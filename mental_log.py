@@ -148,25 +148,6 @@ class MentalLog:
                 lines.append(line)
         return "\n".join(lines)
 
-    def format_table(self) -> str:
-        """以结构化表格格式输出活动流。"""
-        if not self._entries:
-            return "（暂无活动记录）"
-
-        lines: list[str] = ["| 时间 | 事件 | 内容 |", "| --- | --- | --- |"]
-        for entry in self._entries:
-            time_str = entry.get_time_str()
-            event_str = str(entry.event_type)
-            content = self._get_entry_summary(entry)
-            lines.append(f"| {time_str} | {event_str} | {content} |")
-        return "\n".join(lines)
-
-    def format(self, style: str = "narrative") -> str:
-        """按指定格式输出活动流。"""
-        if style == "table":
-            return self.format_table()
-        return self.format_narrative()
-
     def format_as_summary(self, max_entries: int = 10) -> str:
         """格式化为简短摘要，用于 system prompt 注入。"""
         recent = self.get_recent(max_entries)

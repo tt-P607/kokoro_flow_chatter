@@ -1,6 +1,6 @@
 """KokoroFlowChatter 数据模型。
 
-定义所有共享数据类型：事件类型枚举、等待配置、策略结果等。
+定义所有共享数据类型：事件类型枚举、等待配置、工具调用解析结果等。
 """
 
 from __future__ import annotations
@@ -9,6 +9,49 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+
+# 控制流常量
+KFC_REPLY: str = "kfc_reply"
+DO_NOTHING: str = "do_nothing"
+
+
+@dataclass
+class ToolCallResult:
+    """原生 Tool Calling 的结构化解析结果。
+
+    将 LLM 返回的 call_list 解析后的散装变量集中封装，
+    作为 ``_parse_tool_calls()`` 的返回值在主循环中传递。
+    """
+
+    thought: str = ""
+    """LLM 内心想法（来自 kfc_reply / do_nothing 的 thought 参数）"""
+
+    expected_reaction: str = ""
+    """LLM 预期对方的反应"""
+
+    max_wait_seconds: float = 0.0
+    """LLM 愿意等待的最长时间（秒），0 表示不等待"""
+
+    mood: str = ""
+    """LLM 当前心情"""
+
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    """动作列表，每项包含 type + 对应参数"""
+
+    has_reply: bool = False
+    """是否包含 kfc_reply 调用"""
+
+    has_do_nothing: bool = False
+    """是否包含 do_nothing 调用"""
+
+    has_third_party: bool = False
+    """是否包含第三方工具调用"""
+
+    @property
+    def has_meaningful_action(self) -> bool:
+        """是否包含任何有效动作（回复、do_nothing 或第三方工具）。"""
+        return self.has_reply or self.has_do_nothing or self.has_third_party
 
 
 class KFCEventType(Enum):
@@ -92,50 +135,3 @@ class WaitingConfig:
             followup_count=int(data.get("followup_count", 0)),
         )
 
-
-@dataclass
-class StrategyResult:
-    """策略解析 LLM 响应后的结构化结果。"""
-
-    thought: str = ""
-    actions: list[dict[str, Any]] = field(default_factory=list)
-    expected_reaction: str = ""
-    max_wait_seconds: float = 0.0
-    mood: str = ""
-
-    @classmethod
-    def create_error(cls, error_message: str) -> StrategyResult:
-        """创建错误结果。"""
-        return cls(
-            thought=f"出现了问题：{error_message}",
-            actions=[{"type": "do_nothing"}],
-        )
-
-    def has_reply(self) -> bool:
-        """是否包含回复动作。"""
-        return any(
-            a.get("type") in ("kfc_reply", "respond") for a in self.actions
-        )
-
-    def get_reply_content(self) -> str:
-        """获取回复内容。"""
-        for action in self.actions:
-            if action.get("type") in ("kfc_reply", "respond"):
-                return action.get("content", "")
-        return ""
-
-    def get_actions_summary(self) -> str:
-        """获取动作摘要。"""
-        descriptions: list[str] = []
-        for action in self.actions:
-            action_type = action.get("type", "unknown")
-            if action_type in ("kfc_reply", "respond"):
-                content = action.get("content", "")
-                descriptions.append(
-                    f'发送消息："{content[:50]}{"..." if len(content) > 50 else ""}"'
-                )
-            elif action_type == "do_nothing":
-                descriptions.append("什么都没做")
-            else:
-                descriptions.append(f"执行动作：{action_type}")
-        return " + ".join(descriptions)

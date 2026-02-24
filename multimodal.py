@@ -24,6 +24,36 @@ class MediaItem:
     source_message_id: str  # 来源消息 ID
 
 
+class ImageBudget:
+    """跨 payload 的图片预算追踪器。
+
+    在 execute() 初始化阶段创建一个实例，
+    历史图片和当前循环中的图片共享同一预算，
+    避免双重注入导致图片总量超出限制。
+    """
+
+    def __init__(self, total_max: int = 4) -> None:
+        self._total_max = total_max
+        self._used = 0
+
+    @property
+    def remaining(self) -> int:
+        """剩余可用图片配额。"""
+        return max(0, self._total_max - self._used)
+
+    def consume(self, count: int) -> None:
+        """消耗图片配额。"""
+        self._used += count
+
+    def is_exhausted(self) -> bool:
+        """配额是否已用尽。"""
+        return self._used >= self._total_max
+
+    def reset(self) -> None:
+        """重置预算（新一轮对话循环）。"""
+        self._used = 0
+
+
 def extract_media_from_messages(
     messages: list[Message],
     max_items: int = 4,

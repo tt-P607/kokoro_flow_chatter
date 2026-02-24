@@ -13,8 +13,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.app.plugin_system.api.log_api import get_logger
+
 from .mental_log import MentalLog, MentalLogEntry
 from .models import KFCEventType, WaitingConfig
+
+logger = get_logger("kfc_session")
 
 
 @dataclass
@@ -23,6 +27,7 @@ class KFCSession:
 
     user_id: str
     stream_id: str
+    platform: str = ""
 
     # 等待状态
     waiting_config: WaitingConfig = field(default_factory=WaitingConfig)
@@ -133,6 +138,7 @@ class KFCSession:
         return {
             "user_id": self.user_id,
             "stream_id": self.stream_id,
+            "platform": self.platform,
             "waiting_config": self.waiting_config.to_dict(),
             "consecutive_timeout_count": self.consecutive_timeout_count,
             "created_at": self.created_at,
@@ -150,6 +156,7 @@ class KFCSession:
         session = cls(
             user_id=data.get("user_id", ""),
             stream_id=data.get("stream_id", ""),
+            platform=data.get("platform", ""),
         )
         session.waiting_config = WaitingConfig.from_dict(
             data.get("waiting_config", {})
@@ -238,11 +245,11 @@ class KFCSessionStore:
                     session = KFCSession.from_dict(data)
                     self._sessions[stream_id] = session
                     return session
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Session 加载失败 (stream={stream_id[:8]}): {e}")
 
         # 创建新 Session
-        session = KFCSession(user_id="", stream_id=stream_id)
+        session = KFCSession(user_id="", stream_id=stream_id, platform="")
         self._sessions[stream_id] = session
         return session
 
@@ -258,8 +265,10 @@ class KFCSessionStore:
         if self._json_store is not None:
             try:
                 await self._json_store.save(session.stream_id, session.to_dict())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    f"Session 持久化失败 (stream={session.stream_id[:8]}): {e}"
+                )
 
     async def get(self, stream_id: str) -> KFCSession | None:
         """获取 Session（不创建）。"""
@@ -274,10 +283,28 @@ class KFCSessionStore:
                     session = KFCSession.from_dict(data)
                     self._sessions[stream_id] = session
                     return session
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Session 加载失败 (stream={stream_id[:8]}): {e}")
         return None
 
     def get_all_cached(self) -> dict[str, KFCSession]:
         """获取所有缓存中的 Session（不触发 IO）。"""
         return dict(self._sessions)
+
+    async def list_all_stream_ids(self) -> list[str]:
+        """列出所有已持久化的 stream_id。
+
+        从 JSON 存储中读取所有会话文件名，
+        用于在插件启动时预注册 VLM 跳过等批量操作。
+
+        Returns:
+            list[str]: 所有已知的 stream_id 列表
+        """
+        await self._ensure_store()
+        if self._json_store is not None:
+            try:
+                return await self._json_store.list_all()
+            except Exception as e:
+                logger.warning(f"Session 列举失败: {e}")
+                return []
+        return []

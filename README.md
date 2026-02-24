@@ -11,19 +11,18 @@ KFC 模拟人类在对话中的**内心活动**：不只是"收到消息 → 回
 ### 核心特性
 
 - **心理活动流 (MentalLog)** — 记录用户消息、Bot 规划、等待状态变化、超时、回复时效等事件
+- **原生 Tool Calling** — 通过 `kfc_reply` / `do_nothing` 两个核心动作驱动对话，同时支持第三方工具
+- **两阶段感知-决策** — 模型遇到图片等多模态内容"破防"输出纯文本时，自动追加到上下文后引导进入决策阶段
 - **动态等待机制** — LLM 自主决定等待时长，等待期间可触发"连续思考"（内心独白）
 - **主动发起对话** — 定时检测沉默时长，满足条件时 Bot 主动找用户聊天
-- **双模式运行** — Unified（单次调用）和 Split（决策+回复两步）可切换
-- **原生多模态** — Unified 模式下可直接将图片打包进 LLM payload
-- **JSON 嵌入式工具调用** — 不依赖原生 Tool Calling，第三方工具通过提示词注入
+- **原生多模态** — 图片直接打包进 LLM payload，跨 payload 的 ImageBudget 控制配额
 - **打字模拟** — 长消息自动分段，按字数模拟打字延迟
-- **三层防泄漏** — JSON 结构隔离 → 正则清洗 → 发送前最后防线
+- **元数据防线** — 发送前检测 content 中混入的元数据关键字（≥2 个才截断，降低误伤）
 
 ## 要求
 
 - Neo-MoFox >= 1.0.0
 - Python >= 3.11
-- 额外依赖：`json-repair >= 0.57.1`
 
 ## 安装
 
@@ -33,28 +32,30 @@ KFC 模拟人类在对话中的**内心活动**：不只是"收到消息 → 回
 
 ```
 kokoro_flow_chatter/
-├── manifest.json        # 插件元数据
-├── plugin.py            # 插件入口，注册定时任务
-├── config.py            # 配置定义（7 个 Section）
-├── chatter.py           # 核心聊天器，对话主循环
-├── models.py            # 数据模型（事件枚举、等待配置、策略结果）
-├── session.py           # 会话管理与持久化
-├── mental_log.py        # 心理活动流记录与格式化
-├── multimodal.py        # 多模态图片提取与 payload 构建
+├── manifest.json          # 插件元数据
+├── plugin.py              # 插件入口，注册 Scheduler 任务
+├── config.py              # 配置定义（7 个 Section）
+├── chatter.py             # 核心聊天器，对话主循环
+├── parser.py              # 工具调用解析 + 名称归一化
+├── models.py              # 数据模型（事件枚举、等待配置、ToolCallResult）
+├── session.py             # 会话管理与 per-stream 锁持久化
+├── mental_log.py          # 心理活动流记录与格式化
+├── multimodal.py          # 多模态图片提取、ImageBudget、payload 构建
 ├── actions/
-│   └── reply.py         # 回复动作（分段发送、打字延迟、防泄漏）
+│   ├── reply.py           # KFCReplyAction（分段发送、打字延迟、元数据防线）
+│   └── do_nothing.py      # DoNothingAction（选择不回复）
+├── handlers/
+│   └── proactive_handler.py  # 主动发起事件处理（注入触发消息 + 唤醒流循环）
 ├── prompts/
-│   ├── templates.py     # 提示词模板
-│   ├── builder.py       # 提示词构建器
-│   └── modules.py       # 模板注册
-├── strategies/
-│   ├── base.py          # 策略协议定义
-│   ├── unified.py       # Unified 策略（单次调用）
-│   └── split.py         # Split 策略（两步调用）
+│   ├── templates.py       # 提示词模板文本集中管理
+│   ├── builder.py         # KFCPromptBuilder（系统提示 / 用户 payload / 超时 payload）
+│   └── modules.py         # 模板注册 + 上下文构建函数
+├── debug/
+│   └── log_formatter.py   # 调试日志格式化（提示词面板 + 响应摘要）
 └── thinker/
-    ├── proactive.py     # 主动发起检测
-    ├── wait_checker.py  # 连续思考检测
-    └── timeout.py       # 超时处理
+    ├── proactive.py       # ProactiveThinker（沉默检测 + 概率触发）
+    ├── timeout_handler.py # TimeoutHandler（超时判定 + 上下文生成）
+    └── wait_checker.py    # WaitChecker（进度阈值 → 连续思考 → LLM 独白）
 ```
 
 ## 配置
@@ -66,16 +67,15 @@ kokoro_flow_chatter/
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enabled` | bool | `true` | 是否启用 |
-| `mode` | str | `"unified"` | 执行模式：`unified`（单次调用）/ `split`（规划+回复） |
 | `model_task` | str | `"actor"` | LLM 模型任务名（对应 model.toml） |
-| `native_multimodal` | bool | `false` | 原生多模态（仅 unified 模式） |
-| `max_images_per_payload` | int | `4` | 单次最多图片数 |
+| `native_multimodal` | bool | `false` | 原生多模态，图片直接打包进 LLM payload |
+| `max_images_per_payload` | int | `4` | 单次 payload 最多图片数（历史 + 当前共用） |
+| `max_compat_retries` | int | `1` | 感知-决策循环最大重试次数（模型输出纯文本时注入提示重试） |
 
 ### 等待机制 `[wait]`
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `multiplier` | float | `1.0` | 等待时长倍率 |
 | `min_seconds` | float | `10.0` | 最小等待秒数 |
 | `max_seconds` | float | `600.0` | 最大等待秒数 |
 | `max_consecutive_timeouts` | int | `3` | 连续超时上限，达到后放弃等待 |
@@ -90,7 +90,6 @@ kokoro_flow_chatter/
 | `min_interval` | int | `1800` | 两次主动发起最小间隔（秒） |
 | `quiet_hours_start` | str | `"23:00"` | 勿扰开始时间 |
 | `quiet_hours_end` | str | `"07:00"` | 勿扰结束时间 |
-| `min_affinity` | float | `0.3` | 最低好感度阈值 |
 | `check_interval` | int | `60` | 检查间隔（秒） |
 
 ### 回复配置 `[reply]`
@@ -100,14 +99,11 @@ kokoro_flow_chatter/
 | `typing_chars_per_sec` | float | `15.0` | 模拟打字速度（字/秒） |
 | `typing_delay_min` | float | `0.8` | 最小打字延迟（秒） |
 | `typing_delay_max` | float | `4.0` | 最大打字延迟（秒） |
-| `max_segment_length` | int | `200` | 分段长度上限 |
-| `enable_typo` | bool | `false` | 是否启用错字生成 |
 
 ### 提示词 `[prompt]`
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `log_format` | str | `"narrative"` | 活动流格式：`narrative`（叙事）/ `table`（表格） |
 | `max_log_entries` | int | `50` | 最大活动流条目数 |
 | `max_context_payloads` | int | `40` | LLM 上下文最大 payload 数 |
 
@@ -126,35 +122,70 @@ kokoro_flow_chatter/
 | `show_prompt` | bool | `false` | 日志中显示完整提示词 |
 | `show_response` | bool | `true` | 日志中显示 LLM 响应摘要 |
 
-## 两种模式
+## 架构设计
 
-### Unified 模式（默认）
+### 原生 Tool Calling（Route A）
 
-单次 LLM 调用，模型以 JSON 一次性返回思考、动作、情绪等全部信息。
+KFC 使用框架的原生 Tool Calling 能力，通过两个核心动作驱动对话：
 
-- ✅ 延迟低（一次调用）
-- ✅ 支持原生多模态
-- ✅ 支持第三方工具调用
-- ⚠️ 要求模型有较强的 JSON 输出能力
+- **`kfc_reply`** — 发送消息。参数包括 `content`（回复文本）、`thought`（内心想法，用户不可见）、`expected_reaction`（预期反应）、`max_wait_seconds`（等待时长）、`mood`（心情）
+- **`do_nothing`** — 选择不回复。参数与 `kfc_reply` 类似但无 `content`
 
-### Split 模式
+同时支持框架注册的所有第三方工具（Action / Tool），通过 `inject_usables()` 统一注册。
 
-两步调用：决策步用轻量模型（`sub_actor`）生成 JSON 决策，回复步用主模型（`actor`）生成自然语言。
+### 两阶段感知-决策循环
 
-- ✅ 决策与表达分离，各用最合适的模型
-- ✅ JSON 解析失败时更宽容（将文本当回复）
-- ⚠️ 延迟较高（两次调用）
-- ⚠️ 不支持原生多模态和第三方工具
+当模型收到图片后"破防"——输出纯自然语言感言而非工具调用时，不将其视为错误：
+
+1. **感知阶段**：模型的文本输出通过 `auto_append_response=True` 自动追加到上下文（记忆固化）
+2. **决策阶段**：注入轻量提示引导模型输出结构化工具调用
+
+通过 `max_compat_retries` 控制最大重试次数。
+
+### 等待状态机
+
+```
+LLM 决策 max_wait_seconds > 0
+  → WaitingConfig → config.wait.apply_rules()
+    → session.set_waiting() → yield Wait(0)
+
+Scheduler 定期触发 WaitChecker
+  → 等待进度 ≥ 阈值 → LLM 生成独白 → pending_thoughts
+
+下一轮循环：
+  → 有新消息 → 记录回复时效 → clear_waiting → 继续对话
+  → 无新消息 + 超时 → TimeoutHandler → 构建超时 payload → LLM 决策
+  → 连续超时过多 → yield Stop
+```
+
+### 主动发起链路
+
+```
+Scheduler → ProactiveThinker.check_all_sessions()
+  → EventBus.publish("kfc.proactive_trigger")
+    → ProactiveHandler → 注入触发消息 → 唤醒流循环
+```
 
 ## 对话流程
 
 ```
-用户消息 → 构建上下文（历史 + 心理活动流 + 工具描述）
-         → LLM 调用（返回 JSON 决策）
-         → 解析 StrategyResult
-         → 执行动作（回复 / 等待 / 什么都不做）
-         → 等待期间可触发连续思考
-         → 超时或新消息到达 → 回到循环
+初始化：系统提示 + 历史消息 + 工具注册 + ImageBudget
+         ↓
+循环 ←───────────────────────────────────┐
+  ├─ fetch_unreads() 有新消息              │
+  │   → 记录到 MentalLog                  │
+  │   → 提取多模态图片（共享预算）           │
+  │   → 构建 user payload                 │
+  │   → _send_with_perceive_loop()        │
+  │   → parse_tool_calls()                │
+  │   → 执行动作（kfc_reply / do_nothing） │
+  │   → 等待控制 ──────────── yield Wait ──┘
+  │
+  ├─ 正在等待 + 未超时 → yield Wait ───────┘
+  │
+  └─ 正在等待 + 已超时
+      → TimeoutHandler → 超时 payload
+      → LLM 决策 → 继续等/发消息/结束 ─────┘
 ```
 
 ## 许可证

@@ -67,6 +67,9 @@ class TimeoutHandler:
         # 收集等待期间的想法
         pending = list(session.pending_thoughts)
 
+        # 提取最后一条 Bot 发送的消息
+        last_bot_message = session.mental_log.get_last_bot_reply_content()
+
         # 清除等待状态
         session.clear_waiting()
 
@@ -75,6 +78,7 @@ class TimeoutHandler:
             "expected_reaction": expected,
             "consecutive_timeouts": session.consecutive_timeout_count,
             "pending_thoughts": pending,
+            "last_bot_message": last_bot_message,
         }
 
         logger.info(

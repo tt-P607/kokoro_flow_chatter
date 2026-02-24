@@ -14,7 +14,7 @@ from src.app.plugin_system.api.log_api import get_logger
 
 if TYPE_CHECKING:
     from ..config import KFCConfig
-    from ..session import KFCSessionStore
+    from ..session import KFCSession, KFCSessionStore
 
 logger = get_logger("kfc_proactive")
 
@@ -53,13 +53,12 @@ class ProactiveThinker:
 
         return triggered
 
-    def _should_trigger(self, session: object) -> bool:
-        """判断指定 Session 是否应主动发起。"""
-        from ..session import KFCSession
+    def _should_trigger(self, session: KFCSession) -> bool:
+        """判断指定 Session 是否应主动发起。
 
-        if not isinstance(session, KFCSession):
-            return False
-
+        Args:
+            session: KFC 会话对象
+        """
         proactive_config = self._config.proactive
         now = time.time()
 

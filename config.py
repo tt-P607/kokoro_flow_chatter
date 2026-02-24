@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
 
@@ -22,10 +22,6 @@ class KFCConfig(BaseConfig):
         """基础配置。"""
 
         enabled: bool = Field(default=True, description="是否启用")
-        mode: Literal["unified", "split"] = Field(
-            default="unified",
-            description="执行模式: unified(单次调用) / split(规划+回复)",
-        )
         model_task: str = Field(
             default="actor",
             description="LLM 模型任务名称（对应 model.toml 中的 task）",
@@ -34,19 +30,27 @@ class KFCConfig(BaseConfig):
             default=False,
             description=(
                 "原生多模态模式。启用后，图片直接打包进 LLM payload，"
-                "跳过 VLM 文字转述。需确保 model_task 配置的模型支持多模态输入。"
+                "由主模型在对话上下文中理解图片内容并做出响应。"
+                "需确保 model_task 配置的模型支持多模态输入。"
             ),
         )
         max_images_per_payload: int = Field(
             default=4,
             description="单次 payload 最多包含的图片数量",
         )
+        max_compat_retries: int = Field(
+            default=1,
+            description=(
+                "tool_call_compat 解析失败时的最大重试次数。"
+                "当模型输出纯自然语言而非 JSON 格式时，"
+                "注入格式提醒后重试。0 表示不重试。"
+            ),
+        )
 
     @config_section("wait")
     class WaitSection(SectionBase):
         """等待机制配置。"""
 
-        multiplier: float = Field(default=1.0, description="等待时长倍率")
         min_seconds: float = Field(default=10.0, description="最小等待秒数")
         max_seconds: float = Field(default=600.0, description="最大等待秒数")
         max_consecutive_timeouts: int = Field(
@@ -59,8 +63,7 @@ class KFCConfig(BaseConfig):
                 return 0.0
             if consecutive_timeouts >= self.max_consecutive_timeouts:
                 return 0.0
-            adjusted = raw_seconds * self.multiplier
-            return max(self.min_seconds, min(adjusted, self.max_seconds))
+            return max(self.min_seconds, min(raw_seconds, self.max_seconds))
 
     @config_section("proactive")
     class ProactiveSection(SectionBase):
@@ -78,9 +81,6 @@ class KFCConfig(BaseConfig):
         )
         quiet_hours_start: str = Field(default="23:00", description="勿扰开始时间")
         quiet_hours_end: str = Field(default="07:00", description="勿扰结束时间")
-        min_affinity: float = Field(
-            default=0.3, description="最低好感度，低于此值不主动发起"
-        )
         check_interval: int = Field(
             default=60, description="主动发起检查间隔(秒)"
         )
@@ -98,20 +98,11 @@ class KFCConfig(BaseConfig):
         typing_delay_max: float = Field(
             default=4.0, description="最大打字延迟(秒)"
         )
-        max_segment_length: int = Field(
-            default=200, description="最大分段长度，超过则分段发送"
-        )
-        enable_typo: bool = Field(
-            default=False, description="是否启用错字生成"
-        )
 
     @config_section("prompt")
     class PromptSection(SectionBase):
         """提示词配置。"""
 
-        log_format: Literal["narrative", "table"] = Field(
-            default="narrative", description="活动流格式: narrative(线性叙事) / table(结构化)"
-        )
         max_log_entries: int = Field(
             default=50, description="最大活动流条目数"
         )
