@@ -107,7 +107,7 @@ class KFCConfig(BaseConfig):
             default=50, description="最大活动流条目数"
         )
         max_context_payloads: int = Field(
-            default=40, description="LLM 上下文最大 payload 数量"
+            default=20, description="LLM 上下文最大 payload 数量"
         )
 
     @config_section("continuous_thinking")

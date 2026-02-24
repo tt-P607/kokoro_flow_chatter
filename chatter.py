@@ -146,10 +146,13 @@ class KokoroFlowChatter(BaseChatter):
             system_prompt = prompt_builder.build_system_prompt(chat_stream)
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
-            # 历史消息 + 内心独白融合叙事
+            # 历史消息 + 内心独白融合叙事（SYSTEM 角色，不会被上下文裁剪）
             history_text = prompt_builder.build_fused_narrative(
                 chat_stream, session.mental_log
             )
+            if history_text:
+                request.add_payload(LLMPayload(ROLE.SYSTEM, Text(history_text)))
+
             # 图片预算：历史图片 + 当前轮图片共用同一配额
             image_budget: ImageBudget | None = None
             if config.general.native_multimodal:
@@ -157,32 +160,26 @@ class KokoroFlowChatter(BaseChatter):
 
                 image_budget = ImageBudget(config.general.max_images_per_payload)
 
-            if history_text:
-                history_content: Content | list[Content] = Text(history_text)
-                if image_budget and not image_budget.is_exhausted():
-                    from .multimodal import (
-                        build_multimodal_content,
-                        extract_media_from_messages,
-                    )
+            if history_text and image_budget and not image_budget.is_exhausted():
+                from .multimodal import (
+                    build_multimodal_content,
+                    extract_media_from_messages,
+                )
 
-                    history_msgs = getattr(
-                        getattr(chat_stream, "context", None), "history_messages", []
+                history_msgs = getattr(
+                    getattr(chat_stream, "context", None), "history_messages", []
+                )
+                if history_msgs:
+                    history_media = extract_media_from_messages(
+                        history_msgs[-20:],
+                        max_items=image_budget.remaining,
                     )
-                    if history_msgs:
-                        history_media = extract_media_from_messages(
-                            history_msgs[-20:],
-                            max_items=image_budget.remaining,
+                    if history_media:
+                        image_budget.consume(len(history_media))
+                        logger.debug(
+                            f" 历史多模态: 提取到 {len(history_media)} 张图片/表情包"
+                            f" (剩余配额 {image_budget.remaining})"
                         )
-                        if history_media:
-                            image_budget.consume(len(history_media))
-                            history_content = build_multimodal_content(
-                                history_text, history_media
-                            )
-                            logger.debug(
-                                f" 历史多模态: 提取到 {len(history_media)} 张图片/表情包"
-                                f" (剩余配额 {image_budget.remaining})"
-                            )
-                request.add_payload(LLMPayload(ROLE.USER, history_content))
 
             # ── 注册工具（原生 Tool Calling） ──
             usable_map = await self.inject_usables(request)
@@ -224,12 +221,8 @@ class KokoroFlowChatter(BaseChatter):
                     )
 
                     # 构建 user payload（委托给 PromptBuilder）
-                    mental_summary = session.mental_log.format_as_summary(
-                        max_entries=config.prompt.max_log_entries
-                    )
                     user_payload = prompt_builder.build_user_payload(
                         formatted_unreads=formatted_text,
-                        mental_log_summary=mental_summary,
                         media_items=media_items,
                     )
                     response.add_payload(user_payload)

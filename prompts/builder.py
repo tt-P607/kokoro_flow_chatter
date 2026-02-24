@@ -87,27 +87,23 @@ class KFCPromptBuilder:
     def build_user_payload(
         self,
         formatted_unreads: str,
-        mental_log_summary: str,
         media_items: list[Any] | None = None,
     ) -> LLMPayload:
         """构建用户消息 Payload。
 
-        将心理活动摘要与格式化的未读消息组合为一个 USER 角色的 Payload。
+        将格式化的未读消息构建为一个 USER 角色的 Payload。
+        心理活动已在融合叙事时间线中展示，不再单独注入摘要。
         如果携带多模态图片，则打包为 Text + Image 混合内容。
 
         Args:
             formatted_unreads: 格式化后的未读消息文本
-            mental_log_summary: 活动流摘要
             media_items: 多模态图片列表（可选，来自 extract_media_from_messages）
 
         Returns:
             LLMPayload: USER 角色的 Payload
         """
-        parts: list[str] = []
-        if mental_log_summary:
-            parts.append(f"[最近的心理活动]\n{mental_log_summary}")
-        parts.append(f"[新消息]\n{formatted_unreads}")
-        user_text = "\n\n".join(parts)
+        # 心理活动已在融合叙事时间线中展示，不再单独注入摘要
+        user_text = f"[新消息]\n{formatted_unreads}"
 
         content: Content | list[Content]
         if media_items:
@@ -264,9 +260,17 @@ class KFCPromptBuilder:
             else:
                 timeline.append((ts, f"[{time_str}] {sender}说：{text}"))
 
-        # ── 内心独白（仅补充思考类条目，用户消息已在聊天记录中） ──
+        # ── 内心独白（仅展示最近 7 条聊天消息范围内的思考） ──
+        # 找到倒数第 7 条聊天消息的时间戳作为截止点
+        chat_timestamps = [ts for ts, _ in timeline]
+        mental_cutoff = (
+            chat_timestamps[-7] if len(chat_timestamps) >= 7 else 0.0
+        )
+
         if mental_log:
             for entry in mental_log.entries:
+                if entry.timestamp < mental_cutoff:
+                    continue
                 ts = entry.timestamp
                 try:
                     time_str = datetime.datetime.fromtimestamp(ts).strftime(
@@ -281,55 +285,6 @@ class KFCPromptBuilder:
                 ):
                     timeline.append(
                         (ts, f"[{time_str}] （你的内心：{entry.thought}）")
-                    )
-                    # 补充动作描述（如果有回复动作）
-                    for action in entry.actions:
-                        if action.get("type") == "kfc_reply":
-                            content = action.get("content", "")
-                            if content:
-                                # 不再重复添加，聊天记录里已有
-                                pass
-                    # 补充等待决策
-                    if entry.max_wait_seconds > 0:
-                        wait_min = entry.max_wait_seconds / 60
-                        expected = entry.expected_reaction or ""
-                        if expected:
-                            timeline.append(
-                                (
-                                    ts + 0.001,
-                                    f"[{time_str}] （决定等待 {wait_min:.0f} 分钟，"
-                                    f"期待：{expected}）",
-                                )
-                            )
-                elif (
-                    entry.event_type == KFCEventType.WAITING_UPDATE
-                    and entry.waiting_thought
-                ):
-                    timeline.append(
-                        (
-                            ts,
-                            f"[{time_str}] （等待中的想法：{entry.waiting_thought}）",
-                        )
-                    )
-                elif entry.event_type == KFCEventType.WAIT_TIMEOUT:
-                    secs = entry.elapsed_seconds
-                    timeline.append(
-                        (
-                            ts,
-                            f"[{time_str}] （等待超时，等了 {secs:.0f} 秒）",
-                        )
-                    )
-                elif entry.event_type == KFCEventType.REPLY_IN_TIME:
-                    timeline.append(
-                        (ts, f"[{time_str}] （在预期时间内收到了回复）")
-                    )
-                elif entry.event_type == KFCEventType.REPLY_LATE:
-                    secs = entry.elapsed_seconds
-                    timeline.append(
-                        (
-                            ts,
-                            f"[{time_str}] （对方回复较晚，等了 {secs:.0f} 秒）",
-                        )
                     )
 
         if not timeline:

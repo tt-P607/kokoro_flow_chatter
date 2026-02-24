@@ -120,7 +120,7 @@ async def parse_tool_calls(
                 LLMPayload(
                     ROLE.TOOL_RESULT,
                     ToolResult(  # type: ignore[arg-type]
-                        value="已发送",
+                        value="",
                         call_id=call.id,
                         name=call.name,
                     ),
@@ -135,7 +135,7 @@ async def parse_tool_calls(
                 LLMPayload(
                     ROLE.TOOL_RESULT,
                     ToolResult(  # type: ignore[arg-type]
-                        value="已选择不回复",
+                        value="",
                         call_id=call.id,
                         name=call.name,
                     ),
