@@ -78,4 +78,3 @@ class KFCReplyAction(BaseAction):
         return True, f"已发送消息: {content[:80]}"
 
 
-

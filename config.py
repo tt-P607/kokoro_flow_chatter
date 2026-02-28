@@ -46,6 +46,13 @@ class KFCConfig(BaseConfig):
                 "注入格式提醒后重试。0 表示不重试。"
             ),
         )
+        custom_decision_prompt: str = Field(
+            default="",
+            description=(
+                "自定义决策提示词。用于指导 KFC 的决策行为，"
+                "会被注入到系统提示词的安全准则之后。留空则不生效。"
+            ),
+        )
 
     @config_section("wait")
     class WaitSection(SectionBase):

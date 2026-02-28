@@ -106,6 +106,10 @@ class KokoroFlowChatter(BaseChatter):
         # ── 初始化 ──
         stream_manager = get_stream_manager()
         chat_stream = await stream_manager.activate_stream(self.stream_id)
+        if chat_stream is None:
+            logger.error(f"无法激活聊天流: {self.stream_id}")
+            yield Failure("聊天流激活失败")
+            return
         config = self._get_config()
 
         # 检查插件是否启用
@@ -143,8 +147,28 @@ class KokoroFlowChatter(BaseChatter):
             from .prompts.builder import KFCPromptBuilder
 
             prompt_builder = KFCPromptBuilder()
-            system_prompt = prompt_builder.build_system_prompt(chat_stream)
+
+            # 注入自定义决策提示词（如果配置了）
+            extra_vars: dict[str, str] = {}
+            custom_prompt = config.general.custom_decision_prompt
+            if custom_prompt and custom_prompt.strip():
+                extra_vars["custom_decision_prompt"] = (
+                    f"# 决策指导\n{custom_prompt.strip()}"
+                )
+
+            system_prompt = await prompt_builder.build_system_prompt(
+                chat_stream, extra_vars=extra_vars or None
+            )
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+
+            relation_text = prompt_builder.build_relation_context(chat_stream)
+            if relation_text:
+                request.add_payload(LLMPayload(ROLE.SYSTEM, Text(relation_text)))
+
+            # 私聊记忆上下文注入
+            memory_context = prompt_builder.build_memory_context(chat_stream)
+            if memory_context:
+                request.add_payload(LLMPayload(ROLE.SYSTEM, Text(memory_context)))
 
             # 历史消息 + 内心独白融合叙事（SYSTEM 角色，不会被上下文裁剪）
             history_text = prompt_builder.build_fused_narrative(
@@ -303,6 +327,45 @@ class KokoroFlowChatter(BaseChatter):
                     yield Stop(0)
                     await self._save_session(session)
                     return
+
+                # ── 第三方工具回传：tool result → LLM 二次生成 ──
+                if result.has_third_party and not result.has_reply and not result.has_do_nothing:
+                    logger.debug("仅第三方工具调用，回传 tool result 给 LLM 做二次生成")
+                    try:
+                        response = await self._send_with_perceive_loop(
+                            response, config.general.max_compat_retries
+                        )
+                    except Exception as e:
+                        logger.error(f"工具回传后 LLM 请求失败: {e}", exc_info=True)
+                        yield Failure("工具回传后 LLM 请求失败", e)
+                        continue
+
+                    # 重新解析第二轮响应
+                    trigger_msg = unread_msgs[-1] if unread_msgs else None
+                    result = await parse_tool_calls(
+                        response, usable_map, trigger_msg, config,
+                        execute_reply_fn=self._execute_reply,
+                        run_tool_call_fn=self.run_tool_call,
+                    )
+                    log_kfc_result(result, config)
+                    session.add_bot_planning(
+                        thought=result.thought,
+                        actions=result.actions,
+                        expected_reaction=result.expected_reaction,
+                        max_wait_seconds=result.max_wait_seconds,
+                    )
+
+                    # 二次生成后仍无有效动作 → 结束
+                    if not result.has_meaningful_action:
+                        yield Stop(0)
+                        await self._save_session(session)
+                        return
+
+                    if result.has_do_nothing and not result.has_reply:
+                        logger.debug("工具回传后 do_nothing，跳过本轮")
+                        yield Stop(0)
+                        await self._save_session(session)
+                        return
 
                 # ── 等待控制 ──
                 wait_seconds = config.wait.apply_rules(

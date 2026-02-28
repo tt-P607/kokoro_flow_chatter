@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -34,7 +35,32 @@ def _normalize_call_name(name: str) -> str:
     Returns:
         str: 归一化后的名称（末段）
     """
-    return name.rsplit(":", 1)[-1] if ":" in name else name
+    if not name:
+        return ""
+
+    # 兼容格式：plugin:action:kfc_reply / action:kfc_reply
+    if ":" in name:
+        return name.rsplit(":", 1)[-1]
+
+    # 兼容格式：action-kfc_reply / tool-query_person / agent-xxx
+    for prefix in ("action-", "tool-", "agent-"):
+        if name.startswith(prefix):
+            return name[len(prefix) :]
+
+    return name
+
+
+def _extract_args(raw_args: Any) -> dict[str, Any]:
+    """提取工具参数字典，兼容字符串 JSON。"""
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def extract_metadata(result: ToolCallResult, args: dict[str, Any]) -> None:
@@ -86,7 +112,7 @@ async def parse_tool_calls(
     is_first_reply = True
 
     for call in response.call_list or []:
-        args = call.args if isinstance(call.args, dict) else {}
+        args = _extract_args(call.args)
         # 归一化名称：框架可能返回 "action:kfc_reply" 格式
         normalized_name = _normalize_call_name(call.name)
 
@@ -120,7 +146,7 @@ async def parse_tool_calls(
                 LLMPayload(
                     ROLE.TOOL_RESULT,
                     ToolResult(  # type: ignore[arg-type]
-                        value="",
+                        value="已发送",
                         call_id=call.id,
                         name=call.name,
                     ),
@@ -135,7 +161,7 @@ async def parse_tool_calls(
                 LLMPayload(
                     ROLE.TOOL_RESULT,
                     ToolResult(  # type: ignore[arg-type]
-                        value="",
+                        value="已选择不回复",
                         call_id=call.id,
                         name=call.name,
                     ),

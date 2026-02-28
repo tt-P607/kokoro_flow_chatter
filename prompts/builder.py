@@ -25,7 +25,7 @@ class KFCPromptBuilder:
     填入动态变量后构建最终的系统提示词。
     """
 
-    def build_system_prompt(
+    async def build_system_prompt(
         self,
         chat_stream: ChatStream,
         extra_vars: dict[str, Any] | None = None,
@@ -71,18 +71,23 @@ class KFCPromptBuilder:
             for key, value in extra_vars.items():
                 tmpl.set(key, value)
 
-        final_prompt = tmpl.build()
+        return await tmpl.build()
 
-        # 尝试注入人物关系信息（由 person_impression 插件写入 PromptManager）
+    @staticmethod
+    def build_relation_context(chat_stream: ChatStream) -> str:
+        """构建人物关系注入文本。"""
+        pm = get_prompt_manager()
         impression_tmpl = pm.get_template(
             f"person_impression:{chat_stream.stream_id}"
         )
-        if impression_tmpl:
-            relation_text = impression_tmpl.get("relation_text")
-            if relation_text:
-                final_prompt += "\n\n" + relation_text
+        if not impression_tmpl:
+            return ""
 
-        return final_prompt
+        relation_text = impression_tmpl.get("relation_text")
+        if not relation_text:
+            return ""
+
+        return str(relation_text)
 
     def build_user_payload(
         self,
@@ -149,6 +154,28 @@ class KFCPromptBuilder:
         )
 
         return LLMPayload(ROLE.USER, Text(timeout_text))
+
+    @staticmethod
+    def build_memory_context(chat_stream: ChatStream) -> str:
+        """构建私聊记忆上下文文本。
+
+        从 PromptManager 中获取 private_memory 模板，
+        提取记忆上下文供 LLM 使用。
+
+        Args:
+            chat_stream: 当前聊天流
+
+        Returns:
+            str: 记忆上下文文本，无内容时返回空串
+        """
+        pm = get_prompt_manager()
+        memory_tmpl = pm.get_template(f"private_memory:{chat_stream.stream_id}")
+        if not memory_tmpl:
+            return ""
+        memory_context = memory_tmpl.get("memory_context")
+        if not memory_context:
+            return ""
+        return str(memory_context)
 
     @staticmethod
     def _get_theme_guide(chat_stream: ChatStream) -> str:
@@ -243,7 +270,7 @@ class KFCPromptBuilder:
             ts = float(raw_time)
             try:
                 time_str = datetime.datetime.fromtimestamp(ts).strftime(
-                    "%H:%M:%S"
+                    "%Y-%m-%d %H:%M:%S"
                 )
             except (OSError, ValueError, OverflowError):
                 continue
@@ -274,7 +301,7 @@ class KFCPromptBuilder:
                 ts = entry.timestamp
                 try:
                     time_str = datetime.datetime.fromtimestamp(ts).strftime(
-                        "%H:%M:%S"
+                        "%Y-%m-%d %H:%M:%S"
                     )
                 except (OSError, ValueError, OverflowError):
                     continue

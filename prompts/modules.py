@@ -51,6 +51,7 @@ def register_kfc_prompts() -> None:
             "safety_guidelines": optional(
                 "\n".join(personality.safety_guidelines)
             ),
+            "custom_decision_prompt": optional(""),
             "current_time": optional(
                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ),
@@ -91,7 +92,7 @@ def build_mental_log_hint() -> str:
     )
 
 
-def build_proactive_context(
+async def build_proactive_context(
     silence_minutes: float,
     recent_activity: str,
 ) -> str:
@@ -108,7 +109,7 @@ def build_proactive_context(
     else:
         silence_str = f"{silence_minutes:.0f} 分钟"
 
-    return (
+    return await (
         tmpl.clone()
         .set("current_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         .set("silence_duration", silence_str)
@@ -117,7 +118,7 @@ def build_proactive_context(
     )
 
 
-def build_continuous_thinking_context(
+async def build_continuous_thinking_context(
     elapsed_seconds: float,
     progress: float,
     expected_reaction: str,
@@ -136,7 +137,7 @@ def build_continuous_thinking_context(
     if not tmpl:
         return f"已等待 {elapsed_seconds:.0f} 秒"
 
-    return (
+    return await (
         tmpl.clone()
         .set("last_bot_message", last_bot_message or "（消息内容不可用）")
         .set("expected_reaction", expected_reaction or "无特定期望")

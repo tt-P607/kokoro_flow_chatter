@@ -94,7 +94,7 @@ class WaitChecker:
         expected = session.waiting_config.expected_reaction
         last_bot_message = session.mental_log.get_last_bot_reply_content()
 
-        context_text = build_continuous_thinking_context(
+        context_text = await build_continuous_thinking_context(
             elapsed_seconds=elapsed,
             progress=progress,
             expected_reaction=expected,
