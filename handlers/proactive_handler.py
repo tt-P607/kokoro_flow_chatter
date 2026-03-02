@@ -16,6 +16,7 @@ from src.core.components.base.event_handler import BaseEventHandler
 
 if TYPE_CHECKING:
     from src.core.components.base.plugin import BasePlugin
+    from src.core.components.types import EventType
 
 logger = get_logger("kfc_proactive_handler")
 
@@ -35,7 +36,7 @@ class ProactiveHandler(BaseEventHandler):
     handler_description: str = "响应主动发起事件，唤醒目标聊天流"
     weight: int = 0
     intercept_message: bool = False
-    init_subscribe: list[str] = [_PROACTIVE_EVENT]  # type: ignore[assignment]
+    init_subscribe: list[EventType | str] = [_PROACTIVE_EVENT]
 
     async def execute(
         self, kwargs: dict[str, Any] | None

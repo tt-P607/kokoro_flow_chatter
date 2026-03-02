@@ -156,28 +156,6 @@ class KFCPromptBuilder:
         return LLMPayload(ROLE.USER, Text(timeout_text))
 
     @staticmethod
-    def build_memory_context(chat_stream: ChatStream) -> str:
-        """构建私聊记忆上下文文本。
-
-        从 PromptManager 中获取 private_memory 模板，
-        提取记忆上下文供 LLM 使用。
-
-        Args:
-            chat_stream: 当前聊天流
-
-        Returns:
-            str: 记忆上下文文本，无内容时返回空串
-        """
-        pm = get_prompt_manager()
-        memory_tmpl = pm.get_template(f"private_memory:{chat_stream.stream_id}")
-        if not memory_tmpl:
-            return ""
-        memory_context = memory_tmpl.get("memory_context")
-        if not memory_context:
-            return ""
-        return str(memory_context)
-
-    @staticmethod
     def _get_theme_guide(chat_stream: ChatStream) -> str:
         """根据聊天类型返回场景引导文本。"""
         chat_type = str(chat_stream.chat_type or "").lower()
@@ -194,42 +172,6 @@ class KFCPromptBuilder:
                 "群聊中不要总是抢话，保持自然。"
             )
         return ""
-
-    @staticmethod
-    def build_history_text(chat_stream: ChatStream) -> str:
-        """从 chat_stream context 构建历史消息文本（纯聊天记录）。
-
-        Args:
-            chat_stream: 当前聊天流
-
-        Returns:
-            str: 格式化的历史消息文本，无历史时返回空串
-        """
-        history_messages = getattr(
-            getattr(chat_stream, "context", None),
-            "history_messages",
-            [],
-        )
-        if not history_messages:
-            return ""
-
-        lines: list[str] = []
-        for msg in history_messages:
-            raw_time = getattr(msg, "time", None)
-            if isinstance(raw_time, (int, float)):
-                try:
-                    time_str = datetime.datetime.fromtimestamp(raw_time).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
-                except (OSError, ValueError, OverflowError):
-                    time_str = str(raw_time)
-            else:
-                time_str = str(raw_time or "")
-            sender = getattr(msg, "sender_name", "未知")
-            text = getattr(msg, "processed_plain_text", "")
-            lines.append(f"【{time_str}】{sender}: {text}")
-
-        return "以下为最近的聊天历史记录：\n" + "\n".join(lines)
 
     @staticmethod
     def build_fused_narrative(

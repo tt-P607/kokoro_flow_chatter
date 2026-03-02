@@ -32,7 +32,8 @@ class KFCPlugin(BasePlugin):
 
     def __init__(self, config: KFCConfig | None = None) -> None:
         super().__init__(config)
-        self._session_store = KFCSessionStore()
+        max_log_entries = config.prompt.max_log_entries if config else 50
+        self._session_store = KFCSessionStore(max_log_entries=max_log_entries)
 
     async def on_plugin_loaded(self) -> None:
         """插件加载时注册提示词模板。调度任务延迟到调度器启动后注册。"""

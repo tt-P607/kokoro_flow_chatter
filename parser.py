@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any, TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -88,8 +89,8 @@ async def parse_tool_calls(
     trigger_msg: Any | None,
     config: KFCConfig,
     *,
-    execute_reply_fn: Any,
-    run_tool_call_fn: Any,
+    execute_reply_fn: Callable[[str, KFCConfig, Any | None], Awaitable[bool]],
+    run_tool_call_fn: Callable[[Any, Any, ToolRegistry, Any | None], Awaitable[None]],
 ) -> ToolCallResult:
     """遍历 LLM 返回的 call_list，提取元数据并执行动作。
 
@@ -140,13 +141,15 @@ async def parse_tool_calls(
                         await asyncio.sleep(delay)
                 is_first_reply = False
 
-                await execute_reply_fn(content, config, trigger_msg)
+                send_ok = await execute_reply_fn(content, config, trigger_msg)
+            else:
+                send_ok = True
 
             response.add_payload(
                 LLMPayload(
                     ROLE.TOOL_RESULT,
                     ToolResult(  # type: ignore[arg-type]
-                        value="已发送",
+                        value="已发送" if send_ok else "发送失败",
                         call_id=call.id,
                         name=call.name,
                     ),

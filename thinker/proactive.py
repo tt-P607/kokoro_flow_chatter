@@ -107,7 +107,8 @@ class ProactiveThinker:
 
     async def mark_triggered(self, stream_id: str) -> None:
         """标记 Session 已触发主动发起。"""
-        session = await self._session_store.get(stream_id)
-        if session:
-            session.last_proactive_at = time.time()
-            await self._session_store.save(session)
+        async with self._session_store.lock(stream_id):
+            session = await self._session_store.get(stream_id)
+            if session:
+                session.last_proactive_at = time.time()
+                await self._session_store.save(session)

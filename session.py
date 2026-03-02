@@ -151,8 +151,13 @@ class KFCSession:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> KFCSession:
-        """从字典反序列化。"""
+    def from_dict(cls, data: dict[str, Any], max_log_entries: int = 50) -> KFCSession:
+        """从字典反序列化。
+
+        Args:
+            data: 序列化的字典数据
+            max_log_entries: 活动流最大条目数（来自配置）
+        """
         session = cls(
             user_id=data.get("user_id", ""),
             stream_id=data.get("stream_id", ""),
@@ -170,7 +175,7 @@ class KFCSession:
         session.last_proactive_at = data.get("last_proactive_at")
         session.mental_log = MentalLog.from_list(
             data.get("mental_log", []),
-            max_entries=50,
+            max_entries=max_log_entries,
         )
         session.pending_thoughts = data.get("pending_thoughts", [])
         session.total_interactions = int(data.get("total_interactions", 0))
@@ -184,10 +189,11 @@ class KFCSessionStore:
     Session 按 stream_id 索引。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_log_entries: int = 50) -> None:
         self._sessions: dict[str, KFCSession] = {}
         self._store_initialized = False
         self._locks: dict[str, asyncio.Lock] = {}
+        self._max_log_entries = max_log_entries
 
     def _get_lock(self, stream_id: str) -> asyncio.Lock:
         """获取指定 stream_id 的锁（惰性创建）。"""
@@ -242,7 +248,7 @@ class KFCSessionStore:
             try:
                 data = await self._json_store.load(stream_id)
                 if data and isinstance(data, dict):
-                    session = KFCSession.from_dict(data)
+                    session = KFCSession.from_dict(data, max_log_entries=self._max_log_entries)
                     self._sessions[stream_id] = session
                     return session
             except Exception as e:
@@ -250,6 +256,7 @@ class KFCSessionStore:
 
         # 创建新 Session
         session = KFCSession(user_id="", stream_id=stream_id, platform="")
+        session.mental_log = MentalLog(max_entries=self._max_log_entries)
         self._sessions[stream_id] = session
         return session
 
@@ -270,6 +277,12 @@ class KFCSessionStore:
                     f"Session 持久化失败 (stream={session.stream_id[:8]}): {e}"
                 )
 
+        # 锁字典膨胀时定期清理不活跃的锁
+        if len(self._locks) > 100:
+            cleaned = self.cleanup_inactive_locks()
+            if cleaned:
+                logger.debug(f"清理了 {cleaned} 个不活跃的锁")
+
     async def get(self, stream_id: str) -> KFCSession | None:
         """获取 Session（不创建）。"""
         if stream_id in self._sessions:
@@ -280,7 +293,7 @@ class KFCSessionStore:
             try:
                 data = await self._json_store.load(stream_id)
                 if data and isinstance(data, dict):
-                    session = KFCSession.from_dict(data)
+                    session = KFCSession.from_dict(data, max_log_entries=self._max_log_entries)
                     self._sessions[stream_id] = session
                     return session
             except Exception as e:
@@ -290,6 +303,22 @@ class KFCSessionStore:
     def get_all_cached(self) -> dict[str, KFCSession]:
         """获取所有缓存中的 Session（不触发 IO）。"""
         return dict(self._sessions)
+
+    def cleanup_inactive_locks(self) -> int:
+        """清理不活跃 stream 的锁，释放内存。
+
+        移除不在缓存中且当前未被持有的锁。
+
+        Returns:
+            int: 被清理的锁数量
+        """
+        stale = [
+            sid for sid, lock in self._locks.items()
+            if sid not in self._sessions and not lock.locked()
+        ]
+        for sid in stale:
+            del self._locks[sid]
+        return len(stale)
 
     async def list_all_stream_ids(self) -> list[str]:
         """列出所有已持久化的 stream_id。

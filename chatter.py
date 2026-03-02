@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from src.kernel.llm import ToolRegistry
 
     from .config import KFCConfig
+    from .multimodal import ImageBudget
     from .prompts.builder import KFCPromptBuilder
     from .session import KFCSession, KFCSessionStore
 
@@ -134,82 +135,16 @@ class KokoroFlowChatter(BaseChatter):
                 yield Failure("模型配置错误：未找到 model_task 配置")
                 return
 
-            context_manager = LLMContextManager(
-                max_payloads=config.prompt.max_context_payloads
-            )
-            request = create_llm_request(
-                model_set,
-                "kokoro_flow_chatter",
-                context_manager=context_manager,
+            # ── 构建 LLM 上下文 ──
+            (
+                response, image_budget, usable_map, prompt_builder, has_history,
+            ) = await self._build_initial_context(
+                chat_stream, config, session, model_set
             )
 
-            # 系统提示词
-            from .prompts.builder import KFCPromptBuilder
-
-            prompt_builder = KFCPromptBuilder()
-
-            # 注入自定义决策提示词（如果配置了）
-            extra_vars: dict[str, str] = {}
-            custom_prompt = config.general.custom_decision_prompt
-            if custom_prompt and custom_prompt.strip():
-                extra_vars["custom_decision_prompt"] = (
-                    f"# 决策指导\n{custom_prompt.strip()}"
-                )
-
-            system_prompt = await prompt_builder.build_system_prompt(
-                chat_stream, extra_vars=extra_vars or None
-            )
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
-
-            relation_text = prompt_builder.build_relation_context(chat_stream)
-            if relation_text:
-                request.add_payload(LLMPayload(ROLE.SYSTEM, Text(relation_text)))
-
-            # 私聊记忆上下文注入
-            memory_context = prompt_builder.build_memory_context(chat_stream)
-            if memory_context:
-                request.add_payload(LLMPayload(ROLE.SYSTEM, Text(memory_context)))
-
-            # 历史消息 + 内心独白融合叙事（SYSTEM 角色，不会被上下文裁剪）
-            history_text = prompt_builder.build_fused_narrative(
-                chat_stream, session.mental_log
-            )
-            if history_text:
-                request.add_payload(LLMPayload(ROLE.SYSTEM, Text(history_text)))
-
-            # 图片预算：历史图片 + 当前轮图片共用同一配额
-            image_budget: ImageBudget | None = None
-            if config.general.native_multimodal:
-                from .multimodal import ImageBudget
-
-                image_budget = ImageBudget(config.general.max_images_per_payload)
-
-            if history_text and image_budget and not image_budget.is_exhausted():
-                from .multimodal import (
-                    build_multimodal_content,
-                    extract_media_from_messages,
-                )
-
-                history_msgs = getattr(
-                    getattr(chat_stream, "context", None), "history_messages", []
-                )
-                if history_msgs:
-                    history_media = extract_media_from_messages(
-                        history_msgs[-20:],
-                        max_items=image_budget.remaining,
-                    )
-                    if history_media:
-                        image_budget.consume(len(history_media))
-                        logger.debug(
-                            f" 历史多模态: 提取到 {len(history_media)} 张图片/表情包"
-                            f" (剩余配额 {image_budget.remaining})"
-                        )
-
-            # ── 注册工具（原生 Tool Calling） ──
-            usable_map = await self.inject_usables(request)
-
-            # ── response = request（建立 response 链）──
-            response = request
+            # 历史图片仅注入一次（首次有新消息时，用剩余配额填充）
+            _history_images_injected = False
+            _has_pending_tool_results = False
 
             # ── 对话循环 ──
             while True:
@@ -217,6 +152,7 @@ class KokoroFlowChatter(BaseChatter):
                 formatted_text, unread_msgs = await self.fetch_unreads()
 
                 if formatted_text and unread_msgs:
+                    _has_pending_tool_results = False
                     # 记录用户消息到活动流
                     for msg in unread_msgs:
                         sender_id = getattr(msg, "sender_id", "")
@@ -239,10 +175,34 @@ class KokoroFlowChatter(BaseChatter):
                         self._record_reply_timing(session)
                         session.clear_waiting()
 
-                    # 多模态：提取未读消息中的图片数据（共享图片预算）
+                    # 多模态：新消息图片优先消耗预算
                     media_items = self._extract_media(
                         unread_msgs, config, image_budget
                     )
+
+                    # 历史图片：新消息图片消耗预算后，将剩余配额分配给历史图片
+                    # 仅在首次有新消息时注入一次，避免重复追加
+                    if (
+                        not _history_images_injected
+                        and has_history
+                        and image_budget is not None
+                        and not image_budget.is_exhausted()
+                    ):
+                        _history_images_injected = True
+                        history_imgs = self._extract_history_media(
+                            chat_stream, image_budget
+                        )
+                        if history_imgs:
+                            from .multimodal import build_multimodal_content
+
+                            response.add_payload(
+                                LLMPayload(
+                                    ROLE.SYSTEM,
+                                    build_multimodal_content(
+                                        "[历史图片参考]", history_imgs
+                                    ),
+                                )
+                            )
 
                     # 构建 user payload（委托给 PromptBuilder）
                     user_payload = prompt_builder.build_user_payload(
@@ -251,6 +211,9 @@ class KokoroFlowChatter(BaseChatter):
                     )
                     response.add_payload(user_payload)
 
+                elif _has_pending_tool_results:
+                    # 重置标志，避免 LLM 调用完成后再次触发（无限循环）
+                    _has_pending_tool_results = False
                 elif session.is_waiting():
                     # 正在等待中，检查是否有超时
                     from .thinker.timeout_handler import TimeoutHandler
@@ -292,6 +255,7 @@ class KokoroFlowChatter(BaseChatter):
                     await self.flush_unreads(unread_msgs if unread_msgs else [])
                 except Exception as e:
                     logger.error(f"LLM 请求失败: {e}", exc_info=True)
+                    await self._save_session(session)
                     yield Failure("LLM 请求失败", e)
                     continue
 
@@ -328,44 +292,13 @@ class KokoroFlowChatter(BaseChatter):
                     await self._save_session(session)
                     return
 
-                # ── 第三方工具回传：tool result → LLM 二次生成 ──
+                # ── 第三方工具回传：标记待处理，下轮循环继续 ──
                 if result.has_third_party and not result.has_reply and not result.has_do_nothing:
-                    logger.debug("仅第三方工具调用，回传 tool result 给 LLM 做二次生成")
-                    try:
-                        response = await self._send_with_perceive_loop(
-                            response, config.general.max_compat_retries
-                        )
-                    except Exception as e:
-                        logger.error(f"工具回传后 LLM 请求失败: {e}", exc_info=True)
-                        yield Failure("工具回传后 LLM 请求失败", e)
-                        continue
-
-                    # 重新解析第二轮响应
-                    trigger_msg = unread_msgs[-1] if unread_msgs else None
-                    result = await parse_tool_calls(
-                        response, usable_map, trigger_msg, config,
-                        execute_reply_fn=self._execute_reply,
-                        run_tool_call_fn=self.run_tool_call,
+                    logger.debug(
+                        "第三方工具调用完成，tool_result 已积累到 response 链，下轮循环继续"
                     )
-                    log_kfc_result(result, config)
-                    session.add_bot_planning(
-                        thought=result.thought,
-                        actions=result.actions,
-                        expected_reaction=result.expected_reaction,
-                        max_wait_seconds=result.max_wait_seconds,
-                    )
-
-                    # 二次生成后仍无有效动作 → 结束
-                    if not result.has_meaningful_action:
-                        yield Stop(0)
-                        await self._save_session(session)
-                        return
-
-                    if result.has_do_nothing and not result.has_reply:
-                        logger.debug("工具回传后 do_nothing，跳过本轮")
-                        yield Stop(0)
-                        await self._save_session(session)
-                        return
+                    _has_pending_tool_results = True
+                    continue
 
                 # ── 等待控制 ──
                 wait_seconds = config.wait.apply_rules(
@@ -396,6 +329,83 @@ class KokoroFlowChatter(BaseChatter):
         finally:
             if vlm_registered:
                 self._unregister_vlm_skip()
+
+    # ── LLM 上下文构建 ──────────────────────────────────────
+
+    async def _build_initial_context(
+        self,
+        chat_stream: ChatStream,
+        config: KFCConfig,
+        session: KFCSession,
+        model_set: Any,
+    ) -> tuple[Any, ImageBudget | None, ToolRegistry, KFCPromptBuilder, bool]:
+        """构建初始 LLM 上下文（系统提示 + 工具注册 + 图片预算）。
+
+        组装 LLM 请求所需的全部初始 payload：系统提示词、人物关系、
+        图片预算与历史叙事，并注册可用工具。
+
+        Args:
+            chat_stream: 当前聊天流
+            config: KFC 配置
+            session: 当前会话状态
+            model_set: LLM 模型配置
+
+        Returns:
+            tuple: (request, image_budget, usable_map, prompt_builder, has_history)
+        """
+        context_manager = LLMContextManager(
+            max_payloads=config.prompt.max_context_payloads
+        )
+        request = create_llm_request(
+            model_set,
+            "kokoro_flow_chatter",
+            context_manager=context_manager,
+        )
+
+        # 系统提示词
+        from .prompts.builder import KFCPromptBuilder
+
+        prompt_builder = KFCPromptBuilder()
+
+        # 注入自定义决策提示词（如果配置了）
+        extra_vars: dict[str, str] = {}
+        custom_prompt = config.general.custom_decision_prompt
+        if custom_prompt and custom_prompt.strip():
+            extra_vars["custom_decision_prompt"] = (
+                f"# 决策指导\n{custom_prompt.strip()}"
+            )
+
+        system_prompt = await prompt_builder.build_system_prompt(
+            chat_stream, extra_vars=extra_vars or None
+        )
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+
+        relation_text = prompt_builder.build_relation_context(chat_stream)
+        if relation_text:
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(relation_text)))
+
+        # 图片预算初始化（bot 已发图片 > 用户新消息图片 > 历史补充，共用同一总配额）
+        image_budget: ImageBudget | None = None
+        if config.general.native_multimodal:
+            from .multimodal import ImageBudget
+
+            image_budget = ImageBudget(config.general.max_images_per_payload)
+            # 预扣除 bot 自身近期发送的图片，确保其始终优先占用配额
+            self._deduct_bot_sent_images(chat_stream, image_budget)
+
+        # 历史消息 + 内心独白融合叙事（SYSTEM 角色，不会被上下文裁剪）
+        # 注意：历史图片不在此处消耗预算，由对话循环在获知新消息图片数量后再填充，
+        # 确保新消息图片优先占用预算，剩余配额才分配给历史图片。
+        history_text = prompt_builder.build_fused_narrative(
+            chat_stream, session.mental_log
+        )
+        if history_text:
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(history_text)))
+
+        # ── 注册工具（原生 Tool Calling） ──
+        usable_map = await self.inject_usables(request)
+
+        return request, image_budget, usable_map, prompt_builder, bool(history_text)
 
     # ── 两阶段感知-决策循环 ──────────────────────────────────
 
@@ -470,13 +480,16 @@ class KokoroFlowChatter(BaseChatter):
         content: str,
         config: KFCConfig,
         trigger_msg: Any | None = None,
-    ) -> None:
+    ) -> bool:
         """通过框架标准路径发送回复。
 
         Args:
             content: 回复文本内容
             config: KFC 配置
             trigger_msg: 触发消息，为 None 时构造虚拟消息
+
+        Returns:
+            bool: 是否发送成功
         """
         from .actions.reply import KFCReplyAction
 
@@ -484,12 +497,14 @@ class KokoroFlowChatter(BaseChatter):
             trigger_msg = await self._get_virtual_trigger_message()
             if trigger_msg is None:
                 logger.warning("无触发消息，无法发送回复")
-                return
+                return False
 
         try:
             await self.exec_llm_usable(KFCReplyAction, trigger_msg, content=content)
+            return True
         except Exception as e:
             logger.error(f"通过框架执行 KFCReplyAction 失败: {e}", exc_info=True)
+            return False
 
     # ── 辅助方法 ────────────────────────────────────────────
 
@@ -522,6 +537,102 @@ class KokoroFlowChatter(BaseChatter):
             get_media_manager().unskip_vlm_for_stream(self.stream_id)
         except Exception as e:
             logger.debug(f"注销 VLM 跳过失败: {e}")
+
+    def _deduct_bot_sent_images(
+        self,
+        chat_stream: Any,
+        image_budget: Any,
+    ) -> None:
+        """从预算中预扣除 bot 自身近期发送的图片数量。
+
+        bot 已发图片优先级最高，在图片预算初始化后立即调用，
+        使后续的用户新消息图片和历史图片只能使用剩余配额。
+
+        Args:
+            chat_stream: 当前聊天流
+            image_budget: 图片预算追踪器（刚完成初始化，尚未有任何消耗）
+        """
+        bot_id = str(getattr(chat_stream, "bot_id", "") or "")
+        if not bot_id:
+            return
+
+        history_msgs = getattr(
+            getattr(chat_stream, "context", None), "history_messages", []
+        )
+        if not history_msgs:
+            return
+
+        from .multimodal import extract_media_from_messages
+
+        # 逆序取最近 20 条，仅保留 bot 自己发送的消息
+        recent_bot_msgs = [
+            m
+            for m in reversed(history_msgs[-20:])
+            if str(getattr(m, "sender_id", "")) == bot_id
+        ]
+        if not recent_bot_msgs:
+            return
+
+        bot_items = extract_media_from_messages(
+            recent_bot_msgs, max_items=image_budget.remaining
+        )
+        if bot_items:
+            image_budget.consume(len(bot_items))
+            logger.debug(
+                f"多模态: bot 已发图片预扣除 {len(bot_items)} 张"
+                f" (剩余配额 {image_budget.remaining})"
+            )
+
+    def _extract_history_media(
+        self,
+        chat_stream: Any,
+        image_budget: Any,
+    ) -> list[Any] | None:
+        """从聊天历史中提取用户侧图片，用剩余预算填充，最新优先。
+
+        在 bot 已发图片（预扣除）和用户新消息图片（优先消耗）之后调用，
+        仅扫描非 bot 发送的历史消息，避免与预扣除步骤重复计算。
+
+        Args:
+            chat_stream: 当前聊天流
+            image_budget: 图片预算追踪器（已被 bot 图片和用户新消息消耗了对应配额）
+
+        Returns:
+            list | None: 历史图片列表，无可用图片或预算耗尽时返回 None
+        """
+        if image_budget.is_exhausted():
+            return None
+
+        history_msgs = getattr(
+            getattr(chat_stream, "context", None), "history_messages", []
+        )
+        if not history_msgs:
+            return None
+
+        from .multimodal import extract_media_from_messages
+
+        # 过滤掉 bot 自身发送的消息（bot 图片已在预算初始化时预扣除，不重复计算）
+        bot_id = str(getattr(chat_stream, "bot_id", "") or "")
+        recent_msgs = list(reversed(history_msgs[-20:]))
+        if bot_id:
+            recent_msgs = [
+                m for m in recent_msgs
+                if str(getattr(m, "sender_id", "")) != bot_id
+            ]
+
+        if not recent_msgs:
+            return None
+
+        items = extract_media_from_messages(recent_msgs, max_items=image_budget.remaining)
+        if not items:
+            return None
+
+        image_budget.consume(len(items))
+        logger.debug(
+            f"历史多模态: 提取到 {len(items)} 张用户图片/表情包"
+            f" (剩余配额 {image_budget.remaining})"
+        )
+        return items
 
     def _extract_media(
         self,
