@@ -229,6 +229,7 @@ class KokoroFlowChatter(BaseChatter):
                             return
 
                         # 构建超时 payload（委托给 PromptBuilder）
+                        from .prompts.builder import KFCPromptBuilder
                         timeout_payload = KFCPromptBuilder.build_timeout_payload(
                             elapsed_seconds=timeout_ctx["elapsed_seconds"],  # type: ignore[arg-type]
                             expected_reaction=timeout_ctx["expected_reaction"],  # type: ignore[arg-type]
@@ -287,10 +288,13 @@ class KokoroFlowChatter(BaseChatter):
                     return
 
                 if result.has_do_nothing and not result.has_reply:
-                    logger.debug("do_nothing，跳过本轮")
-                    yield Stop(0)
-                    await self._save_session(session)
-                    return
+                    if result.max_wait_seconds <= 0:
+                        # 无等待时间 → 直接结束本轮对话
+                        logger.debug("do_nothing（无等待），结束对话")
+                        await self._save_session(session)
+                        yield Stop(0)
+                        return
+                    # max_wait_seconds > 0 → 设置等待状态，继续走下方等待控制逻辑
 
                 # ── 第三方工具回传：标记待处理，下轮循环继续 ──
                 if result.has_third_party and not result.has_reply and not result.has_do_nothing:

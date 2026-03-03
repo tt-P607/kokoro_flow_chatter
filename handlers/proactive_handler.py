@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base.event_handler import BaseEventHandler
+from src.kernel.event import EventDecision
 
 if TYPE_CHECKING:
     from src.core.components.base.plugin import BasePlugin
@@ -39,8 +40,8 @@ class ProactiveHandler(BaseEventHandler):
     init_subscribe: list[EventType | str] = [_PROACTIVE_EVENT]
 
     async def execute(
-        self, kwargs: dict[str, Any] | None
-    ) -> tuple[bool, bool, str | None]:
+        self, event_name: str, params: dict[str, Any]
+    ) -> tuple[EventDecision, dict[str, Any]]:
         """处理主动发起事件。
 
         流程:
@@ -50,27 +51,24 @@ class ProactiveHandler(BaseEventHandler):
         4. 清除 StreamLoopManager 的 _wait_states 等待锁，唤醒流循环
 
         Args:
-            kwargs: 事件参数，需包含 ``stream_id`` 字段
+            event_name: 触发本处理器的事件名称
+            params: 事件参数，需包含 ``stream_id`` 字段
 
         Returns:
-            tuple[bool, bool, str | None]: (成功, 不拦截, 描述)
+            tuple[EventDecision, dict[str, Any]]: 决策与参数
         """
-        if not kwargs:
-            return False, False, "事件参数为空"
-
-        stream_id = kwargs.get("stream_id")
+        stream_id = params.get("stream_id")
         if not stream_id:
-            return False, False, "缺少 stream_id"
+            return EventDecision.PASS, params
 
         try:
             success = await self._wake_stream(stream_id)
             if success:
                 logger.info(f"主动发起: 流 {stream_id[:8]} 已唤醒")
-                return True, False, f"已唤醒流 {stream_id[:8]}"
-            return False, False, f"唤醒流 {stream_id[:8]} 失败"
+            return EventDecision.SUCCESS, params
         except Exception as e:
             logger.error(f"主动发起处理异常: {e}", exc_info=True)
-            return False, False, f"处理异常: {e}"
+            return EventDecision.PASS, params
 
     async def _wake_stream(self, stream_id: str) -> bool:
         """向目标流注入触发消息并唤醒流循环。
@@ -91,8 +89,19 @@ class ProactiveHandler(BaseEventHandler):
 
         context = chat_stream.context
 
+        # 尝试从 KFCSession 获取真实 user_id，避免 sender_id="system" 导致适配器 int() 转换失败
+        target_user_id: str = ""
+        try:
+            from ..plugin import KFCPlugin
+            if isinstance(self.plugin, KFCPlugin):
+                session = await self.plugin._session_store.get(stream_id)
+                if session and session.user_id:
+                    target_user_id = session.user_id
+        except Exception as e:
+            logger.debug(f"获取 session user_id 失败，将使用空值: {e}")
+
         # 构造系统触发消息
-        trigger_message = self._build_proactive_message(stream_id, chat_stream)
+        trigger_message = self._build_proactive_message(stream_id, chat_stream, target_user_id)
         context.add_unread_message(trigger_message)
         logger.debug(f"已注入主动发起触发消息到流 {stream_id[:8]}")
 
@@ -112,25 +121,31 @@ class ProactiveHandler(BaseEventHandler):
         return True
 
     @staticmethod
-    def _build_proactive_message(stream_id: str, chat_stream: Any) -> Any:
+    def _build_proactive_message(stream_id: str, chat_stream: Any, target_user_id: str = "") -> Any:
         """构造一条用于主动发起的系统触发消息。
 
         Args:
             stream_id: 目标流 ID
             chat_stream: 聊天流对象
+            target_user_id: 目标用户的真实 ID（QQ 号等），用于消息路由
 
         Returns:
             Message: 系统触发消息对象
         """
         from src.core.models.message import Message
 
+        extra_kwargs: dict[str, Any] = {}
+        if target_user_id:
+            extra_kwargs["target_user_id"] = target_user_id
+
         return Message(
             message_id=f"proactive_{uuid.uuid4().hex[:12]}",
             platform=chat_stream.platform or "unknown",
             stream_id=stream_id,
-            sender_id="system",
+            sender_id=target_user_id or "system",
             sender_name="系统",
             content="[主动发起] 你已经沉默很久了，主动找对方聊聊吧。",
             processed_plain_text="[主动发起] 你已经沉默很久了，主动找对方聊聊吧。",
             time=time.time(),
+            **extra_kwargs,
         )
