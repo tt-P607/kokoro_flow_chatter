@@ -95,8 +95,8 @@ async def parse_tool_calls(
 ) -> ToolCallResult:
     """遍历 LLM 返回的 call_list，提取元数据并执行动作。
 
-    先对所有 call 做一遍元数据收集（不执行任何动作），调用 pre_execute_hook
-    后再按序执行，确保调试日志在消息实际发出之前输出。
+    在遇到第一个 kfc_reply 之前，先执行一遍收集循环以提取所有元数据。
+    然后触发 pre_execute_hook 输出调试日志，最后按序执行所有动作。
 
     - kfc_reply: 提取元数据 + 调用 execute_reply_fn + 回传 ToolResult
     - do_nothing: 提取元数据 + 回传 ToolResult
@@ -115,8 +115,9 @@ async def parse_tool_calls(
         ToolCallResult: 结构化的解析结果
     """
     result = ToolCallResult()
+    is_first_reply = True
+    hook_called = False
 
-    # ── 第一遍：仅收集元数据，不执行任何动作 ──
     for call in response.call_list or []:
         args = _extract_args(call.args)
         # 归一化名称：框架可能返回 "action:kfc_reply" 格式
@@ -127,6 +128,7 @@ async def parse_tool_calls(
         action_dict.update(args)
         result.actions.append(action_dict)
 
+        # 对 kfc_reply 和 do_nothing 提取元数据
         if normalized_name == KFC_REPLY:
             result.has_reply = True
             extract_metadata(result, args)
@@ -136,16 +138,13 @@ async def parse_tool_calls(
         else:
             result.has_third_party = True
 
-    # ── 执行前钩子（在消息发出前输出调试日志）──
-    if pre_execute_hook is not None:
-        pre_execute_hook(result)
+        # 在执行第一个主要动作前触发 hook（输出调试日志）
+        if not hook_called and normalized_name in (KFC_REPLY, DO_NOTHING):
+            if pre_execute_hook is not None:
+                pre_execute_hook(result)
+            hook_called = True
 
-    # ── 第二遍：按序执行动作 ──
-    is_first_reply = True
-    for call in response.call_list or []:
-        args = _extract_args(call.args)
-        normalized_name = _normalize_call_name(call.name)
-
+        # 执行动作
         if normalized_name == KFC_REPLY:
             content = args.get("content", "")
             logger.debug(
@@ -192,6 +191,10 @@ async def parse_tool_calls(
         else:
             # 第三方工具：通过 run_tool_call 执行并回传结果
             await run_tool_call_fn(call, response, usable_map, trigger_msg)
+
+    # 如果没有 kfc_reply 或 do_nothing，也要触发 hook
+    if not hook_called and pre_execute_hook is not None:
+        pre_execute_hook(result)
 
     # 调试日志
     if config.debug.show_prompt:
