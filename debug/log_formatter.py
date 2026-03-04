@@ -18,9 +18,6 @@ if TYPE_CHECKING:
 
 logger = get_logger("kfc_debug")
 
-# 单个 payload 的最大展示字符数
-_MAX_CONTENT_LEN = 10000
-
 
 def format_prompt_for_log(response: Any) -> str:
     """从 LLM request/response 的 payload 列表中提取并格式化提示词。
@@ -80,9 +77,6 @@ def format_prompt_for_log(response: Any) -> str:
             text = "\n".join(text_parts)
         else:
             text = "（空）"
-
-        if len(text) > _MAX_CONTENT_LEN:
-            text = text[:_MAX_CONTENT_LEN] + "\n[...截断...]"
 
         parts.append(f"── {role_name} ──\n{text}")
 

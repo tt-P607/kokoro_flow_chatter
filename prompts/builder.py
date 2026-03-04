@@ -157,20 +157,10 @@ class KFCPromptBuilder:
 
     @staticmethod
     def _get_theme_guide(chat_stream: ChatStream) -> str:
-        """根据聊天类型返回场景引导文本。"""
-        chat_type = str(chat_stream.chat_type or "").lower()
-
-        if chat_type == "private":
-            return (
-                "你当前处于私聊环境。你可以更亲近地和对方交流，"
-                "关注对方情绪并提供更直接、细腻的回应。"
-            )
-        if chat_type == "group":
-            return (
-                "你当前处于群聊环境。注意多人对话的上下文，"
-                "确认对方确实在和你说话后再做出回应。"
-                "群聊中不要总是抢话，保持自然。"
-            )
+        """根据聊天类型返回场景引导文本。
+        
+        由于 KFC 是私聊特化的，暂不需要特殊的场景引导。
+        """
         return ""
 
     @staticmethod

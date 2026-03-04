@@ -220,6 +220,21 @@ class KokoroFlowChatter(BaseChatter):
 
                     timeout_handler = TimeoutHandler(config)
                     if timeout_handler.check_timeout(session):
+                        # 若 response 尾部仍是 tool_result，说明上一轮工具链尚未被 LLM
+                        # 承接闭合。此时不能直接注入 user 角色的超时 payload（会形成
+                        # tool_result → user 的非法序列），需先续轮让 LLM 承接工具结果，
+                        # 等工具链闭合后再处理超时。
+                        if (
+                            response.payloads
+                            and response.payloads[-1].role == ROLE.TOOL_RESULT
+                        ):
+                            logger.debug(
+                                "超时触发时 response 尾部为 tool_result，"
+                                "先闭合工具链再处理超时"
+                            )
+                            _has_pending_tool_results = True
+                            continue
+
                         timeout_ctx = timeout_handler.handle_timeout(session)
 
                         if timeout_handler.should_give_up(session):
@@ -266,10 +281,10 @@ class KokoroFlowChatter(BaseChatter):
                     response, usable_map, trigger_msg, config,
                     execute_reply_fn=self._execute_reply,
                     run_tool_call_fn=self.run_tool_call,
+                    pre_execute_hook=lambda r: log_kfc_result(r, config),
                 )
 
-                # 日志与活动流记录
-                log_kfc_result(result, config)
+                # 活动流记录
                 session.add_bot_planning(
                     thought=result.thought,
                     actions=result.actions,

@@ -91,8 +91,12 @@ async def parse_tool_calls(
     *,
     execute_reply_fn: Callable[[str, KFCConfig, Any | None], Awaitable[bool]],
     run_tool_call_fn: Callable[[Any, Any, ToolRegistry, Any | None], Awaitable[None]],
+    pre_execute_hook: Callable[[ToolCallResult], None] | None = None,
 ) -> ToolCallResult:
     """遍历 LLM 返回的 call_list，提取元数据并执行动作。
+
+    先对所有 call 做一遍元数据收集（不执行任何动作），调用 pre_execute_hook
+    后再按序执行，确保调试日志在消息实际发出之前输出。
 
     - kfc_reply: 提取元数据 + 调用 execute_reply_fn + 回传 ToolResult
     - do_nothing: 提取元数据 + 回传 ToolResult
@@ -105,13 +109,14 @@ async def parse_tool_calls(
         config: KFC 配置
         execute_reply_fn: 回复执行回调（chatter._execute_reply 的引用）
         run_tool_call_fn: 第三方工具执行回调（chatter.run_tool_call 的引用）
+        pre_execute_hook: 在执行任何动作前调用的钩子，接收预填好的 ToolCallResult
 
     Returns:
         ToolCallResult: 结构化的解析结果
     """
     result = ToolCallResult()
-    is_first_reply = True
 
+    # ── 第一遍：仅收集元数据，不执行任何动作 ──
     for call in response.call_list or []:
         args = _extract_args(call.args)
         # 归一化名称：框架可能返回 "action:kfc_reply" 格式
@@ -125,7 +130,23 @@ async def parse_tool_calls(
         if normalized_name == KFC_REPLY:
             result.has_reply = True
             extract_metadata(result, args)
+        elif normalized_name == DO_NOTHING:
+            result.has_do_nothing = True
+            extract_metadata(result, args)
+        else:
+            result.has_third_party = True
 
+    # ── 执行前钩子（在消息发出前输出调试日志）──
+    if pre_execute_hook is not None:
+        pre_execute_hook(result)
+
+    # ── 第二遍：按序执行动作 ──
+    is_first_reply = True
+    for call in response.call_list or []:
+        args = _extract_args(call.args)
+        normalized_name = _normalize_call_name(call.name)
+
+        if normalized_name == KFC_REPLY:
             content = args.get("content", "")
             logger.debug(
                 f"[KFC] kfc_reply args 详情: "
@@ -157,9 +178,6 @@ async def parse_tool_calls(
             )
 
         elif normalized_name == DO_NOTHING:
-            result.has_do_nothing = True
-            extract_metadata(result, args)
-
             response.add_payload(
                 LLMPayload(
                     ROLE.TOOL_RESULT,
@@ -173,7 +191,6 @@ async def parse_tool_calls(
 
         else:
             # 第三方工具：通过 run_tool_call 执行并回传结果
-            result.has_third_party = True
             await run_tool_call_fn(call, response, usable_map, trigger_msg)
 
     # 调试日志
