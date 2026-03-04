@@ -151,15 +151,7 @@ class KokoroFlowChatter(BaseChatter):
                 # 读取未读消息
                 formatted_text, unread_msgs = await self.fetch_unreads()
 
-                if formatted_text and unread_msgs:                    # 检查 response 是否需要闭合工具链
-                    # 若尾部仍是 tool_result，需要先让 LLM 处理，避免 tool_result → user 的非法序列
-                    if (
-                        response.payloads
-                        and response.payloads[-1].role == ROLE.TOOL_RESULT
-                    ):
-                        logger.debug("新消息到达时 response 尾部为 tool_result，先闭合工具链")
-                        _has_pending_tool_results = True
-                        continue
+                if formatted_text and unread_msgs:
                     _has_pending_tool_results = False
                     # 记录用户消息到活动流
                     for msg in unread_msgs:
