@@ -88,6 +88,25 @@ class KokoroFlowChatter(BaseChatter):
         """获取 Session Store（由 plugin.__init__ 初始化）。"""
         return self.plugin._session_store  # type: ignore[attr-defined]
 
+    async def modify_llm_usables(self, usables: list[Any]) -> list[Any]:
+        """过滤掉 kfc_reply 和 do_nothing，回复决策改走 JSON 文本，第三方工具仍走 tool calling。"""
+
+        def _is_reply_tool(u: Any) -> bool:
+            try:
+                schema = u.to_schema()
+                name: str = schema.get("function", schema).get("name", "") or ""
+            except Exception:
+                name = str(getattr(u, "name", "") or "")
+            # 归一化：兼容 "action-kfc_reply" / "action:kfc_reply" / "kfc_reply" 等格式
+            n = name.rsplit(":", 1)[-1]
+            for prefix in ("action-", "tool-", "agent-"):
+                if n.startswith(prefix):
+                    n = n[len(prefix):]
+                    break
+            return n in (KFC_REPLY, DO_NOTHING)
+
+        return [u for u in usables if not _is_reply_tool(u)]
+
     # ── 核心对话循环 ──────────────────────────────────────────
 
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
@@ -209,6 +228,22 @@ class KokoroFlowChatter(BaseChatter):
                         formatted_unreads=formatted_text,
                         media_items=media_items,
                     )
+
+                    # 工具链闭合守卫：若 response 尾部为 tool_result，
+                    # 直接追加 user 会形成非法序列（tool_result → user），
+                    # 需先插入一个 assistant 桥接 payload 以满足 LLM 上下文规则。
+                    if (
+                        response.payloads
+                        and response.payloads[-1].role == ROLE.TOOL_RESULT
+                    ):
+                        logger.debug(
+                            "新消息到达时 response 尾部为 tool_result，"
+                            "插入 assistant 桥接 payload 以闭合工具链"
+                        )
+                        response.add_payload(
+                            LLMPayload(ROLE.ASSISTANT, Text("好的。"))
+                        )
+
                     response.add_payload(user_payload)
 
                 elif _has_pending_tool_results:
@@ -471,6 +506,12 @@ class KokoroFlowChatter(BaseChatter):
 
             # 模型成功输出了工具调用 → 直接返回
             if new_response.call_list:
+                return new_response
+
+            # JSON 回复模式：消息文本中含有效回复 JSON → 视为完整响应，无需感知循环
+            from .reply_json import extract_json_reply
+            if extract_json_reply(getattr(new_response, "message", None)):
+                logger.debug("[KFC] 检测到 JSON 回复文本，视为完整响应直接返回")
                 return new_response
 
             # 模型输出了纯文本但没有工具调用（"破防"）

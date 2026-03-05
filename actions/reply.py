@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Annotated
 
@@ -29,8 +30,10 @@ class KFCReplyAction(BaseAction):
 
     action_name = "kfc_reply"
     action_description = (
-        "发送一段文本消息给对方。"
-        "你可以调用多次来分多段回复，每次提供你想说的话的纯文本内容。"
+        "发送文本消息给对方。"
+        "content 支持传入字符串数组来分段发送多条消息，每个元素是一条独立消息，"
+        "系统会按顺序逐条发出并自动模拟打字延迟。"
+        "也可以传单个字符串发送一条消息。"
         "注意：本工具无法发送表情包等非文本内容。"
     )
 
@@ -38,23 +41,55 @@ class KFCReplyAction(BaseAction):
 
     async def execute(
         self,
-        content: Annotated[str, "要发送的文本内容，不要添加标记，只写你想说的话"],
+        content: Annotated[
+            str | list[str],
+            "要发送的文本内容。"
+            "可传字符串数组以分段发送多条消息，例如 [\"等等！\", \"你说什么意思啊\"]；"
+            "也可传单个字符串发送一条消息。"
+            "不要添加任何标记，只写你想说的话。",
+        ],
         thought: Annotated[str, "你此刻的内心想法和感受，描述你为什么要这样回复"] = "",
         expected_reaction: Annotated[str, "你期望对方看到你这条消息后的反应"] = "",
         max_wait_seconds: Annotated[float, "你愿意等待对方回复的最长时间(秒)，0表示不等待"] = 0.0,
         mood: Annotated[str, "你当前的心情，用一两个词描述"] = "",
     ) -> tuple[bool, str]:
-        """执行发送文本消息的逻辑。"""
+        """执行发送文本消息的逻辑。
+
+        content 支持字符串或字符串列表，列表时逐条发送（parser 层处理延迟，
+        此处仅作降级兜底：直接发送第一条非空内容）。
+        """
         # thought/expected_reaction/max_wait_seconds/mood 由 chatter.py 的策略层提取，
         # action 本身不使用这些参数
-        if not content or not content.strip():
+
+        # 统一为列表，兼容三种格式：
+        # 1. 原生列表  2. JSON 字符串形式的列表  3. 普通字符串
+        if isinstance(content, list):
+            segments = [s.strip() for s in content if isinstance(s, str) and s.strip()]
+        elif isinstance(content, str):
+            stripped = content.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        segments = [s.strip() for s in parsed if isinstance(s, str) and s.strip()]
+                    else:
+                        segments = [stripped] if stripped else []
+                except Exception:
+                    segments = [stripped] if stripped else []
+            else:
+                segments = [stripped] if stripped else []
+        else:
+            segments = []
+
+        if not segments:
             return False, "内容为空，未发送"
 
-        content = content.strip()
+        # parser 层已处理多段逻辑；此处仅发送第一段作为兜底
+        segment = segments[0]
 
         # 最后防线：仅当 >=2 个元数据关键字同时出现时才截断，降低误伤
         keyword_matches = [
-            p.search(content) for p in _METADATA_PATTERNS
+            p.search(segment) for p in _METADATA_PATTERNS
         ]
         hit_count = sum(1 for m in keyword_matches if m is not None)
         if hit_count >= 2:
@@ -62,19 +97,19 @@ class KFCReplyAction(BaseAction):
             earliest = min(
                 (m.start() for m in keyword_matches if m is not None),
             )
-            cleaned = content[:earliest].strip()
+            cleaned = segment[:earliest].strip()
             logger.warning(
                 f"[最后防线] 检测到 content 中混入 {hit_count} 个元数据关键字，已截断。"
-                f"原始长度={len(content)}，截断后={len(cleaned)}"
+                f"原始长度={len(segment)}，截断后={len(cleaned)}"
             )
-            content = cleaned
-            if not content:
+            segment = cleaned
+            if not segment:
                 return False, "清洗后内容为空，未发送"
 
-        success = await self._send_to_stream(content)
+        success = await self._send_to_stream(segment)
         if not success:
             return False, "消息发送失败"
 
-        return True, f"已发送消息: {content[:80]}"
+        return True, f"已发送消息: {segment[:80]}"
 
 

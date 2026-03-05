@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.kernel.llm import ROLE
 
 from ..models import KFC_REPLY, DO_NOTHING
 
@@ -19,8 +20,52 @@ if TYPE_CHECKING:
 logger = get_logger("kfc_debug")
 
 
+def _extract_payload_text(payload: Any) -> tuple[list[str], list[str]]:
+    """从单个 payload 中提取文本片段和工具名称。
+
+    Returns:
+        tuple: (text_parts, tool_names)
+    """
+    content_list = getattr(payload, "content", [])
+    if not isinstance(content_list, list):
+        content_list = [content_list]
+
+    text_parts: list[str] = []
+    tool_names: list[str] = []
+    for item in content_list:
+        if hasattr(item, "text"):
+            text_parts.append(item.text)
+        elif (
+            hasattr(item, "value")
+            and hasattr(item, "__class__")
+            and item.__class__.__name__ == "Image"
+        ):
+            data_preview = str(item.value)[:40]
+            text_parts.append(f"[图片: {data_preview}...]")
+        elif hasattr(item, "to_text"):
+            text_parts.append(item.to_text())
+        elif hasattr(item, "to_schema"):
+            schema = item.to_schema()
+            func_info = schema.get("function", schema)
+            name = func_info.get("name", type(item).__name__)
+            tool_names.append(name)
+        else:
+            text_parts.append(str(item))
+    return text_parts, tool_names
+
+
 def format_prompt_for_log(response: Any) -> str:
     """从 LLM request/response 的 payload 列表中提取并格式化提示词。
+
+    渲染顺序（符合阅读习惯，首尾最重要）：
+    1. SYSTEM（人设 / 关系）：固定在最前，快速定位角色设定
+    2. TOOLS（API tools 参数，不进入消息流）：放中间，了解可用能力
+    3. SYSTEM（历史叙事）+ 对话轮次 + 新消息：贴在一块放末尾，
+       历史叙事与最新消息上下文相邻，便于阅读完整的对话脉络
+
+    历史叙事识别方式：context 构建时注入顺序固定为
+    人设 → 关系文本 → 历史叙事，因此最后一个 SYSTEM payload
+    即为历史叙事（仅当 SYSTEM > 1 条时才拆分）。
 
     Args:
         response: LLMRequest 或 LLMResponse 对象
@@ -32,55 +77,57 @@ def format_prompt_for_log(response: Any) -> str:
     if not payloads:
         return "（无 payload）"
 
-    parts: list[str] = []
+    system_parts: list[str] = []
+    convo_parts: list[str] = []
+    all_tool_names: list[str] = []
+
     for payload in payloads:
         role = getattr(payload, "role", None)
+        text_parts, tool_names = _extract_payload_text(payload)
+
+        if role == ROLE.TOOL:
+            # TOOL role 对应 API 的 tools 参数，不进入消息流，单独收集
+            all_tool_names.extend(tool_names)
+            continue
+
         role_name = str(role.value).upper() if hasattr(role, "value") else str(role)
+        text = "\n".join(text_parts) if text_parts else "（空）"
+        line = f"── {role_name} ──\n{text}"
 
-        content_list = getattr(payload, "content", [])
-        if not isinstance(content_list, list):
-            content_list = [content_list]
-
-        text_parts: list[str] = []
-        tool_names: list[str] = []
-        for item in content_list:
-            if hasattr(item, "text"):
-                text_parts.append(item.text)
-            elif (
-                hasattr(item, "value")
-                and hasattr(item, "__class__")
-                and item.__class__.__name__ == "Image"
-            ):
-                data_preview = str(item.value)[:40]
-                text_parts.append(f"[图片: {data_preview}...]")
-            elif hasattr(item, "to_text"):
-                text_parts.append(item.to_text())
-            elif hasattr(item, "to_schema"):
-                schema = item.to_schema()
-                func_info = schema.get("function", schema)
-                name = func_info.get("name", type(item).__name__)
-                tool_names.append(name)
-            else:
-                text_parts.append(str(item))
-
-        tool_count = len(tool_names)
-        tool_summary = (
-            f"[{tool_count} 个工具: {', '.join(tool_names)}]"
-            if tool_names
-            else ""
-        )
-        if tool_count > 0 and not text_parts:
-            text = tool_summary
-        elif tool_count > 0:
-            text = "\n".join(text_parts) + f"\n[+ {tool_summary}]"
-        elif text_parts:
-            text = "\n".join(text_parts)
+        if role == ROLE.SYSTEM:
+            system_parts.append(line)
         else:
-            text = "（空）"
+            convo_parts.append(line)
 
-        parts.append(f"── {role_name} ──\n{text}")
+    # 拆分 SYSTEM：当只有 1 条时全归人设段；≥2 条时最后一条为历史叙事
+    if len(system_parts) >= 2:
+        persona_parts = system_parts[:-1]
+        history_part = system_parts[-1]
+    else:
+        persona_parts = system_parts
+        history_part = None
 
-    return "\n\n".join(parts)
+    sections: list[str] = []
+
+    # 1. 人设 / 关系（最前）
+    if persona_parts:
+        sections.extend(persona_parts)
+
+    # 2. 工具列表（中间）
+    if all_tool_names:
+        tool_count = len(all_tool_names)
+        sections.append(
+            f"── TOOLS (API 参数，不进入消息流) ──\n"
+            f"[{tool_count} 个工具: {', '.join(all_tool_names)}]"
+        )
+
+    # 3. 历史叙事 + 对话轮次 + 新消息（末尾，紧密相邻）
+    if history_part:
+        sections.append(history_part)
+    if convo_parts:
+        sections.extend(convo_parts)
+
+    return "\n\n".join(sections) if sections else "（无 payload）"
 
 
 def log_kfc_result(result: ToolCallResult, config: KFCConfig) -> None:
@@ -99,9 +146,14 @@ def log_kfc_result(result: ToolCallResult, config: KFCConfig) -> None:
     for action in result.actions:
         action_type = action.get("type", "")
         if action_type in (KFC_REPLY, "respond"):
-            content = action.get("content", "")
+            content = action.get("content")
             if content:
-                logger.info(f"[bold green]💬[/bold green] {content}")
+                if isinstance(content, list):
+                    for i, seg in enumerate(content, 1):
+                        prefix = f"[{i}/{len(content)}] " if len(content) > 1 else ""
+                        logger.info(f"[bold green]💬[/bold green] {prefix}{seg}")
+                else:
+                    logger.info(f"[bold green]💬[/bold green] {content}")
         elif action_type == DO_NOTHING:
             logger.info("[bold yellow]⏳[/bold yellow] 选择不回复")
         elif action_type not in ("no_action",):
