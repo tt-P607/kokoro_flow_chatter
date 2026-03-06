@@ -58,6 +58,13 @@ class KFCConfig(BaseConfig):
                 "会被注入到系统提示词的安全准则之后。留空则不生效。"
             ),
         )
+        blocked_tools: list[str] = Field(
+            default_factory=list,
+            description=(
+                "需要从工具列表中屏蔽的工具末段名称（不含组件类型前缀）。"
+                "列表中的工具不会暴露给 LLM。"
+            ),
+        )
 
     @config_section("wait")
     class WaitSection(SectionBase):

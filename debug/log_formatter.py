@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -20,18 +21,18 @@ if TYPE_CHECKING:
 logger = get_logger("kfc_debug")
 
 
-def _extract_payload_text(payload: Any) -> tuple[list[str], list[str]]:
-    """从单个 payload 中提取文本片段和工具名称。
+def _extract_payload_text(payload: Any) -> tuple[list[str], list[dict[str, Any]]]:
+    """从单个 payload 中提取文本片段和工具 schema。
 
     Returns:
-        tuple: (text_parts, tool_names)
+        tuple: (text_parts, tool_schemas)
     """
     content_list = getattr(payload, "content", [])
     if not isinstance(content_list, list):
         content_list = [content_list]
 
     text_parts: list[str] = []
-    tool_names: list[str] = []
+    tool_schemas: list[dict[str, Any]] = []
     for item in content_list:
         if hasattr(item, "text"):
             text_parts.append(item.text)
@@ -46,12 +47,10 @@ def _extract_payload_text(payload: Any) -> tuple[list[str], list[str]]:
             text_parts.append(item.to_text())
         elif hasattr(item, "to_schema"):
             schema = item.to_schema()
-            func_info = schema.get("function", schema)
-            name = func_info.get("name", type(item).__name__)
-            tool_names.append(name)
+            tool_schemas.append(schema)
         else:
             text_parts.append(str(item))
-    return text_parts, tool_names
+    return text_parts, tool_schemas
 
 
 def format_prompt_for_log(response: Any) -> str:
@@ -79,15 +78,15 @@ def format_prompt_for_log(response: Any) -> str:
 
     system_parts: list[str] = []
     convo_parts: list[str] = []
-    all_tool_names: list[str] = []
+    all_tool_schemas: list[dict[str, Any]] = []
 
     for payload in payloads:
         role = getattr(payload, "role", None)
-        text_parts, tool_names = _extract_payload_text(payload)
+        text_parts, tool_schemas = _extract_payload_text(payload)
 
         if role == ROLE.TOOL:
             # TOOL role 对应 API 的 tools 参数，不进入消息流，单独收集
-            all_tool_names.extend(tool_names)
+            all_tool_schemas.extend(tool_schemas)
             continue
 
         role_name = str(role.value).upper() if hasattr(role, "value") else str(role)
@@ -114,12 +113,33 @@ def format_prompt_for_log(response: Any) -> str:
         sections.extend(persona_parts)
 
     # 2. 工具列表（中间）
-    if all_tool_names:
-        tool_count = len(all_tool_names)
-        sections.append(
-            f"── TOOLS (API 参数，不进入消息流) ──\n"
-            f"[{tool_count} 个工具: {', '.join(all_tool_names)}]"
-        )
+    if all_tool_schemas:
+        tool_count = len(all_tool_schemas)
+        tools_section = f"── TOOLS (API 参数，不进入消息流) ──\n"
+        tools_section += f"[共 {tool_count} 个工具]\n\n"
+        
+        for i, schema in enumerate(all_tool_schemas, 1):
+            func_info = schema.get("function", schema)
+            name = func_info.get("name", "unknown")
+            desc = func_info.get("description", "（无描述）")
+            params = func_info.get("parameters", {})
+            
+            tools_section += f"{i}. {name}\n"
+            tools_section += f"   描述: {desc}\n"
+            
+            if params and isinstance(params, dict):
+                required = params.get("required", [])
+                properties = params.get("properties", {})
+                if properties:
+                    tools_section += f"   参数:\n"
+                    for param_name, param_info in properties.items():
+                        param_desc = param_info.get("description", "")
+                        param_type = param_info.get("type", "unknown")
+                        is_required = "必需" if param_name in required else "可选"
+                        tools_section += f"     - {param_name} ({param_type}) [{is_required}]: {param_desc}\n"
+            tools_section += "\n"
+        
+        sections.append(tools_section.rstrip())
 
     # 3. 历史叙事 + 对话轮次 + 新消息（末尾，紧密相邻）
     if history_part:

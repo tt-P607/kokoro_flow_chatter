@@ -18,15 +18,64 @@ from src.app.plugin_system.api.log_api import get_logger
 
 logger = get_logger("kfc_reply_json")
 
-# JSON 代码块（```json...``` 或 ```...```）
-_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-# 裸 JSON 对象（贪婪匹配最外层大括号，支持嵌套）
-_JSON_BARE_RE = re.compile(r"\{.*\}", re.DOTALL)
-
 # 识别关键字：解析出的 dict 必须含其中至少一个才认定为 KFC 回复 JSON
 _REPLY_KEYS: frozenset[str] = frozenset(
     {"content", "thought", "expected_reaction", "max_wait_seconds", "mood"}
 )
+
+
+def _extract_balanced_json(text: str) -> list[str]:
+    """用括号深度扫描从文本中提取所有完整 JSON 对象字符串。
+
+    正确处理嵌套括号和字符串内的 `{}`，不受 regex 非贪婪截断影响。
+
+    Args:
+        text: 待扫描的原始文本
+
+    Returns:
+        list[str]: 所有找到的顶层 JSON 对象字符串
+    """
+    results: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape_next = False
+        start = i
+        j = i
+        while j < n:
+            c = text[j]
+            if escape_next:
+                escape_next = False
+                j += 1
+                continue
+            if c == "\\" and in_string:
+                escape_next = True
+                j += 1
+                continue
+            if c == '"':
+                in_string = not in_string
+                j += 1
+                continue
+            if in_string:
+                j += 1
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    results.append(text[start : j + 1])
+                    i = j + 1
+                    break
+            j += 1
+        else:
+            break  # 未找到匹配的 }，停止扫描
+    return results
 
 
 def extract_json_reply(text: str | None) -> dict[str, Any] | None:
@@ -34,6 +83,10 @@ def extract_json_reply(text: str | None) -> dict[str, Any] | None:
 
     识别规则：解析出的 dict 必须包含至少一个回复相关键
     (content / thought / expected_reaction / max_wait_seconds / mood)。
+
+    提取策略（按优先级）：
+    1. 代码块内 JSON（```json...```），用括号平衡扫描确保嵌套完整
+    2. 裸 JSON 对象，同样用括号平衡扫描
 
     Args:
         text: LLM 响应的原始文本
@@ -46,15 +99,19 @@ def extract_json_reply(text: str | None) -> dict[str, Any] | None:
 
     candidates: list[str] = []
 
-    # 优先尝试代码块格式（精确）
-    for m in _JSON_BLOCK_RE.finditer(text):
-        candidates.append(m.group(1))
+    # 优先尝试代码块内容（用括号平衡扫描，避免非贪婪截断）
+    for block_m in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text):
+        block_content = block_m.group(1)
+        candidates.extend(_extract_balanced_json(block_content))
 
-    # 再尝试裸 JSON（宽松）
-    for m in _JSON_BARE_RE.finditer(text):
-        candidates.append(m.group(0))
+    # 再从整个文本中用括号平衡扫描提取裸 JSON
+    candidates.extend(_extract_balanced_json(text))
 
+    seen: set[str] = set()
     for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         try:
             data = json.loads(candidate)
             if isinstance(data, dict) and _REPLY_KEYS & data.keys():

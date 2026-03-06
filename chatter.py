@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator
 from src.app.plugin_system.api.llm_api import (
     create_llm_request,
     get_model_set_by_task,
+    get_model_set_by_name,
 )
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import (
@@ -34,7 +35,7 @@ from src.kernel.llm import Content, LLMContextManager, LLMPayload, ROLE, Text, T
 from .debug.log_formatter import format_prompt_for_log, log_kfc_result
 from .models import KFC_REPLY, DO_NOTHING, ToolCallResult
 from .parser import parse_tool_calls
-from .prompts.templates import KFC_PERCEIVE_FOLLOWUP_PROMPT
+from .prompts.templates import KFC_PERCEIVE_FOLLOWUP_PROMPT, KFC_TOOL_INTENT_FOLLOWUP_PROMPT
 
 if TYPE_CHECKING:
     from src.core.models.stream import ChatStream
@@ -89,7 +90,11 @@ class KokoroFlowChatter(BaseChatter):
         return self.plugin._session_store  # type: ignore[attr-defined]
 
     async def modify_llm_usables(self, usables: list[Any]) -> list[Any]:
-        """过滤掉 kfc_reply 和 do_nothing，回复决策改走 JSON 文本，第三方工具仍走 tool calling。"""
+        """过滤掉 kfc_reply 和 do_nothing，回复决策改走 JSON 文本，第三方工具仍走 tool calling。
+        额外过滤 config.general.blocked_tools 中指定的工具名。
+        """
+        config = self._get_config()
+        _blocked = frozenset([KFC_REPLY, DO_NOTHING, *config.general.blocked_tools])
 
         def _is_reply_tool(u: Any) -> bool:
             try:
@@ -103,7 +108,7 @@ class KokoroFlowChatter(BaseChatter):
                 if n.startswith(prefix):
                     n = n[len(prefix):]
                     break
-            return n in (KFC_REPLY, DO_NOTHING)
+            return n in _blocked
 
         return [u for u in usables if not _is_reply_tool(u)]
 
@@ -347,6 +352,15 @@ class KokoroFlowChatter(BaseChatter):
                     # max_wait_seconds > 0 → 设置等待状态，继续走下方等待控制逻辑
 
                 # ── 第三方工具回传：标记待处理，下轮循环继续 ──
+                # has_info_tool（agent-/tool-）：有实际返回值，无论 content 是否为 []
+                # 都需要立即续轮让 LLM 看到结果后正式回复。
+                # 普通 action 工具（TTS、emoji 等）仍保持原有行为（不续轮）。
+                if result.has_info_tool and not result.has_reply:
+                    logger.debug(
+                        "信息工具调用完成，tool_result 已积累到 response 链，立即续轮"
+                    )
+                    _has_pending_tool_results = True
+                    continue
                 if result.has_third_party and not result.has_reply and not result.has_do_nothing:
                     logger.debug(
                         "第三方工具调用完成，tool_result 已积累到 response 链，下轮循环继续"
@@ -508,10 +522,35 @@ class KokoroFlowChatter(BaseChatter):
             if new_response.call_list:
                 return new_response
 
-            # JSON 回复模式：消息文本中含有效回复 JSON → 视为完整响应，无需感知循环
-            from .reply_json import extract_json_reply
-            if extract_json_reply(getattr(new_response, "message", None)):
-                logger.debug("[KFC] 检测到 JSON 回复文本，视为完整响应直接返回")
+            # JSON 回复模式：检查消息文本是否含有效 JSON
+            from .reply_json import extract_json_reply, normalize_reply_data
+            json_data = extract_json_reply(getattr(new_response, "message", None))
+
+            if json_data:
+                norm = normalize_reply_data(json_data)
+                # JSON 有实际回复内容 → 完整响应，无需感知循环
+                if not norm["is_do_nothing"]:
+                    logger.debug("[KFC] 检测到含内容的 JSON 回复，直接返回")
+                    return new_response
+
+                # JSON 是 do_nothing（content=null）且没有工具调用 →
+                # 模型把工具调用意图写进了 thought 但没有真正发出 tool_call，
+                # 注入提示强制其发起实际调用
+                if attempt < max_retries:
+                    thought_preview = (norm.get("thought") or "")[:60]
+                    logger.info(
+                        f"[KFC] do_nothing + 无工具调用（可能存在工具意图未落地），"
+                        f"注入强制提示重试 (第 {attempt + 1} 轮)"
+                        f"{': ' + thought_preview + '...' if thought_preview else ''}"
+                    )
+                    new_response.add_payload(
+                        LLMPayload(ROLE.USER, Text(KFC_TOOL_INTENT_FOLLOWUP_PROMPT))
+                    )
+                    response = new_response
+                    continue
+
+                # 重试耗尽，原样返回 do_nothing
+                logger.debug("[KFC] do_nothing + 无工具调用，重试耗尽，直接返回")
                 return new_response
 
             # 模型输出了纯文本但没有工具调用（"破防"）

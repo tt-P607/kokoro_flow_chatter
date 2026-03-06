@@ -48,6 +48,9 @@ class ToolCallResult:
     has_third_party: bool = False
     """是否包含第三方工具调用"""
 
+    has_info_tool: bool = False
+    """是否包含 agent-* / tool-* 类工具调用（有实际返回值，需立即续轮让 LLM 看到结果）"""
+
     @property
     def has_meaningful_action(self) -> bool:
         """是否包含任何有效动作（回复、do_nothing 或第三方工具）。"""

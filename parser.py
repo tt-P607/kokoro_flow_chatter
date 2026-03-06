@@ -255,6 +255,9 @@ async def parse_tool_calls(
 
         # 第三方工具
         result.has_third_party = True
+        # agent-* / tool-* 有实际返回值，需要续轮让 LLM 看到结果后才能正式回复
+        if call.name.startswith(("agent-", "tool-")):
+            result.has_info_tool = True
         action_dict = {"type": normalized_name}
         action_dict.update(args)
         result.actions.append(action_dict)
