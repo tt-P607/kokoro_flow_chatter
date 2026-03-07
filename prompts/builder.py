@@ -54,6 +54,7 @@ class KFCPromptBuilder:
         tmpl.set("platform", chat_stream.platform or "unknown")
         tmpl.set("chat_type", str(chat_stream.chat_type or "unknown"))
         tmpl.set("bot_id", chat_stream.bot_id or "")
+        tmpl.set("stream_id", str(chat_stream.stream_id or ""))
         tmpl.set(
             "current_time",
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -65,6 +66,9 @@ class KFCPromptBuilder:
         # 场景引导
         theme_guide = self._get_theme_guide(chat_stream)
         tmpl.set("theme_guide", theme_guide)
+
+        # 聊天流标识（供 on_prompt_build 事件处理器读取）
+        tmpl.set("stream_id", chat_stream.stream_id or "")
 
         # 额外变量
         if extra_vars:

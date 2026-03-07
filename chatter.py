@@ -316,7 +316,13 @@ class KokoroFlowChatter(BaseChatter):
                     continue
 
                 # ── 解析 + 执行 ──
+                # 超时主动触发时 unread_msgs 为空，trigger_msg 会是 None，
+                # 导致所有 action 工具（send_emoji、music_search 等）执行被跳过。
+                # 借用 _get_virtual_trigger_message() 补一个虚拟触发消息，
+                # 确保超时场景下 action 工具能正常执行。
                 trigger_msg = unread_msgs[-1] if unread_msgs else None
+                if trigger_msg is None:
+                    trigger_msg = await self._get_virtual_trigger_message()
                 result = await parse_tool_calls(
                     response, usable_map, trigger_msg, config,
                     execute_reply_fn=self._execute_reply,
