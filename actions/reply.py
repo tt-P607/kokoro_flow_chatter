@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Annotated
+from typing import Annotated, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base.action import BaseAction
@@ -34,6 +34,7 @@ class KFCReplyAction(BaseAction):
         "content 支持传入字符串数组来分段发送多条消息，每个元素是一条独立消息，"
         "系统会按顺序逐条发出并自动模拟打字延迟。"
         "也可以传单个字符串发送一条消息。"
+        "可选的 reply_to 参数允许你引用消息（虽然私聊中较少用到，但引用旧消息时可能有用）。"
         "注意：本工具无法发送表情包等非文本内容。"
     )
 
@@ -52,11 +53,13 @@ class KFCReplyAction(BaseAction):
         expected_reaction: Annotated[str, "你期望对方看到你这条消息后的反应"] = "",
         max_wait_seconds: Annotated[float, "你愿意等待对方回复的最长时间(秒)，0表示不等待"] = 0.0,
         mood: Annotated[str, "你当前的心情，用一两个词描述"] = "",
+        reply_to: Annotated[str, "可选，要引用回复的消息 ID"] = "",
     ) -> tuple[bool, str]:
         """执行发送文本消息的逻辑。
 
         content 支持字符串或字符串列表，列表时逐条发送（parser 层处理延迟，
         此处仅作降级兜底：直接发送第一条非空内容）。
+        reply_to 为可选的引用消息 ID。
         """
         # thought/expected_reaction/max_wait_seconds/mood 由 chatter.py 的策略层提取，
         # action 本身不使用这些参数
@@ -106,10 +109,64 @@ class KFCReplyAction(BaseAction):
             if not segment:
                 return False, "清洗后内容为空，未发送"
 
-        success = await self._send_to_stream(segment)
-        if not success:
-            return False, "消息发送失败"
+        # 如果指定了 reply_to，创建带 reply_to 的 Message 对象
+        if reply_to:
+            from src.core.models.message import Message, MessageType
+            from src.core.managers.adapter_manager import get_adapter_manager
+            from uuid import uuid4
+            
+            target_stream_id = self.chat_stream.stream_id
+            platform = self.chat_stream.platform
+            chat_type = self.chat_stream.chat_type
+            context = self.chat_stream.context
+            
+            bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
+            
+            target_user_id = None
+            target_user_name = None
+            
+            def _get_last_context_message() -> Message | None:
+                if context.unread_messages:
+                    return context.unread_messages[-1]
+                if context.history_messages:
+                    return context.history_messages[-1]
+                return context.current_message
+            
+            last_msg = _get_last_context_message()
+            
+            if last_msg:
+                target_user_id = last_msg.sender_id
+                target_user_name = last_msg.sender_name
+            
+            extra: dict[str, Any] = {}
+            if target_user_id:
+                extra["target_user_id"] = target_user_id
+            if target_user_name:
+                extra["target_user_name"] = target_user_name
+            
+            message = Message(
+                message_id=f"action_{self.action_name}_{uuid4().hex}",
+                content=segment,
+                processed_plain_text=segment,
+                message_type=MessageType.TEXT,
+                sender_id=bot_info.get("bot_id", "") if bot_info else "",
+                sender_name=bot_info.get("bot_nickname", "Bot") if bot_info else "Bot",
+                platform=platform,
+                chat_type=chat_type,
+                stream_id=target_stream_id,
+                reply_to=reply_to,
+                **extra,
+            )
+            
+            from src.core.transport.message_send import get_message_sender
+            sender = get_message_sender()
+            success = await sender.send_message(message)
+            return success, f"已发送消息: {segment[:80]}"
+        else:
+            success = await self._send_to_stream(segment)
+            if not success:
+                return False, "消息发送失败"
 
-        return True, f"已发送消息: {segment[:80]}"
+            return True, f"已发送消息: {segment[:80]}"
 
 

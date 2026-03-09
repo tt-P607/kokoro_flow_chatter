@@ -179,3 +179,7 @@ def _get_media_list(msg: Message) -> list[dict[str, Any]]:
         return [{"type": "emoji", "data": data}]
 
     return []
+
+
+# 公开别名，供外部模块（如 chatter.py）直接调用
+get_media_list = _get_media_list

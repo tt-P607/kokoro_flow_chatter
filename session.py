@@ -70,6 +70,7 @@ class KFCSession:
         user_name: str,
         user_id: str,
         timestamp: float | None = None,
+        message_id: str = "",
     ) -> MentalLogEntry:
         """记录用户消息到活动流。"""
         msg_time = timestamp or time.time()
@@ -79,6 +80,7 @@ class KFCSession:
             content=content,
             user_name=user_name,
             user_id=user_id,
+            message_id=message_id,
         )
 
         # 标记回复时效

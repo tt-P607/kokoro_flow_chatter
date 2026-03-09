@@ -165,5 +165,6 @@ def normalize_reply_data(data: dict[str, Any]) -> dict[str, Any]:
         "expected_reaction": str(data.get("expected_reaction", "")).strip(),
         "max_wait_seconds": float(data.get("max_wait_seconds", 0) or 0),
         "mood": str(data.get("mood", "")).strip(),
+        "reply_to": str(data.get("reply_to", "") or "").strip(),
         "is_do_nothing": content is None,
     }

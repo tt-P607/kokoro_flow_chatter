@@ -26,6 +26,7 @@ class MentalLogEntry:
     # 用户消息相关
     user_name: str = ""
     user_id: str = ""
+    message_id: str = ""
 
     # Bot 规划相关
     thought: str = ""
@@ -53,6 +54,7 @@ class MentalLogEntry:
             "content": self.content,
             "user_name": self.user_name,
             "user_id": self.user_id,
+            "message_id": self.message_id,
             "thought": self.thought,
             "actions": self.actions,
             "expected_reaction": self.expected_reaction,
@@ -78,6 +80,7 @@ class MentalLogEntry:
             content=data.get("content", ""),
             user_name=data.get("user_name", ""),
             user_id=data.get("user_id", ""),
+            message_id=data.get("message_id", ""),
             thought=data.get("thought", ""),
             actions=data.get("actions", []),
             expected_reaction=data.get("expected_reaction", ""),
@@ -187,7 +190,8 @@ class MentalLog:
 
         if event == KFCEventType.USER_MESSAGE:
             name = entry.user_name or "用户"
-            return f"[{time_str}] {name} 说：{entry.content}"
+            msg_id_part = f" [消息id:{entry.message_id}]" if entry.message_id else ""
+            return f"[{time_str}] {name}{msg_id_part}说：{entry.content}"
 
         if event == KFCEventType.BOT_PLANNING:
             parts = [f"[{time_str}] 你的内心想法：{entry.thought}"]

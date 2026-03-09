@@ -79,6 +79,43 @@ class KokoroFlowChatter(BaseChatter):
             return plugin_config
         return KFCConfig()
 
+    @staticmethod
+    def format_message_line(msg: Any, time_format: str = "%H:%M") -> str:  # type: ignore[override]
+        """将单条消息格式化为带标签的显示行（KFC 层覆盖）。
+
+        格式：》时间》[QQ:xxx] 昵称 [\u6d88\u606fid:xxx]\uff1a \u5185\u5bb9
+        两种括号将意義明确区分，避免模型将 QQ 号与消息 ID 混淡。
+        """
+        from datetime import datetime as _dt
+
+        raw_time = getattr(msg, "time", None)
+        if isinstance(raw_time, (int, float)):
+            time_str = _dt.fromtimestamp(raw_time).strftime(time_format)
+        elif isinstance(raw_time, _dt):
+            time_str = raw_time.strftime(time_format)
+        else:
+            time_str = str(raw_time or "")
+
+        role_raw = getattr(msg, "sender_role", None)
+        role_str = BaseChatter._format_role(role_raw)
+        role_part = f"<{role_str}> " if role_str else ""
+
+        platform_id = getattr(msg, "sender_id", "") or ""
+        id_part = f"[QQ:{platform_id}] " if platform_id else ""
+
+        nickname = getattr(msg, "sender_name", "") or ""
+        cardname = getattr(msg, "sender_cardname", None)
+        if cardname and cardname != nickname:
+            name_part = f"{nickname}${cardname}"
+        else:
+            name_part = nickname or "未知发送者"
+
+        message_id = getattr(msg, "message_id", "") or ""
+        msg_id_part = f"[消息id:{message_id}]" if message_id else ""
+
+        content = getattr(msg, "processed_plain_text", None) or str(getattr(msg, "content", ""))
+        return f"》{time_str}》{role_part}{id_part}{name_part} {msg_id_part}： {content}"
+
     async def _get_session(self) -> KFCSession:
         """获取当前 stream 的 Session（持有 per-stream 锁）。"""
         session_store = self._get_session_store()
@@ -187,6 +224,7 @@ class KokoroFlowChatter(BaseChatter):
                             user_name=getattr(msg, "sender_name", "用户"),
                             user_id=sender_id,
                             timestamp=self._extract_timestamp(msg),
+                            message_id=getattr(msg, "message_id", ""),
                         )
                         # 更新 session 中的用户信息（每次都取最新的）
                         if sender_id:
@@ -585,6 +623,7 @@ class KokoroFlowChatter(BaseChatter):
         content: str,
         config: KFCConfig,
         trigger_msg: Any | None = None,
+        reply_to: str = "",
     ) -> bool:
         """通过框架标准路径发送回复。
 
@@ -592,6 +631,7 @@ class KokoroFlowChatter(BaseChatter):
             content: 回复文本内容
             config: KFC 配置
             trigger_msg: 触发消息，为 None 时构造虚拟消息
+            reply_to: 要引用的消息 ID（可选）
 
         Returns:
             bool: 是否发送成功
@@ -605,7 +645,10 @@ class KokoroFlowChatter(BaseChatter):
                 return False
 
         try:
-            await self.exec_llm_usable(KFCReplyAction, trigger_msg, content=content)
+            kwargs: dict[str, Any] = {"content": content}
+            if reply_to:
+                kwargs["reply_to"] = reply_to
+            await self.exec_llm_usable(KFCReplyAction, trigger_msg, **kwargs)
             return True
         except Exception as e:
             logger.error(f"通过框架执行 KFCReplyAction 失败: {e}", exc_info=True)
@@ -714,9 +757,9 @@ class KokoroFlowChatter(BaseChatter):
         if not history_msgs:
             return None
 
-        from .multimodal import extract_media_from_messages
+        from .multimodal import MediaItem, get_media_list
 
-        # 过滤掉 bot 自身发送的消息（bot 图片已在预算初始化时预扣除，不重复计算）
+        # 过滤掉 bot 自身发送的消息
         bot_id = str(getattr(chat_stream, "bot_id", "") or "")
         recent_msgs = list(reversed(history_msgs[-20:]))
         if bot_id:
@@ -728,7 +771,29 @@ class KokoroFlowChatter(BaseChatter):
         if not recent_msgs:
             return None
 
-        items = extract_media_from_messages(recent_msgs, max_items=image_budget.remaining)
+        items: list[MediaItem] = []
+
+        for msg in recent_msgs:
+            if image_budget.is_exhausted() or len(items) >= image_budget.remaining:
+                break
+            msg_id = getattr(msg, "message_id", "")
+            media_list = get_media_list(msg)
+            for media in media_list:
+                if len(items) >= image_budget.remaining:
+                    break
+                if media.get("type") not in ("image", "emoji"):
+                    continue
+                data = media.get("data", "")
+                if not data:
+                    continue
+                items.append(
+                    MediaItem(
+                        media_type=media["type"],
+                        base64_data=data,
+                        source_message_id=msg_id,
+                    )
+                )
+
         if not items:
             return None
 

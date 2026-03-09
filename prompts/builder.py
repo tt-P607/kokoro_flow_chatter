@@ -213,15 +213,20 @@ class KFCPromptBuilder:
 
             sender = getattr(msg, "sender_name", "未知")
             sender_id = str(getattr(msg, "sender_id", ""))
+            message_id = str(getattr(msg, "message_id", "") or "")
             text = getattr(msg, "processed_plain_text", "")
             if not text or not text.strip():
                 continue
 
-            is_bot = bot_id and sender_id == bot_id
+            is_bot = bool(
+                (bot_id and sender_id == bot_id)
+                or message_id.startswith("action_kfc_reply")
+            )
             if is_bot:
                 timeline.append((ts, f"[{time_str}] 你回复：{text}"))
             else:
-                timeline.append((ts, f"[{time_str}] {sender}说：{text}"))
+                msg_id_part = f" [消息id:{message_id}]" if message_id else ""
+                timeline.append((ts, f"[{time_str}] {sender}{msg_id_part}说：{text}"))
 
         # ── 内心独白（仅展示最近 7 条聊天消息范围内的思考） ──
         # 找到倒数第 7 条聊天消息的时间戳作为截止点

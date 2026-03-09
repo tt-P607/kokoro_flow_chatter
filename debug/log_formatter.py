@@ -36,11 +36,7 @@ def _extract_payload_text(payload: Any) -> tuple[list[str], list[dict[str, Any]]
     for item in content_list:
         if hasattr(item, "text"):
             text_parts.append(item.text)
-        elif (
-            hasattr(item, "value")
-            and hasattr(item, "__class__")
-            and item.__class__.__name__ == "Image"
-        ):
+        elif hasattr(item, "value") and hasattr(item, "__class__") and item.__class__.__name__ == "Image":
             data_preview = str(item.value)[:40]
             text_parts.append(f"[图片: {data_preview}...]")
         elif hasattr(item, "to_text"):
@@ -48,8 +44,22 @@ def _extract_payload_text(payload: Any) -> tuple[list[str], list[dict[str, Any]]
         elif hasattr(item, "to_schema"):
             schema = item.to_schema()
             tool_schemas.append(schema)
+        elif hasattr(item, "name") and hasattr(item, "args") and hasattr(item, "id"):
+            # ToolCall：仅展示名称和参数，截断 id 中的 base64
+            name = getattr(item, "name", "?")
+            args = getattr(item, "args", {})
+            try:
+                args_str = json.dumps(args, ensure_ascii=False)
+            except Exception:
+                args_str = str(args)
+            if len(args_str) > 200:
+                args_str = args_str[:200] + "..."
+            text_parts.append(f"ToolCall(name={name!r}, args={args_str})")
         else:
-            text_parts.append(str(item))
+            raw = str(item)
+            if len(raw) > 300:
+                raw = raw[:300] + "..."
+            text_parts.append(raw)
     return text_parts, tool_schemas
 
 

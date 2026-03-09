@@ -90,7 +90,7 @@ async def parse_tool_calls(
     trigger_msg: Any | None,
     config: KFCConfig,
     *,
-    execute_reply_fn: Callable[[str, KFCConfig, Any | None], Awaitable[bool]],
+    execute_reply_fn: Callable[[str, KFCConfig, Any | None, str], Awaitable[bool]],
     run_tool_call_fn: Callable[[Any, Any, ToolRegistry, Any | None], Awaitable[None]],
     pre_execute_hook: Callable[[ToolCallResult], None] | None = None,
 ) -> ToolCallResult:
@@ -136,6 +136,8 @@ async def parse_tool_calls(
             action_dict["thought"] = norm["thought"]
         if norm["content"] is not None:
             action_dict["content"] = norm["content"]
+        if norm["reply_to"]:
+            action_dict["reply_to"] = norm["reply_to"]
         result.actions.append(action_dict)
 
         if norm["is_do_nothing"]:
@@ -151,6 +153,7 @@ async def parse_tool_calls(
         # 执行分段发送
         if not norm["is_do_nothing"] and norm["content"]:
             segments = norm["content"]
+            reply_to = norm["reply_to"]
             send_ok = True
             for segment in segments:
                 if not is_first_reply:
@@ -159,11 +162,15 @@ async def parse_tool_calls(
                         logger.debug(f"[KFC-JSON] 模拟打字延迟 {delay:.2f}s")
                         await asyncio.sleep(delay)
                 is_first_reply = False
+                # 只在第一段应用引用，后续分段不重复引界
+                seg_reply_to = reply_to if (is_first_reply is False and reply_to) else reply_to
 
-                send_ok = await execute_reply_fn(segment, config, trigger_msg)
+                send_ok = await execute_reply_fn(segment, config, trigger_msg, seg_reply_to)
                 if not send_ok:
                     logger.warning(f"[KFC-JSON] 段落发送失败: {repr(segment[:50])}")
                     break
+                # 后续段不再引用，避免多段全部引用同一条
+                reply_to = ""
 
             logger.debug(
                 f"[KFC-JSON] JSON 回复完成: segments={len(segments)}, "
@@ -209,7 +216,11 @@ async def parse_tool_calls(
                         if delay > 0:
                             await asyncio.sleep(delay)
                     is_first_reply = False
-                    send_ok = await execute_reply_fn(segment, config, trigger_msg)
+                    seg_reply_to = args.get("reply_to", "") or ""
+                    send_ok = await execute_reply_fn(segment, config, trigger_msg, seg_reply_to)
+                    # 后续段不引用
+                    args.pop("reply_to", None)
+                    seg_reply_to = ""
                     if not send_ok:
                         break
 
