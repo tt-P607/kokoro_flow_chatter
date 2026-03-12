@@ -59,7 +59,7 @@ class KFCConfig(BaseConfig):
             ),
         )
         blocked_tools: list[str] = Field(
-            default_factory=list,
+            default=["send_text", "pass_and_wait", "stop_conversation"],
             description=(
                 "需要从工具列表中屏蔽的工具末段名称（不含组件类型前缀）。"
                 "列表中的工具不会暴露给 LLM。"
@@ -127,6 +127,17 @@ class KFCConfig(BaseConfig):
         )
         max_context_payloads: int = Field(
             default=20, description="LLM 上下文最大 payload 数量"
+        )
+        warmup_rounds: int = Field(
+            default=3,
+            description=(
+                "历史热启动轮次数（每轮 = 一次 bot 回复及其前的用户消息）。"
+                "在 execute() 重启时，从历史末尾取最近 N 轮重建为真实"
+                " USER/ASSISTANT payload，让模型以第一人称延续对话情绪。"
+                "这些 payload 位于上下文最前端，当真实对话积累超过"
+                " max_context_payloads 上限时，它们会被优先裁剪（已完成使命），"
+                "最新的真实对话始终保留在末尾。设为 0 则禁用热启动。"
+            ),
         )
 
     @config_section("continuous_thinking")

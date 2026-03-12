@@ -368,12 +368,13 @@ class KokoroFlowChatter(BaseChatter):
                     pre_execute_hook=lambda r: log_kfc_result(r, config),
                 )
 
-                # 活动流记录
+                # 活动流记录（同时保存原始 LLM 响应文本，供热启动使用）
                 session.add_bot_planning(
                     thought=result.thought,
                     actions=result.actions,
                     expected_reaction=result.expected_reaction,
                     max_wait_seconds=result.max_wait_seconds,
+                    raw_response=getattr(response, "message", "") or "",
                 )
 
                 # ── 控制流决策 ──
@@ -514,10 +515,189 @@ class KokoroFlowChatter(BaseChatter):
         if history_text:
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(history_text)))
 
+        # ── 历史热启动：以真实 USER/ASSISTANT 对延续对话 ──
+        # 融合叙事作为 SYSTEM 让模型"阅读历史"，但 SYSTEM role 权重远低于
+        # 真实对话 turn；热启动 pair 让模型以第一人称 ASSISTANT role
+        # "活在对话末尾"，新消息到达时情绪与记忆可无缝延续。
+        warmup_rounds = config.prompt.warmup_rounds
+        if warmup_rounds > 0:
+            for warmup_payload in self._build_warmup_payloads(
+                chat_stream, session, num_rounds=warmup_rounds
+            ):
+                request.add_payload(warmup_payload)
+
         # ── 注册工具（原生 Tool Calling） ──
         usable_map = await self.inject_usables(request)
 
         return request, image_budget, usable_map, prompt_builder, bool(history_text)
+
+    # ── 历史热启动 ────────────────────────────────────────────
+
+    def _build_warmup_payloads(
+        self,
+        chat_stream: Any,
+        session: Any,
+        num_rounds: int = 3,
+    ) -> list[LLMPayload]:
+        """从历史消息末尾重建若干轮 USER/ASSISTANT 对话链。
+
+        目的：让模型在 execute() 重启后以第一人称"活在"对话中，
+        ASSISTANT payload 优先使用 MentalLog 中保存的原始 LLM 响应文本
+        （含 thought/content/expected_reaction 等完整字段），
+        确保内心思考不在存储路径中丢失。
+
+        策略：
+        1. 从 history_messages 按连续同角色分组，取末尾 num_rounds 个 bot 组；
+        2. 每个 bot 组找 MentalLog 中时间最近的 BOT_PLANNING 条目；
+        3. 有 raw_response → 直接用；无则从 thought + processed_plain_text 重建 JSON。
+
+        Args:
+            chat_stream: 当前聊天流
+            session: 当前 KFCSession（含 MentalLog）
+            num_rounds: 取历史末尾最近几个 bot 回复轮次
+
+        Returns:
+            list[LLMPayload]: 热启动 payload 列表，可能为空
+        """
+        import json as _json
+        from .models import KFCEventType
+
+        history = list(
+            getattr(getattr(chat_stream, "context", None), "history_messages", [])
+        )
+        if not history:
+            return []
+
+        bot_id = str(chat_stream.bot_id or "")
+
+        def _is_bot(msg: Any) -> bool:
+            sender_id = str(getattr(msg, "sender_id", ""))
+            message_id = str(getattr(msg, "message_id", "") or "")
+            return bool(
+                (bot_id and sender_id == bot_id)
+                or message_id.startswith("action_kfc_reply")
+            )
+
+        def _msg_time(msg: Any) -> float:
+            t = getattr(msg, "time", None)
+            return float(t) if isinstance(t, (int, float)) else 0.0
+
+        # 仅保留有有效文本内容的消息
+        valid = [
+            m for m in history
+            if (
+                getattr(m, "processed_plain_text", "")
+                or str(getattr(m, "content", ""))
+            ).strip()
+        ]
+        if not valid:
+            return []
+
+        # 将连续同角色消息合并为组
+        role_list: list[str] = []
+        msg_groups: list[list[Any]] = []
+        for msg in valid:
+            role = "bot" if _is_bot(msg) else "user"
+            if role_list and role_list[-1] == role:
+                msg_groups[-1].append(msg)
+            else:
+                role_list.append(role)
+                msg_groups.append([msg])
+
+        # 从末尾往前数 num_rounds 个 bot 组，确定截取起始索引
+        bot_seen = 0
+        start_idx = 0
+        for i in range(len(role_list) - 1, -1, -1):
+            if role_list[i] == "bot":
+                bot_seen += 1
+                if bot_seen >= num_rounds:
+                    start_idx = i - 1 if i > 0 and role_list[i - 1] == "user" else i
+                    break
+
+        role_list = role_list[start_idx:]
+        msg_groups = msg_groups[start_idx:]
+
+        # 结尾必须是 bot
+        while role_list and role_list[-1] == "user":
+            role_list.pop()
+            msg_groups.pop()
+
+        # 开头必须是 user
+        while role_list and role_list[0] == "bot":
+            role_list.pop(0)
+            msg_groups.pop(0)
+
+        if not role_list:
+            return []
+
+        # 准备 MentalLog BOT_PLANNING 条目（按时间升序）
+        mental_log = getattr(session, "mental_log", None)
+        planning_entries = []
+        if mental_log:
+            planning_entries = [
+                e for e in mental_log.entries
+                if e.event_type == KFCEventType.BOT_PLANNING
+            ]
+
+        def _find_planning_entry(msgs: list[Any]) -> Any | None:
+            """找与该 bot 组时间最近的 BOT_PLANNING 条目。"""
+            if not planning_entries or not msgs:
+                return None
+            group_ts = max(_msg_time(m) for m in msgs)
+            # 取时间差最小的条目（允许条目时间略晚于消息存储时间）
+            return min(
+                planning_entries,
+                key=lambda e: abs(e.timestamp - group_ts),
+            )
+
+        def _build_assistant_text(msgs: list[Any]) -> str:
+            """构建 ASSISTANT payload 文本。
+
+            优先使用 MentalLog raw_response（原始 LLM 输出 JSON）；
+            无则用 thought + processed_plain_text 重建兼容格式，保留内心思考。
+            """
+            entry = _find_planning_entry(msgs)
+
+            # 有 raw_response → 直接使用
+            if entry and entry.metadata.get("raw_response"):
+                return entry.metadata["raw_response"]
+
+            # 无 raw_response → 从 MentalLog 字段 + 消息文本重建
+            content_lines = [
+                (
+                    getattr(m, "processed_plain_text", "")
+                    or str(getattr(m, "content", ""))
+                ).strip()
+                for m in msgs
+            ]
+            content_lines = [c for c in content_lines if c]
+
+            if entry and entry.thought:
+                # 重建成与 KFC JSON 模式一致的结构，保留 thought
+                obj: dict[str, Any] = {
+                    "thought": entry.thought,
+                    "content": content_lines,
+                }
+                if entry.expected_reaction:
+                    obj["expected_reaction"] = entry.expected_reaction
+                if entry.max_wait_seconds:
+                    obj["max_wait_seconds"] = entry.max_wait_seconds
+                return _json.dumps(obj, ensure_ascii=False)
+
+            # 兜底：纯文本拼接
+            return "\n".join(content_lines)
+
+        payloads: list[LLMPayload] = []
+        for role, msgs in zip(role_list, msg_groups):
+            if role == "user":
+                lines = "\n".join(self.format_message_line(m) for m in msgs)
+                payloads.append(LLMPayload(ROLE.USER, Text(f"[消息记录]\n{lines}")))
+            else:
+                text = _build_assistant_text(msgs)
+                if text:
+                    payloads.append(LLMPayload(ROLE.ASSISTANT, Text(text)))
+
+        return payloads
 
     # ── 两阶段感知-决策循环 ──────────────────────────────────
 

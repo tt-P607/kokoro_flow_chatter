@@ -106,6 +106,7 @@ class KFCSession:
         actions: list[dict[str, Any]],
         expected_reaction: str = "",
         max_wait_seconds: float = 0.0,
+        raw_response: str = "",
     ) -> MentalLogEntry:
         """记录 Bot 规划到活动流。"""
         entry = MentalLogEntry(
@@ -116,6 +117,8 @@ class KFCSession:
             expected_reaction=expected_reaction,
             max_wait_seconds=max_wait_seconds,
         )
+        if raw_response:
+            entry.metadata["raw_response"] = raw_response
         self.mental_log.add(entry)
         self.total_interactions += 1
         self.last_activity_at = time.time()
