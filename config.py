@@ -26,6 +26,10 @@ class KFCConfig(BaseConfig):
             default="actor",
             description="LLM 模型任务名称（对应 model.toml 中的 task）",
         )
+        model: str = Field(
+            default="",
+            description="自定义 LLM 模型名称（对应 model.toml 中的 name）。默认为空，使用 model_task。",
+        )
         native_multimodal: bool = Field(
             default=False,
             description=(

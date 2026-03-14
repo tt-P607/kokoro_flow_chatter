@@ -190,10 +190,21 @@ class KokoroFlowChatter(BaseChatter):
 
         try:  # 确保退出时清理 VLM 跳过注册
             # ── 构建 LLM 请求 ──
-            model_set = get_model_set_by_task(config.general.model_task)
+            model_set = None
+            if config.general.model:
+                model_set = get_model_set_by_name(config.general.model)
+                if not model_set:
+                    logger.warning(
+                        f"自定义模型 '{config.general.model}' 未注册，"
+                        f"将回退到任务模型 '{config.general.model_task}'"
+                    )
+
+            if not model_set:
+                model_set = get_model_set_by_task(config.general.model_task)
+
             if not model_set:
                 logger.error("无法获取模型配置")
-                yield Failure("模型配置错误：未找到 model_task 配置")
+                yield Failure("模型配置错误：未找到有效的模型配置")
                 return
 
             # ── 构建 LLM 上下文 ──
