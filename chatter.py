@@ -504,9 +504,14 @@ class KokoroFlowChatter(BaseChatter):
         )
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
-        relation_text = prompt_builder.build_relation_context(chat_stream)
-        if relation_text:
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(relation_text)))
+        # ── 注入 actor bucket reminder（跨聊天流摘要等全局 reminder）──
+        # DFC 通过 create_request(with_reminder="actor") 自动注入；
+        # KFC 手动构建 request，需要在此处显式读取并注入，确保 context_bridge
+        # 的跨流摘要对私聊聊天流同样可见。
+        from src.core.prompt import get_system_reminder_store
+        actor_reminder_text = get_system_reminder_store().get("actor")
+        if actor_reminder_text:
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(actor_reminder_text)))
 
         # 图片预算初始化（bot 已发图片 > 用户新消息图片 > 历史补充，共用同一总配额）
         image_budget: ImageBudget | None = None

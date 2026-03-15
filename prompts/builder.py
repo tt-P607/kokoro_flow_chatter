@@ -77,22 +77,6 @@ class KFCPromptBuilder:
 
         return await tmpl.build()
 
-    @staticmethod
-    def build_relation_context(chat_stream: ChatStream) -> str:
-        """构建人物关系注入文本。"""
-        pm = get_prompt_manager()
-        impression_tmpl = pm.get_template(
-            f"person_impression:{chat_stream.stream_id}"
-        )
-        if not impression_tmpl:
-            return ""
-
-        relation_text = impression_tmpl.get("relation_text")
-        if not relation_text:
-            return ""
-
-        return str(relation_text)
-
     def build_user_payload(
         self,
         formatted_unreads: str,
