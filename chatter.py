@@ -35,7 +35,7 @@ from src.kernel.llm import Content, LLMContextManager, LLMPayload, ROLE, Text, T
 from .debug.log_formatter import format_prompt_for_log, log_kfc_result
 from .models import KFC_REPLY, DO_NOTHING, ToolCallResult
 from .parser import parse_tool_calls
-from .prompts.templates import KFC_PERCEIVE_FOLLOWUP_PROMPT, KFC_TOOL_INTENT_FOLLOWUP_PROMPT
+from .prompts.templates import KFC_PERCEIVE_FOLLOWUP_PROMPT
 
 if TYPE_CHECKING:
     from src.core.models.stream import ChatStream
@@ -177,6 +177,21 @@ class KokoroFlowChatter(BaseChatter):
         # 检查插件是否启用
         if not config.general.enabled:
             logger.debug("KFC 插件已禁用，跳过 execute")
+            # 注销自身：从活跃 Chatter 表和全局注册表中移除，
+            # 让下次消息重新选择 Chatter（如 DFC）
+            try:
+                from src.core.managers import get_chatter_manager
+                get_chatter_manager().unregister_active_chatter(self.stream_id)
+            except Exception:
+                pass
+            try:
+                from src.core.components.registry import get_global_registry
+                signature = self.get_signature()
+                if signature:
+                    get_global_registry().unregister(signature)
+                    logger.debug(f"KFC Chatter 已从注册表注销: {signature}")
+            except Exception:
+                pass
             yield Stop(0)
             return
 
@@ -365,6 +380,13 @@ class KokoroFlowChatter(BaseChatter):
                     continue
 
                 # ── 解析 + 执行 ──
+                # 先打印本轮调用列表（对标 DFC 的调用列表日志），让 call_list 在执行前可见
+                _call_list = getattr(response, "call_list", None) or []
+                if _call_list:
+                    logger.info(f"本轮调用列表：{[c.name for c in _call_list]}")
+                elif getattr(response, "message", ""):
+                    logger.debug("[KFC] 本轮无 tool call，将解析消息文本 JSON")
+
                 # 超时主动触发时 unread_msgs 为空，trigger_msg 会是 None，
                 # 导致所有 action 工具（send_emoji、music_search 等）执行被跳过。
                 # 借用 _get_virtual_trigger_message() 补一个虚拟触发消息，
@@ -768,31 +790,8 @@ class KokoroFlowChatter(BaseChatter):
 
             if json_data:
                 norm = normalize_reply_data(json_data)
-                # JSON 有实际回复内容 → 完整响应，无需感知循环
-                if not norm["is_do_nothing"]:
-                    logger.debug("[KFC] 检测到含内容的 JSON 回复，直接返回")
-                    return new_response
-
-                # JSON 是 do_nothing（content=null）且没有工具调用 →
-                # 模型把工具调用意图写进了 thought 但没有真正发出 tool_call，
-                # 注入提示强制其发起实际调用
-                if attempt < max_retries:
-                    thought_preview = (norm.get("thought") or "")[:60]
-                    logger.info(
-                        f"[KFC] do_nothing + 无工具调用（可能存在工具意图未落地），"
-                        f"注入强制提示重试 (第 {attempt + 1} 轮)"
-                        f"{': ' + thought_preview + '...' if thought_preview else ''}"
-                    )
-                    new_response.add_payload(
-                        LLMPayload(ROLE.USER, Text(KFC_TOOL_INTENT_FOLLOWUP_PROMPT))
-                    )
-                    response = new_response
-                    continue
-
-                # 重试耗尽，原样返回 do_nothing
-                logger.debug("[KFC] do_nothing + 无工具调用，重试耗尽，直接返回")
+                logger.debug(f"[KFC] 检测到有效 JSON 回复 (is_do_nothing={norm['is_do_nothing']})，直接返回")
                 return new_response
-
             # 模型输出了纯文本但没有工具调用（"破防"）
             if attempt < max_retries:
                 perceive_text = (new_response.message or "").strip()

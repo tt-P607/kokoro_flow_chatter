@@ -91,13 +91,13 @@ async def parse_tool_calls(
     config: KFCConfig,
     *,
     execute_reply_fn: Callable[[str, KFCConfig, Any | None, str], Awaitable[bool]],
-    run_tool_call_fn: Callable[[Any, Any, ToolRegistry, Any | None], Awaitable[None]],
+    run_tool_call_fn: Callable[[Any, Any, ToolRegistry, Any | None], Awaitable[tuple[bool, bool]]],
     pre_execute_hook: Callable[[ToolCallResult], None] | None = None,
 ) -> ToolCallResult:
     """遍历 LLM 返回的 call_list，提取元数据并执行动作。
 
-    在遇到第一个 kfc_reply 之前，先执行一遍收集循环以提取所有元数据。
-    然后触发 pre_execute_hook 输出调试日志，最后按序执行所有动作。
+    按序处理 kfc_reply、do_nothing 和第三方工具。
+    pre_execute_hook 在所有动作执行完毕后统一触发，确保日志包含完整动作记录。
 
     - kfc_reply: 提取元数据 + 调用 execute_reply_fn + 回传 ToolResult
     - do_nothing: 提取元数据 + 回传 ToolResult
@@ -117,7 +117,6 @@ async def parse_tool_calls(
     """
     result = ToolCallResult()
     is_first_reply = True
-    hook_called = False
 
     # ── 阶段一：从消息文本提取 JSON 回复（JSON 模式）─────────────────────
     json_data = extract_json_reply(getattr(response, "message", None))
@@ -144,11 +143,6 @@ async def parse_tool_calls(
             result.has_do_nothing = True
         else:
             result.has_reply = True
-
-        # 触发 hook
-        if pre_execute_hook is not None:
-            pre_execute_hook(result)
-        hook_called = True
 
         # 执行分段发送
         if not norm["is_do_nothing"] and norm["content"]:
@@ -180,7 +174,9 @@ async def parse_tool_calls(
     # ── 阶段二：处理工具调用（第三方 action/tool/agent）───────────────
     for call in response.call_list or []:
         args = _extract_args(call.args)
+        reason = args.pop("reason", "未提供原因")
         normalized_name = _normalize_call_name(call.name)
+        logger.info(f"LLM 调用 {call.name}，原因: {reason}")
 
         # kfc_reply / do_nothing 已由阶段一的 JSON 解析处理，此处跳过
         # （正常情况下模型不再生成这两个 tool call；保留分支作为边缘兜底）
@@ -189,10 +185,6 @@ async def parse_tool_calls(
                 # JSON 解析未命中时，降级走旧 tool call 路径
                 result.has_reply = True
                 extract_metadata(result, args)
-                if not hook_called and pre_execute_hook is not None:
-                    pre_execute_hook(result)
-                    hook_called = True
-
                 content_raw = args.get("content", "")
                 if isinstance(content_raw, list):
                     segments = [s.strip() for s in content_raw if isinstance(s, str) and s.strip()]
@@ -238,16 +230,24 @@ async def parse_tool_calls(
                         ),
                     )
                 )
+            else:
+                # JSON 模式已处理，补充占位 TOOL_RESULT 以保持工具链完整性
+                response.add_payload(
+                    LLMPayload(
+                        ROLE.TOOL_RESULT,
+                        ToolResult(  # type: ignore[arg-type]
+                            value="已由 JSON 模式处理",
+                            call_id=call.id,
+                            name=call.name,
+                        ),
+                    )
+                )
             continue
 
         if normalized_name == DO_NOTHING:
             if not json_data:
                 result.has_do_nothing = True
                 extract_metadata(result, args)
-                if not hook_called and pre_execute_hook is not None:
-                    pre_execute_hook(result)
-                    hook_called = True
-
                 action_dict = {"type": normalized_name}
                 action_dict.update(args)
                 result.actions.append(action_dict)
@@ -257,6 +257,18 @@ async def parse_tool_calls(
                         ROLE.TOOL_RESULT,
                         ToolResult(  # type: ignore[arg-type]
                             value="已选择不回复",
+                            call_id=call.id,
+                            name=call.name,
+                        ),
+                    )
+                )
+            else:
+                # JSON 模式已处理，补充占位 TOOL_RESULT 以保持工具链完整性
+                response.add_payload(
+                    LLMPayload(
+                        ROLE.TOOL_RESULT,
+                        ToolResult(  # type: ignore[arg-type]
+                            value="已由 JSON 模式处理",
                             call_id=call.id,
                             name=call.name,
                         ),
@@ -273,10 +285,15 @@ async def parse_tool_calls(
         action_dict.update(args)
         result.actions.append(action_dict)
 
-        await run_tool_call_fn(call, response, usable_map, trigger_msg)
+        _, success = await run_tool_call_fn(call, response, usable_map, trigger_msg)
+        if not success:
+            logger.warning(
+                f"[KFC] 工具 {call.name} 执行失败或被跳过"
+                "（可能原因：工具未注册、无触发消息或执行异常）"
+            )
 
-    # 如果没有 kfc_reply 或 do_nothing，也要触发 hook
-    if not hook_called and pre_execute_hook is not None:
+    # 所有动作执行完毕后统一触发汇总日志，确保第三方工具也被记录
+    if pre_execute_hook is not None:
         pre_execute_hook(result)
 
     # 调试日志

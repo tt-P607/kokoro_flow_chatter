@@ -177,7 +177,7 @@ def build_timeout_context(
         followup_warning = (
             "\n📝 温馨提醒：这是你第 2 次等待回复（已追问 1 次）。"
             "可以再试着追问一次，但如果对方还是没回复，"
-            "**强烈建议**之后选择 do_nothing 结束等待。"
+            "**建议**之后选择 do_nothing 结束等待。"
         )
     else:
         followup_warning = (

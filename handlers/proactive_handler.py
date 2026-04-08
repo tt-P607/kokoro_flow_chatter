@@ -89,19 +89,48 @@ class ProactiveHandler(BaseEventHandler):
 
         context = chat_stream.context
 
-        # 尝试从 KFCSession 获取真实 user_id，避免 sender_id="system" 导致适配器 int() 转换失败
+        # 尝试从 KFCSession 获取真实 user_id 和沉默时长
         target_user_id: str = ""
+        silence_minutes: float = 0.0
         try:
             from ..plugin import KFCPlugin
             if isinstance(self.plugin, KFCPlugin):
                 session = await self.plugin._session_store.get(stream_id)
-                if session and session.user_id:
-                    target_user_id = session.user_id
+                if session:
+                    if session.user_id:
+                        target_user_id = session.user_id
+                    if session.last_activity_at:
+                        silence_minutes = (time.time() - session.last_activity_at) / 60
         except Exception as e:
-            logger.debug(f"获取 session user_id 失败，将使用空值: {e}")
+            logger.debug(f"获取 session 信息失败，将使用默认值: {e}")
+
+        # 从近期历史消息构建近期活动摘要
+        recent_activity = ""
+        try:
+            recent_msgs = context.history_messages[-5:] if context.history_messages else []
+            if recent_msgs:
+                lines = []
+                for msg in recent_msgs:
+                    sender = getattr(msg, "sender_name", "") or "未知"
+                    content = getattr(msg, "processed_plain_text", "") or str(getattr(msg, "content", ""))
+                    lines.append(f"{sender}: {content}")
+                recent_activity = "\n".join(lines)
+        except Exception as e:
+            logger.debug(f"构建近期活动摘要失败: {e}")
+
+        # 调用 build_proactive_context 生成富上下文提示词
+        proactive_content = "[主动发起] 你已经沉默很久了，主动找对方聊聊吧。"
+        try:
+            from ..prompts.modules import build_proactive_context
+            proactive_content = await build_proactive_context(
+                silence_minutes=silence_minutes,
+                recent_activity=recent_activity,
+            )
+        except Exception as e:
+            logger.debug(f"构建主动发起上下文失败，使用默认消息: {e}")
 
         # 构造系统触发消息
-        trigger_message = self._build_proactive_message(stream_id, chat_stream, target_user_id)
+        trigger_message = self._build_proactive_message(stream_id, chat_stream, target_user_id, proactive_content)
         context.add_unread_message(trigger_message)
         logger.debug(f"已注入主动发起触发消息到流 {stream_id[:8]}")
 
@@ -121,13 +150,19 @@ class ProactiveHandler(BaseEventHandler):
         return True
 
     @staticmethod
-    def _build_proactive_message(stream_id: str, chat_stream: Any, target_user_id: str = "") -> Any:
+    def _build_proactive_message(
+        stream_id: str,
+        chat_stream: Any,
+        target_user_id: str = "",
+        content: str = "[主动发起] 你已经沉默很久了，主动找对方聊聊吧。",
+    ) -> Any:
         """构造一条用于主动发起的系统触发消息。
 
         Args:
             stream_id: 目标流 ID
             chat_stream: 聊天流对象
             target_user_id: 目标用户的真实 ID（QQ 号等），用于消息路由
+            content: 注入的消息内容（默认为简单提示，推荐传入 build_proactive_context 生成的富上下文）
 
         Returns:
             Message: 系统触发消息对象
@@ -144,8 +179,8 @@ class ProactiveHandler(BaseEventHandler):
             stream_id=stream_id,
             sender_id=target_user_id or "system",
             sender_name="系统",
-            content="[主动发起] 你已经沉默很久了，主动找对方聊聊吧。",
-            processed_plain_text="[主动发起] 你已经沉默很久了，主动找对方聊聊吧。",
+            content=content,
+            processed_plain_text=content,
             time=time.time(),
             **extra_kwargs,
         )
