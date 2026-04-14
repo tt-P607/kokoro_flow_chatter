@@ -35,7 +35,10 @@ from src.kernel.llm import Content, LLMContextManager, LLMPayload, ROLE, Text, T
 from .debug.log_formatter import format_prompt_for_log, log_kfc_result
 from .models import KFC_REPLY, DO_NOTHING, ToolCallResult
 from .parser import parse_tool_calls
-from .prompts.templates import KFC_PERCEIVE_FOLLOWUP_PROMPT
+from .prompts.templates import (
+    KFC_PERCEIVE_FOLLOWUP_PROMPT_JSON,
+    KFC_PERCEIVE_FOLLOWUP_PROMPT_TOOL_CALLING,
+)
 
 if TYPE_CHECKING:
     from src.core.models.stream import ChatStream
@@ -127,11 +130,19 @@ class KokoroFlowChatter(BaseChatter):
         return self.plugin._session_store  # type: ignore[attr-defined]
 
     async def modify_llm_usables(self, usables: list[Any]) -> list[Any]:
-        """过滤掉 kfc_reply 和 do_nothing，回复决策改走 JSON 文本，第三方工具仍走 tool calling。
+        """过滤掉不需要的工具，并根据模式决定是否保留 kfc_reply 和 do_nothing。
+
+        - JSON 模式（use_tool_calling=False）：过滤掉 kfc_reply 和 do_nothing，
+          回复决策由 LLM 输出 JSON 文本完成，第三方工具仍走 tool calling。
+        - 完全工具调用模式（use_tool_calling=True）：保留 kfc_reply 和 do_nothing，
+          让 LLM 通过原生工具调用决定回复，与 default_chatter 行为对齐。
         额外过滤 config.general.blocked_tools 中指定的工具名。
         """
         config = self._get_config()
-        _blocked = frozenset([KFC_REPLY, DO_NOTHING, *config.general.blocked_tools])
+        if config.general.use_tool_calling:
+            _blocked = frozenset(config.general.blocked_tools)
+        else:
+            _blocked = frozenset([KFC_REPLY, DO_NOTHING, *config.general.blocked_tools])
 
         def _is_reply_tool(u: Any) -> bool:
             try:
@@ -326,18 +337,22 @@ class KokoroFlowChatter(BaseChatter):
                     if timeout_handler.check_timeout(session):
                         # 若 response 尾部仍是 tool_result，说明上一轮工具链尚未被 LLM
                         # 承接闭合。此时不能直接注入 user 角色的超时 payload（会形成
-                        # tool_result → user 的非法序列），需先续轮让 LLM 承接工具结果，
-                        # 等工具链闭合后再处理超时。
+                        # tool_result → user 的非法序列），需先插入一个 assistant 桥接
+                        # payload 原地闭合工具链，再继续超时处理流程。
+                        # 注意：不能用 _has_pending_tool_results = True; continue，
+                        # 因为那样下一轮会直接调 LLM 而没有 timeout payload，
+                        # 导致 LLM 误以为要续写原对话（复读 Bug）。
                         if (
                             response.payloads
                             and response.payloads[-1].role == ROLE.TOOL_RESULT
                         ):
                             logger.debug(
                                 "超时触发时 response 尾部为 tool_result，"
-                                "先闭合工具链再处理超时"
+                                "插入 assistant 桥接 payload 闭合工具链后继续处理超时"
                             )
-                            _has_pending_tool_results = True
-                            continue
+                            response.add_payload(
+                                LLMPayload(ROLE.ASSISTANT, Text("好的。"))
+                            )
 
                         timeout_ctx = timeout_handler.handle_timeout(session)
 
@@ -370,7 +385,9 @@ class KokoroFlowChatter(BaseChatter):
 
                 try:
                     response = await self._send_with_perceive_loop(
-                        response, config.general.max_compat_retries
+                        response,
+                        config.general.max_compat_retries,
+                        use_tool_calling=config.general.use_tool_calling,
                     )
                     await self.flush_unreads(unread_msgs if unread_msgs else [])
                 except Exception as e:
@@ -513,8 +530,15 @@ class KokoroFlowChatter(BaseChatter):
 
         prompt_builder = KFCPromptBuilder()
 
-        # 注入自定义决策提示词（如果配置了）
+        # 注入动态变量：回复模式指令 + 自定义决策提示词
+        from .prompts.templates import KFC_REPLY_MODE_JSON, KFC_REPLY_MODE_TOOL_CALLING
+
         extra_vars: dict[str, str] = {}
+        extra_vars["reply_mode_instruction"] = (
+            KFC_REPLY_MODE_TOOL_CALLING
+            if config.general.use_tool_calling
+            else KFC_REPLY_MODE_JSON
+        )
         custom_prompt = config.general.custom_decision_prompt
         if custom_prompt and custom_prompt.strip():
             extra_vars["custom_decision_prompt"] = (
@@ -522,7 +546,7 @@ class KokoroFlowChatter(BaseChatter):
             )
 
         system_prompt = await prompt_builder.build_system_prompt(
-            chat_stream, extra_vars=extra_vars or None
+            chat_stream, extra_vars=extra_vars
         )
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
@@ -743,6 +767,8 @@ class KokoroFlowChatter(BaseChatter):
         self,
         response: Any,
         max_retries: int,
+        *,
+        use_tool_calling: bool = False,
     ) -> Any:
         """发送 LLM 请求，实现两阶段"感知→决策"循环。
 
@@ -785,13 +811,15 @@ class KokoroFlowChatter(BaseChatter):
                 return new_response
 
             # JSON 回复模式：检查消息文本是否含有效 JSON
-            from .reply_json import extract_json_reply, normalize_reply_data
-            json_data = extract_json_reply(getattr(new_response, "message", None))
+            if not use_tool_calling:
+                from .reply_json import extract_json_reply, normalize_reply_data
+                json_data = extract_json_reply(getattr(new_response, "message", None))
 
-            if json_data:
-                norm = normalize_reply_data(json_data)
-                logger.debug(f"[KFC] 检测到有效 JSON 回复 (is_do_nothing={norm['is_do_nothing']})，直接返回")
-                return new_response
+                if json_data:
+                    norm = normalize_reply_data(json_data)
+                    logger.debug(f"[KFC] 检测到有效 JSON 回复 (is_do_nothing={norm['is_do_nothing']})，直接返回")
+                    return new_response
+
             # 模型输出了纯文本但没有工具调用（"破防"）
             if attempt < max_retries:
                 perceive_text = (new_response.message or "").strip()
@@ -802,8 +830,13 @@ class KokoroFlowChatter(BaseChatter):
                 )
                 # 感言已通过 auto_append 进入上下文，
                 # 注入轻量提示引导模型进入决策阶段
+                followup = (
+                    KFC_PERCEIVE_FOLLOWUP_PROMPT_TOOL_CALLING
+                    if use_tool_calling
+                    else KFC_PERCEIVE_FOLLOWUP_PROMPT_JSON
+                )
                 new_response.add_payload(
-                    LLMPayload(ROLE.USER, Text(KFC_PERCEIVE_FOLLOWUP_PROMPT))
+                    LLMPayload(ROLE.USER, Text(followup))
                 )
                 response = new_response
                 continue

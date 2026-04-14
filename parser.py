@@ -119,7 +119,10 @@ async def parse_tool_calls(
     is_first_reply = True
 
     # ── 阶段一：从消息文本提取 JSON 回复（JSON 模式）─────────────────────
-    json_data = extract_json_reply(getattr(response, "message", None))
+    # tool calling 模式下跳过此阶段，kfc_reply/do_nothing 直接通过 call_list 处理
+    json_data = None
+    if not config.general.use_tool_calling:
+        json_data = extract_json_reply(getattr(response, "message", None))
     if json_data:
         norm = normalize_reply_data(json_data)
 
@@ -218,6 +221,9 @@ async def parse_tool_calls(
 
                 action_dict: dict[str, Any] = {"type": normalized_name}
                 action_dict.update(args)
+                # 用规范化后的 segments 列表覆盖原始 content（原始值可能是 JSON 字符串），
+                # 确保 log_kfc_result 能按段逐条打印 💬
+                action_dict["content"] = segments
                 result.actions.append(action_dict)
 
                 response.add_payload(

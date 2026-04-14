@@ -69,6 +69,14 @@ class KFCConfig(BaseConfig):
                 "列表中的工具不会暴露给 LLM。"
             ),
         )
+        use_tool_calling: bool = Field(
+            default=False,
+            description=(
+                "完全工具调用模式（对齐 default_chatter）。"
+                "启用后，LLM 通过 kfc_reply/do_nothing 工具调用决定回复，"
+                "不再输出 JSON 文本。禁用时使用传统 JSON 解析模式。"
+            ),
+        )
 
     @config_section("wait")
     class WaitSection(SectionBase):

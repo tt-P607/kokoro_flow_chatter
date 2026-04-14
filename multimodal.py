@@ -105,7 +105,7 @@ def extract_media_from_messages(
 def build_multimodal_content(
     text: str,
     media_items: list[MediaItem],
-) -> list[Content]:
+) -> list[Content | Any]:
     """构建混合 Text + Image 的 content 列表，用于 LLMPayload。
 
     Args:

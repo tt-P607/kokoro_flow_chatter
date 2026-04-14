@@ -16,6 +16,7 @@ from .templates import (
     KFC_PROACTIVE_PROMPT,
     KFC_CONTINUOUS_THINKING_PROMPT,
     KFC_TIMEOUT_PROMPT,
+    KFC_REPLY_MODE_JSON,
 )
 
 
@@ -52,6 +53,8 @@ def register_kfc_prompts() -> None:
                 "\n".join(personality.safety_guidelines)
             ),
             "custom_decision_prompt": optional(""),
+            # reply_mode_instruction 由 _build_initial_context 动态注入，此处提供空串兜底
+            "reply_mode_instruction": optional(KFC_REPLY_MODE_JSON),
             "current_time": optional(
                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ),
