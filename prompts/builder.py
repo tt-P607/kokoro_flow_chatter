@@ -55,11 +55,6 @@ class KFCPromptBuilder:
         tmpl.set("chat_type", str(chat_stream.chat_type or "unknown"))
         tmpl.set("bot_id", chat_stream.bot_id or "")
         tmpl.set("stream_id", str(chat_stream.stream_id or ""))
-        tmpl.set(
-            "current_time",
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
-
         # 活动流格式提示
         tmpl.set("mental_log_hint", build_mental_log_hint())
 
@@ -152,6 +147,7 @@ class KFCPromptBuilder:
     def build_fused_narrative(
         chat_stream: ChatStream,
         mental_log: Any,
+        before_ts: float | None = None,
     ) -> str:
         """构建聊天历史与内心独白的融合叙事。
 
@@ -163,6 +159,8 @@ class KFCPromptBuilder:
         Args:
             chat_stream: 当前聊天流
             mental_log: 心理活动日志（MentalLog 实例）
+            before_ts: 若指定，只包含时间戳严格小于该值的消息，
+                用于将叙事截止到 warmup 窗口开始前，避免内容重叠。
 
         Returns:
             str: 融合叙事文本，无内容时返回空串
@@ -199,6 +197,10 @@ class KFCPromptBuilder:
             if not text or not text.strip():
                 continue
 
+            # 跳过 warmup 窗口内的消息，避免与热启动 pair 内容重叠
+            if before_ts is not None and ts >= before_ts:
+                continue
+
             is_bot = bool(
                 (bot_id and sender_id == bot_id)
                 or message_id.startswith("action_kfc_reply")
@@ -226,6 +228,10 @@ class KFCPromptBuilder:
                         "%Y-%m-%d %H:%M:%S"
                     )
                 except (OSError, ValueError, OverflowError):
+                    continue
+
+                # 同样跳过 warmup 窗口内的思考条目
+                if before_ts is not None and entry.timestamp >= before_ts:
                     continue
 
                 if (

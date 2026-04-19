@@ -235,8 +235,6 @@ KFC_SYSTEM_PROMPT = """# 关于你
 - 保持人设，始终以符合你性格的方式表达
 - 回复有理有据，不编造信息
 
-当前时间: {current_time}
-
 # 其他信息
 聊天平台：{platform}，聊天类型：{chat_type}
 你的信息：昵称 {nickname}，ID {bot_id}

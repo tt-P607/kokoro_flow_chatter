@@ -86,6 +86,10 @@ class KFCConfig(BaseConfig):
     class WaitSection(SectionBase):
         """等待机制配置。"""
 
+        enabled: bool = Field(
+            default=True,
+            description="是否启用回复等待。设为 false 后模型不再等待用户回复",
+        )
         min_seconds: float = Field(default=10.0, description="最小等待秒数")
         max_seconds: float = Field(default=600.0, description="最大等待秒数")
         max_consecutive_timeouts: int = Field(
@@ -93,8 +97,8 @@ class KFCConfig(BaseConfig):
         )
 
         def apply_rules(self, raw_seconds: float, consecutive_timeouts: int) -> float:
-            """应用等待时长规则。raw_seconds <= 0 表示不等待，直接返回 0。"""
-            if raw_seconds <= 0:
+            """应用等待时长规则。raw_seconds <= 0 或 enabled=false 时返回 0。"""
+            if not self.enabled or raw_seconds <= 0:
                 return 0.0
             if consecutive_timeouts >= self.max_consecutive_timeouts:
                 return 0.0
@@ -142,18 +146,7 @@ class KFCConfig(BaseConfig):
             default=50, description="最大活动流条目数"
         )
         max_context_payloads: int = Field(
-            default=20, description="LLM 上下文最大 payload 数量"
-        )
-        warmup_rounds: int = Field(
-            default=3,
-            description=(
-                "历史热启动轮次数（每轮 = 一次 bot 回复及其前的用户消息）。"
-                "在 execute() 重启时，从历史末尾取最近 N 轮重建为真实"
-                " USER/ASSISTANT payload，让模型以第一人称延续对话情绪。"
-                "这些 payload 位于上下文最前端，当真实对话积累超过"
-                " max_context_payloads 上限时，它们会被优先裁剪（已完成使命），"
-                "最新的真实对话始终保留在末尾。设为 0 则禁用热启动。"
-            ),
+            default=20, description="LLM 上下文持久化链最大条目数（超出时裁剪最旧的 USER/ASSISTANT 对）"
         )
 
 

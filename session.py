@@ -46,6 +46,12 @@ class KFCSession:
     # 心理活动流
     mental_log: MentalLog = field(default_factory=MentalLog)
 
+    # 持久化对话链：序列化的 USER/ASSISTANT payload 列表，跨 execute() 重启保留上下文。
+    # 每条条目格式：{"role": "user"|"assistant", "text": "...", "ts": <float，仅 user>}
+    # chain_cutoff_ts 为链头第一个 user 条目的时间戳，供 build_fused_narrative 做截断。
+    chain_payloads: list[dict[str, Any]] = field(default_factory=list)
+    chain_cutoff_ts: float = 0.0
+
     # 统计
     total_interactions: int = 0
 
@@ -133,6 +139,35 @@ class KFCSession:
         """
         self.scheduled_proactive_at = at
 
+    def update_chain(
+        self, new_entries: list[dict[str, Any]], max_payloads: int
+    ) -> None:
+        """追加新的对话条目到持久化链，并裁剪至 max_payloads 条目。
+
+        Args:
+            new_entries: 要追加的条目列表，每条格式为
+                ``{"role": "user"|"assistant", "text": "...", "ts": float}``。
+                USER 条目应携带 ``ts``（第一条未读消息的时间戳），
+                ASSISTANT 条目无需携带 ``ts``。
+            max_payloads: 链最大条目数，超出时删除最老的条目。
+        """
+        self.chain_payloads.extend(new_entries)
+        if len(self.chain_payloads) > max_payloads:
+            self.chain_payloads = self.chain_payloads[-max_payloads:]
+        # 更新截止时间戳为链头第一个 user 条目的时间
+        self.chain_cutoff_ts = 0.0
+        for entry in self.chain_payloads:
+            if entry.get("role") == "user":
+                ts = entry.get("ts", 0.0)
+                if isinstance(ts, (int, float)) and ts > 0:
+                    self.chain_cutoff_ts = float(ts)
+                break
+
+    def clear_chain(self) -> None:
+        """清空持久化对话链（重置上下文）。"""
+        self.chain_payloads = []
+        self.chain_cutoff_ts = 0.0
+
     def add_interrupt_event(self, interrupt_msgs: list[Any]) -> MentalLogEntry:
         """记录用户打断事件到活动流。
 
@@ -177,6 +212,8 @@ class KFCSession:
             "scheduled_proactive_at": self.scheduled_proactive_at,
             "mental_log": self.mental_log.to_list(),
             "total_interactions": self.total_interactions,
+            "chain_payloads": self.chain_payloads,
+            "chain_cutoff_ts": self.chain_cutoff_ts,
         }
 
     @classmethod
@@ -208,6 +245,9 @@ class KFCSession:
             max_entries=max_log_entries,
         )
         session.total_interactions = int(data.get("total_interactions", 0))
+        # 持久化对话链
+        session.chain_payloads = data.get("chain_payloads", [])
+        session.chain_cutoff_ts = float(data.get("chain_cutoff_ts", 0.0))
         return session
 
 
