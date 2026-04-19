@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Annotated, Any
+from typing import Annotated
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base.action import BaseAction
+from src.app.plugin_system.api.send_api import send_text
+from src.app.plugin_system.base import BaseAction
 
 logger = get_logger("kfc_reply")
 
@@ -109,64 +110,18 @@ class KFCReplyAction(BaseAction):
             if not segment:
                 return False, "清洗后内容为空，未发送"
 
-        # 如果指定了 reply_to，创建带 reply_to 的 Message 对象
+        # reply_to 非空时用 send_api 发带引用的消息，否则走标准 _send_to_stream
         if reply_to:
-            from src.core.models.message import Message, MessageType
-            from src.core.managers.adapter_manager import get_adapter_manager
-            from uuid import uuid4
-            
-            target_stream_id = self.chat_stream.stream_id
-            platform = self.chat_stream.platform
-            chat_type = self.chat_stream.chat_type
-            context = self.chat_stream.context
-            
-            bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
-            
-            target_user_id = None
-            target_user_name = None
-            
-            def _get_last_context_message() -> Message | None:
-                if context.unread_messages:
-                    return context.unread_messages[-1]
-                if context.history_messages:
-                    return context.history_messages[-1]
-                return context.current_message
-            
-            last_msg = _get_last_context_message()
-            
-            if last_msg:
-                target_user_id = last_msg.sender_id
-                target_user_name = last_msg.sender_name
-            
-            extra: dict[str, Any] = {}
-            if target_user_id:
-                extra["target_user_id"] = target_user_id
-            if target_user_name:
-                extra["target_user_name"] = target_user_name
-            
-            message = Message(
-                message_id=f"action_{self.action_name}_{uuid4().hex}",
+            success = await send_text(
                 content=segment,
-                processed_plain_text=segment,
-                message_type=MessageType.TEXT,
-                sender_id=bot_info.get("bot_id", "") if bot_info else "",
-                sender_name=bot_info.get("bot_nickname", "Bot") if bot_info else "Bot",
-                platform=platform,
-                chat_type=chat_type,
-                stream_id=target_stream_id,
+                stream_id=self.chat_stream.stream_id,
                 reply_to=reply_to,
-                **extra,
             )
-            
-            from src.core.transport.message_send import get_message_sender
-            sender = get_message_sender()
-            success = await sender.send_message(message)
             return success, f"已发送消息: {segment[:80]}"
-        else:
-            success = await self._send_to_stream(segment)
-            if not success:
-                return False, "消息发送失败"
 
-            return True, f"已发送消息: {segment[:80]}"
+        success = await self._send_to_stream(segment)
+        if not success:
+            return False, "消息发送失败"
+        return True, f"已发送消息: {segment[:80]}"
 
 

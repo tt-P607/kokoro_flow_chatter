@@ -6,8 +6,7 @@
 from __future__ import annotations
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base import BasePlugin
-from src.core.components.loader import register_plugin
+from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.kernel.concurrency import get_task_manager
 
 from .actions.do_nothing import DoNothingAction
@@ -29,6 +28,8 @@ class KFCPlugin(BasePlugin):
     plugin_author = "MoFox Team"
     plugin_description = "心理活动流聊天器，模拟真实人类的连续心理活动和对话节奏"
     configs = [KFCConfig]
+
+    _session_store: KFCSessionStore
 
     def __init__(self, config: KFCConfig | None = None) -> None:
         super().__init__(config)
@@ -134,17 +135,13 @@ class KFCPlugin(BasePlugin):
                 for stream_id in triggered:
                     await proactive.mark_triggered(stream_id)
                     logger.info(f"主动发起触发: {stream_id[:8]}")
-                    # 通过事件总线触发 chatter
-                    try:
-                        from src.kernel.event import get_event_bus
+                    # 通过事件 API 触发 chatter
+                    from src.app.plugin_system.api.event_api import publish_event
 
-                        bus = get_event_bus()
-                        await bus.publish(
-                            "kfc.proactive_trigger",
-                            {"stream_id": stream_id},
-                        )
-                    except ImportError:
-                        logger.debug("事件总线不可用")
+                    await publish_event(
+                        "kfc.proactive_trigger",
+                        {"stream_id": stream_id},
+                    )
 
             # 注册周期性主动发起检查任务
             await scheduler.create_schedule(

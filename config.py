@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
 
 class KFCConfig(BaseConfig):
@@ -24,11 +24,19 @@ class KFCConfig(BaseConfig):
         enabled: bool = Field(default=True, description="是否启用")
         model_task: str = Field(
             default="actor",
-            description="LLM 模型任务名称（对应 model.toml 中的 task）",
+            description="LLM 模型名称（对应 model.toml 中的 task），models 为空时使用",
         )
-        model: str = Field(
-            default="",
-            description="自定义 LLM 模型名称（对应 model.toml 中的 name）。默认为空，使用 model_task。",
+        models: list[str] = Field(
+            default=[],
+            description="指定 LLM 模型列表（对应 model.toml 中的 name）。非空时覆盖 model_task，多个模型按顺序 fallback",
+        )
+        temperature: float = Field(
+            default=0.7,
+            description="模型温度，仅在 models 非空时生效",
+        )
+        max_tokens: int = Field(
+            default=8000,
+            description="最大输出 token 数，仅在 models 非空时生效",
         )
         native_multimodal: bool = Field(
             default=False,

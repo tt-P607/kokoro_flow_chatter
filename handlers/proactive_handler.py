@@ -12,12 +12,11 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base.event_handler import BaseEventHandler
-from src.kernel.event import EventDecision
+from src.app.plugin_system.base import BaseEventHandler
+from src.app.plugin_system.api.event_api import EventDecision
 
 if TYPE_CHECKING:
-    from src.core.components.base.plugin import BasePlugin
-    from src.core.components.types import EventType
+    from src.app.plugin_system.api.event_api import EventType
 
 logger = get_logger("kfc_proactive_handler")
 
@@ -79,10 +78,9 @@ class ProactiveHandler(BaseEventHandler):
         Returns:
             bool: 是否成功唤醒
         """
-        from src.core.managers.stream_manager import get_stream_manager
+        from src.app.plugin_system.api.stream_api import get_stream
 
-        sm = get_stream_manager()
-        chat_stream = sm._streams.get(stream_id)  # HACK: 需要框架公开 API (stream_manager.get_stream)
+        chat_stream = await get_stream(stream_id)
         if not chat_stream:
             logger.warning(f"目标流 {stream_id[:8]} 不在内存中，跳过")
             return False
@@ -95,7 +93,7 @@ class ProactiveHandler(BaseEventHandler):
         try:
             from ..plugin import KFCPlugin
             if isinstance(self.plugin, KFCPlugin):
-                session = await self.plugin._session_store.get(stream_id)
+                session = await self.plugin._session_store.get(stream_id)  # type: ignore[attr-defined]
                 if session:
                     if session.user_id:
                         target_user_id = session.user_id

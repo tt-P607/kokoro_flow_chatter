@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import datetime
-from typing import Any
 
 from src.core.config import get_core_config
 from src.core.prompt import get_prompt_manager, optional, wrap, min_len
@@ -195,7 +194,6 @@ def build_timeout_context(
     else:
         pending_block = ""
 
-    from .templates import KFC_TIMEOUT_PROMPT
 
     return KFC_TIMEOUT_PROMPT.format(
         elapsed_seconds=elapsed_seconds,

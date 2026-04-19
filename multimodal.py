@@ -138,7 +138,11 @@ def build_multimodal_content(
 def _get_media_list(msg: Message) -> list[dict[str, Any]]:
     """从 Message 中提取 media 列表。
 
-    按优先级尝试三种路径获取媒体数据。
+    按优先级尝试以下路径获取媒体数据：
+    1. content dict（当前会话内存消息，含完整 base64）
+    2. extra dict
+    3. message.media 直接属性
+    4. EMOJI 类型原始 content 字符串
 
     Args:
         msg: 消息对象
@@ -146,12 +150,15 @@ def _get_media_list(msg: Message) -> list[dict[str, Any]]:
     Returns:
         媒体字典列表，每项为 ``{"type": str, "data": str}``
     """
-    # 路径 1: content 是 dict（含媒体消息）
     content = getattr(msg, "content", None)
+
+    # 路径 1: content 是 dict（当前会话内存中的消息，含完整 base64）
     if isinstance(content, dict):
         media = content.get("media")
         if isinstance(media, list) and media:
-            return media
+            # 仅在含有 data 的情况下从这里返回，避免返回被 stream_manager 剥离后的空壳
+            if any(item.get("data") for item in media if isinstance(item, dict)):
+                return media
 
     # 路径 2: extra 中的 media（converter 构造时通过 **extra 传入）
     extra = getattr(msg, "extra", {})
@@ -160,7 +167,7 @@ def _get_media_list(msg: Message) -> list[dict[str, Any]]:
         if isinstance(media, list) and media:
             return media
 
-    # 路径 3: 直接属性（**extra 展开后成为实例属性）
+    # 路径 3: 直接属性 message.media（当前会话内存，含完整 base64）
     media = getattr(msg, "media", None)
     if isinstance(media, list) and media:
         return media

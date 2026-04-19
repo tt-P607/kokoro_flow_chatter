@@ -125,7 +125,7 @@ def format_prompt_for_log(response: Any) -> str:
     # 2. 工具列表（中间）
     if all_tool_schemas:
         tool_count = len(all_tool_schemas)
-        tools_section = f"── TOOLS (API 参数，不进入消息流) ──\n"
+        tools_section = "── TOOLS (API 参数，不进入消息流) ──\n"
         tools_section += f"[共 {tool_count} 个工具]\n\n"
         
         for i, schema in enumerate(all_tool_schemas, 1):
@@ -141,7 +141,7 @@ def format_prompt_for_log(response: Any) -> str:
                 required = params.get("required", [])
                 properties = params.get("properties", {})
                 if properties:
-                    tools_section += f"   参数:\n"
+                    tools_section += "   参数:\n"
                     for param_name, param_info in properties.items():
                         param_desc = param_info.get("description", "")
                         param_type = param_info.get("type", "unknown")

@@ -21,7 +21,7 @@ from src.app.plugin_system.api.llm_api import (
     get_model_set_by_name,
 )
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base import (
+from src.app.plugin_system.base import (
     BaseChatter,
     Failure,
     Stop,
@@ -30,10 +30,10 @@ from src.core.components.base import (
 )
 from src.core.components.types import ChatType
 from src.kernel.concurrency import get_watchdog
-from src.kernel.llm import Content, LLMContextManager, LLMPayload, ROLE, Text, ToolResult
+from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
 
 from .debug.log_formatter import format_prompt_for_log, log_kfc_result
-from .models import KFC_REPLY, DO_NOTHING, ToolCallResult
+from .models import KFC_REPLY, DO_NOTHING
 from .parser import parse_tool_calls
 from .prompts.templates import (
     KFC_PERCEIVE_FOLLOWUP_PROMPT_JSON,
@@ -42,7 +42,7 @@ from .prompts.templates import (
 
 if TYPE_CHECKING:
     from src.core.models.stream import ChatStream
-    from src.kernel.llm import ToolRegistry
+    from src.app.plugin_system.api.llm_api import ToolRegistry
 
     from .config import KFCConfig
     from .multimodal import ImageBudget
@@ -76,14 +76,14 @@ class KokoroFlowChatter(BaseChatter):
     def _get_config(self) -> KFCConfig:
         """获取 KFC 配置。"""
         from .config import KFCConfig
+        from .plugin import KFCPlugin
 
-        plugin_config = getattr(self.plugin, "config", None)
-        if plugin_config and isinstance(plugin_config, KFCConfig):
-            return plugin_config
+        if isinstance(self.plugin, KFCPlugin) and isinstance(self.plugin.config, KFCConfig):
+            return self.plugin.config
         return KFCConfig()
 
     @staticmethod
-    def format_message_line(msg: Any, time_format: str = "%H:%M") -> str:  # type: ignore[override]
+    def format_message_line(msg: Any, time_format: str = "%Y-%m-%d %H:%M:%S") -> str:  # type: ignore[override]
         """将单条消息格式化为带标签的显示行（KFC 层覆盖）。
 
         格式：》时间》[QQ:xxx] 昵称 [\u6d88\u606fid:xxx]\uff1a \u5185\u5bb9
@@ -174,11 +174,10 @@ class KokoroFlowChatter(BaseChatter):
         Yields:
             Wait | Success | Failure | Stop: 执行结果
         """
-        from src.core.managers.stream_manager import get_stream_manager
+        from src.app.plugin_system.api.stream_api import activate_stream
 
         # ── 初始化 ──
-        stream_manager = get_stream_manager()
-        chat_stream = await stream_manager.activate_stream(self.stream_id)
+        chat_stream = await activate_stream(self.stream_id)
         if chat_stream is None:
             logger.error(f"无法激活聊天流: {self.stream_id}")
             yield Failure("聊天流激活失败")
@@ -188,21 +187,6 @@ class KokoroFlowChatter(BaseChatter):
         # 检查插件是否启用
         if not config.general.enabled:
             logger.debug("KFC 插件已禁用，跳过 execute")
-            # 注销自身：从活跃 Chatter 表和全局注册表中移除，
-            # 让下次消息重新选择 Chatter（如 DFC）
-            try:
-                from src.core.managers import get_chatter_manager
-                get_chatter_manager().unregister_active_chatter(self.stream_id)
-            except Exception:
-                pass
-            try:
-                from src.core.components.registry import get_global_registry
-                signature = self.get_signature()
-                if signature:
-                    get_global_registry().unregister(signature)
-                    logger.debug(f"KFC Chatter 已从注册表注销: {signature}")
-            except Exception:
-                pass
             yield Stop(0)
             return
 
@@ -217,12 +201,23 @@ class KokoroFlowChatter(BaseChatter):
         try:  # 确保退出时清理 VLM 跳过注册
             # ── 构建 LLM 请求 ──
             model_set = None
-            if config.general.model:
-                model_set = get_model_set_by_name(config.general.model)
+            _temperature = config.general.temperature
+            _max_tokens = config.general.max_tokens
+            if config.general.models:
+                # 多模型 fallback：按顺序合并
+                parts = [
+                    get_model_set_by_name(m, temperature=_temperature, max_tokens=_max_tokens)
+                    for m in config.general.models
+                ]
+                valid_parts = [p for p in parts if p]
+                if valid_parts:
+                    model_set = valid_parts[0]
+                    for p in valid_parts[1:]:
+                        model_set = model_set + p
                 if not model_set:
                     logger.warning(
-                        f"自定义模型 '{config.general.model}' 未注册，"
-                        f"将回退到任务模型 '{config.general.model_task}'"
+                        f"models 中的模型均未注册: {config.general.models}，"
+                        f"回退到任务模型 '{config.general.model_task}'"
                     )
 
             if not model_set:
@@ -247,7 +242,7 @@ class KokoroFlowChatter(BaseChatter):
             # ── 对话循环 ──
             while True:
                 # 读取未读消息
-                formatted_text, unread_msgs = await self.fetch_unreads()
+                formatted_text, unread_msgs = await self.fetch_unreads(time_format="%Y-%m-%d %H:%M:%S")
 
                 if formatted_text and unread_msgs:
                     _has_pending_tool_results = False
@@ -752,7 +747,7 @@ class KokoroFlowChatter(BaseChatter):
         payloads: list[LLMPayload] = []
         for role, msgs in zip(role_list, msg_groups):
             if role == "user":
-                lines = "\n".join(self.format_message_line(m) for m in msgs)
+                lines = "\n".join(self.format_message_line(m, "%Y-%m-%d %H:%M:%S") for m in msgs)
                 payloads.append(LLMPayload(ROLE.USER, Text(f"[消息记录]\n{lines}")))
             else:
                 text = _build_assistant_text(msgs)
@@ -1080,10 +1075,9 @@ class KokoroFlowChatter(BaseChatter):
 
     async def _get_virtual_trigger_message(self) -> Any:
         """构造虚拟触发消息，用于超时主动发言等无真实触发消息的场景。"""
-        from src.core.managers.stream_manager import get_stream_manager
+        from src.app.plugin_system.api.stream_api import get_stream
 
-        sm = get_stream_manager()
-        chat_stream = sm._streams.get(self.stream_id)  # HACK: 需要框架公开 API (stream_manager.get_stream)
+        chat_stream = await get_stream(self.stream_id)
         if not chat_stream:
             return None
 
