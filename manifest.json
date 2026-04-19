@@ -19,6 +19,11 @@
             "dependencies": []
         },
         {
+            "component_type": "action",
+            "component_name": "schedule_proactive",
+            "dependencies": []
+        },
+        {
             "component_type": "config",
             "component_name": "config",
             "dependencies": []

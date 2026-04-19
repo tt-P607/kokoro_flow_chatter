@@ -48,13 +48,24 @@ class ProactiveThinker:
         sessions = self._session_store.get_all_cached()
 
         for stream_id, session in sessions.items():
-            if self._should_trigger(session):
+            if await self._check_and_trigger(stream_id, session):
                 triggered.append(stream_id)
 
         return triggered
 
+    async def _check_and_trigger(self, stream_id: str, session: KFCSession) -> bool:
+        """检查单个 session 是否应触发，处理过期预约的持久化清除。"""
+        now = time.time()
+        if session.scheduled_proactive_at is not None:
+            if now >= session.scheduled_proactive_at:
+                logger.info(f"主动思考：触发模型预约 stream={stream_id[:8]}")
+                return True
+            return False
+
+        return self._should_trigger(session)
+
     def _should_trigger(self, session: KFCSession) -> bool:
-        """判断指定 Session 是否应主动发起。
+        """判断无预约情况下是否应主动发起（沉默条件 + 概率）。
 
         Args:
             session: KFC 会话对象
@@ -106,9 +117,10 @@ class ProactiveThinker:
             return False
 
     async def mark_triggered(self, stream_id: str) -> None:
-        """标记 Session 已触发主动发起。"""
+        """标记 Session 已触发主动发起，同时清除模型预约。"""
         async with self._session_store.lock(stream_id):
             session = await self._session_store.get(stream_id)
             if session:
                 session.last_proactive_at = time.time()
+                session.scheduled_proactive_at = None  # 清除已消费的预约
                 await self._session_store.save(session)

@@ -39,6 +39,10 @@ class KFCSession:
     last_user_message_at: float | None = None
     last_proactive_at: float | None = None
 
+    # 模型预约的下一次主动思考时间（Unix 时间戳）
+    # 若存在，条件主动发起逻辑不生效，直到预约时间到来或被清除
+    scheduled_proactive_at: float | None = None
+
     # 心理活动流
     mental_log: MentalLog = field(default_factory=MentalLog)
 
@@ -121,6 +125,14 @@ class KFCSession:
         self.last_activity_at = time.time()
         return entry
 
+    def set_scheduled_proactive(self, at: float | None) -> None:
+        """设置（或清除）模型预约的主动思考时间。
+
+        Args:
+            at: Unix 时间戳，None 表示清除预约
+        """
+        self.scheduled_proactive_at = at
+
     def add_interrupt_event(self, interrupt_msgs: list[Any]) -> MentalLogEntry:
         """记录用户打断事件到活动流。
 
@@ -162,6 +174,7 @@ class KFCSession:
             "last_activity_at": self.last_activity_at,
             "last_user_message_at": self.last_user_message_at,
             "last_proactive_at": self.last_proactive_at,
+            "scheduled_proactive_at": self.scheduled_proactive_at,
             "mental_log": self.mental_log.to_list(),
             "total_interactions": self.total_interactions,
         }
@@ -189,6 +202,7 @@ class KFCSession:
         session.last_activity_at = float(data.get("last_activity_at", time.time()))
         session.last_user_message_at = data.get("last_user_message_at")
         session.last_proactive_at = data.get("last_proactive_at")
+        session.scheduled_proactive_at = data.get("scheduled_proactive_at")
         session.mental_log = MentalLog.from_list(
             data.get("mental_log", []),
             max_entries=max_log_entries,

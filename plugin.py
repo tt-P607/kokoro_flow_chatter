@@ -11,6 +11,7 @@ from src.kernel.concurrency import get_task_manager
 
 from .actions.do_nothing import DoNothingAction
 from .actions.reply import KFCReplyAction
+from .actions.schedule_proactive import ScheduleProactiveAction
 from .chatter import KokoroFlowChatter
 from .config import KFCConfig
 from .handlers.proactive_handler import ProactiveHandler
@@ -161,5 +162,6 @@ class KFCPlugin(BasePlugin):
             KokoroFlowChatter,
             KFCReplyAction,
             DoNothingAction,
+            ScheduleProactiveAction,
             ProactiveHandler,
         ]

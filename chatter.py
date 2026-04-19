@@ -485,6 +485,27 @@ class KokoroFlowChatter(BaseChatter):
                     pre_execute_hook=lambda r: log_kfc_result(r, config),
                 )
 
+                # ── 处理 schedule_proactive 预约副作用 ──
+                # Action 无法直接访问 session，由 chatter 在这里处理
+                for call in getattr(response, "call_list", None) or []:
+                    call_name = call.name.rsplit(":", 1)[-1] if ":" in call.name else call.name
+                    for prefix in ("action-", "tool-", "agent-"):
+                        if call_name.startswith(prefix):
+                            call_name = call_name[len(prefix):]
+                            break
+                    if call_name == "schedule_proactive":
+                        try:
+                            import json as _json
+                            _args = call.args if isinstance(call.args, dict) else (
+                                _json.loads(call.args) if isinstance(call.args, str) else {}
+                            )
+                            delay = max(1800.0, min(43200.0, float(_args.get("delay_seconds", 1800))))
+                            session.set_scheduled_proactive(time.time() + delay)
+                            logger.info(f"[KFC] 已预约主动思考: {delay:.0f}s 后")
+                        except Exception as _e:
+                            logger.warning(f"[KFC] schedule_proactive 参数解析失败: {_e}")
+                        break
+
                 # 活动流记录（同时保存原始 LLM 响应文本，供热启动使用）
                 session.add_bot_planning(
                     thought=result.thought,
