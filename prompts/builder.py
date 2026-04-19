@@ -106,7 +106,7 @@ class KFCPromptBuilder:
         else:
             content = Text(user_text)
 
-        return LLMPayload(ROLE.USER, content)
+        return LLMPayload(ROLE.USER, content)  # type: ignore[arg-type]
 
     @staticmethod
     def build_timeout_payload(
@@ -114,7 +114,6 @@ class KFCPromptBuilder:
         expected_reaction: str,
         consecutive_timeouts: int,
         last_bot_message: str = "",
-        pending_thoughts: list[str] | None = None,
     ) -> LLMPayload:
         """构建等待超时 Payload。
 
@@ -126,7 +125,6 @@ class KFCPromptBuilder:
             expected_reaction: 之前预期的对方反应
             consecutive_timeouts: 连续超时次数
             last_bot_message: 最后一条 Bot 发送的消息
-            pending_thoughts: 等待期间产生的想法列表
 
         Returns:
             LLMPayload: USER 角色的超时 Payload
@@ -138,7 +136,6 @@ class KFCPromptBuilder:
             expected_reaction=expected_reaction,
             consecutive_timeouts=consecutive_timeouts,
             last_bot_message=last_bot_message,
-            pending_thoughts=pending_thoughts,
         )
 
         return LLMPayload(ROLE.USER, Text(timeout_text))

@@ -99,7 +99,7 @@ def format_prompt_for_log(response: Any) -> str:
             all_tool_schemas.extend(tool_schemas)
             continue
 
-        role_name = str(role.value).upper() if hasattr(role, "value") else str(role)
+        role_name = str(role.value).upper() if role is not None and hasattr(role, "value") else str(role)
         text = "\n".join(text_parts) if text_parts else "（空）"
         line = f"── {role_name} ──\n{text}"
 

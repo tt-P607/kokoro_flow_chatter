@@ -42,9 +42,6 @@ class KFCSession:
     # 心理活动流
     mental_log: MentalLog = field(default_factory=MentalLog)
 
-    # 连续思考期间的待注入想法（Scheduler 写入，execute() 读取后清空）
-    pending_thoughts: list[str] = field(default_factory=list)
-
     # 统计
     total_interactions: int = 0
 
@@ -124,16 +121,31 @@ class KFCSession:
         self.last_activity_at = time.time()
         return entry
 
-    def add_waiting_update(
-        self, waiting_thought: str, mood: str = ""
-    ) -> MentalLogEntry:
-        """记录等待期间的心理活动。"""
+    def add_interrupt_event(self, interrupt_msgs: list[Any]) -> MentalLogEntry:
+        """记录用户打断事件到活动流。
+
+        当 LLM 生成期间检测到新消息时调用，让模型在下一轮上下文
+        中感知到"我正在思考时被打断"这一事实，从而做出更自然的响应。
+
+        Args:
+            interrupt_msgs: 打断时到达的消息列表
+
+        Returns:
+            MentalLogEntry: 写入活动流的条目
+        """
+        count = len(interrupt_msgs)
+        senders = {
+            getattr(m, "sender_name", "") or getattr(m, "sender_id", "未知")
+            for m in interrupt_msgs
+        }
+        sender_str = "、".join(sorted(senders))
         entry = MentalLogEntry(
-            event_type=KFCEventType.WAITING_UPDATE,
+            event_type=KFCEventType.USER_INTERRUPTED,
             timestamp=time.time(),
-            waiting_thought=waiting_thought,
-            mood=mood,
-            elapsed_seconds=self.waiting_config.get_elapsed_seconds(),
+            content=(
+                f"我正在思考时，{sender_str} 发来了 {count} 条新消息，"
+                "我的回复是在没看到这些消息的情况下做出的。"
+            ),
         )
         self.mental_log.add(entry)
         return entry
@@ -151,7 +163,6 @@ class KFCSession:
             "last_user_message_at": self.last_user_message_at,
             "last_proactive_at": self.last_proactive_at,
             "mental_log": self.mental_log.to_list(),
-            "pending_thoughts": self.pending_thoughts,
             "total_interactions": self.total_interactions,
         }
 
@@ -182,7 +193,6 @@ class KFCSession:
             data.get("mental_log", []),
             max_entries=max_log_entries,
         )
-        session.pending_thoughts = data.get("pending_thoughts", [])
         session.total_interactions = int(data.get("total_interactions", 0))
         return session
 

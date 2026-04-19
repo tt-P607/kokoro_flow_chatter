@@ -68,6 +68,7 @@ class KFCEventType(Enum):
     REPLY_LATE = "reply_late"
     WAIT_TIMEOUT = "wait_timeout"
     PROACTIVE_TRIGGER = "proactive_trigger"
+    USER_INTERRUPTED = "user_interrupted"
 
     def __str__(self) -> str:
         return self.value
@@ -80,8 +81,6 @@ class WaitingConfig:
     expected_reaction: str = ""
     max_wait_seconds: float = 0.0
     started_at: float = 0.0
-    last_thinking_at: float = 0.0
-    thinking_count: int = 0
     followup_count: int = 0
 
     def is_active(self) -> bool:
@@ -111,8 +110,6 @@ class WaitingConfig:
         self.expected_reaction = ""
         self.max_wait_seconds = 0.0
         self.started_at = 0.0
-        self.last_thinking_at = 0.0
-        self.thinking_count = 0
         self.followup_count = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -121,8 +118,6 @@ class WaitingConfig:
             "expected_reaction": self.expected_reaction,
             "max_wait_seconds": self.max_wait_seconds,
             "started_at": self.started_at,
-            "last_thinking_at": self.last_thinking_at,
-            "thinking_count": self.thinking_count,
             "followup_count": self.followup_count,
         }
 
@@ -133,8 +128,6 @@ class WaitingConfig:
             expected_reaction=data.get("expected_reaction", ""),
             max_wait_seconds=float(data.get("max_wait_seconds", 0)),
             started_at=float(data.get("started_at", 0)),
-            last_thinking_at=float(data.get("last_thinking_at", 0)),
-            thinking_count=int(data.get("thinking_count", 0)),
             followup_count=int(data.get("followup_count", 0)),
         )
 

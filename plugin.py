@@ -153,31 +153,6 @@ class KFCPlugin(BasePlugin):
                 force_overwrite=True,
             )
 
-        # 等待检查（连续思考）
-        if config.continuous_thinking.enabled:
-            from .thinker.wait_checker import WaitChecker
-
-            wait_checker = WaitChecker(config=config)
-
-            async def wait_check() -> None:
-                """定期检查等待中的 Session 并触发连续思考。"""
-                sessions = self._session_store.get_all_cached()
-                for stream_id, session in sessions.items():
-                    if session.is_waiting():
-                        async with self._session_store.lock(stream_id):
-                            await wait_checker.check_and_think(session)
-                            await self._session_store.save(session)
-
-            # 注册周期性连续思考检查任务
-            await scheduler.create_schedule(
-                callback=wait_check,
-                trigger_type=TriggerType.TIME,
-                trigger_config={"delay_seconds": int(config.continuous_thinking.min_interval)},
-                is_recurring=True,
-                task_name="kfc_wait_check",
-                force_overwrite=True,
-            )
-
         logger.info("KFC 调度器任务注册完成")
 
     def get_components(self) -> list[type]:

@@ -129,7 +129,55 @@ class KokoroFlowChatter(BaseChatter):
         """获取 Session Store（由 plugin.__init__ 初始化）。"""
         return self.plugin._session_store  # type: ignore[attr-defined]
 
-    async def modify_llm_usables(self, usables: list[Any]) -> list[Any]:
+    async def _accumulate_messages(
+        self,
+        config: KFCConfig,
+    ) -> tuple[str, list[Any]]:
+        """在积累窗口内等待并聚合连发消息。
+
+        收到第一条消息后，等待 ``buffer.accumulate_window`` 秒，
+        期间若有新消息到达则重置窗口（最多等待 ``buffer.accumulate_max_window`` 秒）。
+        由于 ``fetch_unreads()`` 是非破坏性读取，窗口结束后重新 fetch
+        可天然获取这段时间内到达的全部消息。
+
+        Args:
+            config: KFC 配置
+
+        Returns:
+            tuple[str, list]: (格式化文本, 消息列表)
+        """
+        import asyncio
+
+        window = config.buffer.accumulate_window
+        max_window = config.buffer.accumulate_max_window
+
+        if window <= 0:
+            # 积累窗口已禁用，直接返回当前未读
+            return await self.fetch_unreads(time_format="%Y-%m-%d %H:%M:%S")
+
+        deadline = time.monotonic() + max_window
+        last_count = 0
+
+        while True:
+            _, current_msgs = await self.fetch_unreads(time_format="%Y-%m-%d %H:%M:%S")
+            current_count = len(current_msgs)
+
+            if current_count > last_count:
+                # 有新消息：重置窗口（但不超过硬性截止时间）
+                last_count = current_count
+                next_check = time.monotonic() + window
+            else:
+                next_check = time.monotonic()  # 无新增，立即检查截止时间
+
+            remaining = min(deadline, next_check) - time.monotonic()
+            if remaining <= 0:
+                break
+
+            await asyncio.sleep(min(0.2, remaining))
+
+        return await self.fetch_unreads(time_format="%Y-%m-%d %H:%M:%S")
+
+    async def modify_llm_usables(self, llm_usables: list[Any]) -> list[Any]:  # type: ignore[override]
         """过滤掉不需要的工具，并根据模式决定是否保留 kfc_reply 和 do_nothing。
 
         - JSON 模式（use_tool_calling=False）：过滤掉 kfc_reply 和 do_nothing，
@@ -158,11 +206,11 @@ class KokoroFlowChatter(BaseChatter):
                     break
             return n in _blocked
 
-        return [u for u in usables if not _is_reply_tool(u)]
+        return [u for u in llm_usables if not _is_reply_tool(u)]
 
     # ── 核心对话循环 ──────────────────────────────────────────
 
-    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
+    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:  # type: ignore[override]
         """执行聊天器的对话循环。
 
         核心流程：
@@ -228,6 +276,8 @@ class KokoroFlowChatter(BaseChatter):
                 yield Failure("模型配置错误：未找到有效的模型配置")
                 return
 
+
+
             # ── 构建 LLM 上下文 ──
             (
                 response, image_budget, usable_map, prompt_builder, has_history,
@@ -245,6 +295,10 @@ class KokoroFlowChatter(BaseChatter):
                 formatted_text, unread_msgs = await self.fetch_unreads(time_format="%Y-%m-%d %H:%M:%S")
 
                 if formatted_text and unread_msgs:
+                    # ── 消息积累窗口：等待连发消息聚合 ──
+                    formatted_text, unread_msgs = await self._accumulate_messages(
+                        config
+                    )
                     _has_pending_tool_results = False
                     # 记录用户消息到活动流
                     for msg in unread_msgs:
@@ -364,7 +418,6 @@ class KokoroFlowChatter(BaseChatter):
                             expected_reaction=timeout_ctx["expected_reaction"],  # type: ignore[arg-type]
                             consecutive_timeouts=timeout_ctx["consecutive_timeouts"],  # type: ignore[arg-type]
                             last_bot_message=timeout_ctx.get("last_bot_message", ""),  # type: ignore[arg-type]
-                            pending_thoughts=timeout_ctx.get("pending_thoughts"),  # type: ignore[arg-type]
                         )
                         response.add_payload(timeout_payload)
                     else:
@@ -378,12 +431,31 @@ class KokoroFlowChatter(BaseChatter):
                 if config.debug.show_prompt:
                     self._log_prompt(response)
 
+                # 快照：LLM 调用前的已知消息 ID，用于检测打断
+                _known_ids: frozenset[str] = frozenset(
+                    mid for m in (unread_msgs or [])
+                    if (mid := getattr(m, "message_id", None)) is not None
+                )
+
                 try:
-                    response = await self._send_with_perceive_loop(
-                        response,
-                        config.general.max_compat_retries,
-                        use_tool_calling=config.general.use_tool_calling,
-                    )
+                    if config.buffer.interrupt_enabled and _known_ids:
+                        new_response, interrupt_msgs = await self._send_interruptable(
+                            response, config, _known_ids
+                        )
+                        if interrupt_msgs:
+                            # 被打断：刷新原始消息，记录打断事件，循环重来
+                            await self.flush_unreads(unread_msgs or [])
+                            session.add_interrupt_event(interrupt_msgs)
+                            await self._save_session(session)
+                            continue
+                        assert new_response is not None  # interrupt_msgs 非空时已 continue
+                        response = new_response
+                    else:
+                        response = await self._send_with_perceive_loop(
+                            response,
+                            config.general.max_compat_retries,
+                            use_tool_calling=config.general.use_tool_calling,
+                        )
                     await self.flush_unreads(unread_msgs if unread_msgs else [])
                 except Exception as e:
                     logger.error(f"LLM 请求失败: {e}", exc_info=True)
@@ -473,7 +545,6 @@ class KokoroFlowChatter(BaseChatter):
                         started_at=time.time(),
                     )
                     session.set_waiting(waiting_config)
-                    session.pending_thoughts.clear()
                     await self._save_session(session)
                     yield Wait(0)
                     continue
@@ -838,6 +909,86 @@ class KokoroFlowChatter(BaseChatter):
 
             # 重试次数耗尽，返回最后一次响应（由调用方处理空 call_list）
             return new_response
+
+    # ── 可打断 LLM 调用 ─────────────────────────────────────
+
+    async def _send_interruptable(
+        self,
+        response: Any,
+        config: KFCConfig,
+        known_unread_ids: frozenset[str],
+    ) -> tuple[Any | None, list[Any]]:
+        """以可打断方式发送 LLM 请求。
+
+        将 ``_send_with_perceive_loop`` 包装为 asyncio.Task 并发运行，
+        同时按 ``buffer.interrupt_poll_seconds`` 轮询未读消息队列。
+        若检测到 ``known_unread_ids`` 之外的新消息（即打断消息），
+        立即取消 LLM Task 并返回中断消息列表。
+
+        取消发生在 HTTP 传输阶段（``auto_append_response`` 尚未执行），
+        response 链保持干净，主循环可直接 ``continue`` 重新发起。
+
+        Args:
+            response: 当前 LLM 请求/响应链对象
+            config: KFC 配置
+            known_unread_ids: LLM 调用前的已知未读消息 ID 集合
+
+        Returns:
+            tuple:
+                - ``new_response``：LLM 正常完成时为新响应对象，被打断时为 ``None``
+                - ``interrupt_msgs``：打断时到达的消息列表，正常完成时为空列表
+        """
+        import asyncio as _asyncio
+        from src.kernel.concurrency import get_task_manager
+
+        async def _llm_work() -> Any:
+            return await self._send_with_perceive_loop(
+                response,
+                config.general.max_compat_retries,
+                use_tool_calling=config.general.use_tool_calling,
+            )
+
+        tm = get_task_manager()
+        task_handle = tm.create_task(
+            _llm_work(), name=f"kfc_llm_{self.stream_id[:8]}"
+        )
+        if task_handle.task is None:  # pragma: no cover
+            raise RuntimeError("task_manager 未返回有效的 Task")
+        llm_task: _asyncio.Task[Any] = task_handle.task
+
+        poll_interval = config.buffer.interrupt_poll_seconds
+
+        try:
+            while not llm_task.done():
+                await _asyncio.sleep(poll_interval)
+                if llm_task.done():
+                    break
+
+                _, current_msgs = await self.fetch_unreads(
+                    time_format="%Y-%m-%d %H:%M:%S"
+                )
+                interrupt_msgs = [
+                    m for m in current_msgs
+                    if getattr(m, "message_id", None) not in known_unread_ids
+                ]
+                if interrupt_msgs:
+                    llm_task.cancel()
+                    try:
+                        await llm_task
+                    except _asyncio.CancelledError:
+                        pass
+                    logger.info(
+                        f"[打断] LLM 被取消，检测到 {len(interrupt_msgs)} 条新消息"
+                    )
+                    return None, interrupt_msgs
+
+        except _asyncio.CancelledError:
+            # 外层取消（WatchDog 等）：传播取消信号
+            llm_task.cancel()
+            raise
+
+        # LLM 正常完成
+        return llm_task.result(), []
 
     # ── 动作执行 ────────────────────────────────────────────
 

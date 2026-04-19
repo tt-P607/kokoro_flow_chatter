@@ -154,7 +154,6 @@ def build_timeout_context(
     expected_reaction: str,
     consecutive_timeouts: int,
     last_bot_message: str = "",
-    pending_thoughts: list[str] | None = None,
 ) -> str:
     """构建等待超时决策上下文。
 
@@ -163,7 +162,6 @@ def build_timeout_context(
         expected_reaction: 预期对方的反应
         consecutive_timeouts: 连续超时次数（含本次）
         last_bot_message: 最后一条 Bot 发送的消息
-        pending_thoughts: 等待期间产生的想法列表
     """
     elapsed_minutes = elapsed_seconds / 60
 
@@ -187,19 +185,11 @@ def build_timeout_context(
             "可以适当追问一下，但也要考虑对方可能在忙。"
         )
 
-    # 等待期间的想法
-    if pending_thoughts:
-        thoughts_text = "、".join(pending_thoughts)
-        pending_block = f"\n你等待期间的想法：{thoughts_text}"
-    else:
-        pending_block = ""
-
-
     return KFC_TIMEOUT_PROMPT.format(
         elapsed_seconds=elapsed_seconds,
         elapsed_minutes=elapsed_minutes,
         expected_reaction=expected_reaction or "对方能回复点什么",
         last_bot_message=last_bot_message or "（消息内容不可用）",
         followup_warning=followup_warning,
-        pending_thoughts_block=pending_block,
+        pending_thoughts_block="",
     )

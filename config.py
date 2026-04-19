@@ -160,17 +160,39 @@ class KFCConfig(BaseConfig):
             ),
         )
 
-    @config_section("continuous_thinking")
-    class ContinuousThinkingSection(SectionBase):
-        """连续思考配置。"""
 
-        enabled: bool = Field(default=True, description="是否启用连续思考")
-        progress_thresholds: list[float] = Field(
-            default=[0.3, 0.6, 0.85],
-            description="等待进度触发阈值列表",
+    @config_section("buffer")
+    class BufferSection(SectionBase):
+        """消息积累与打断配置。"""
+
+        accumulate_window: float = Field(
+            default=1.5,
+            description=(
+                "消息积累窗口（秒）。检测到第一条消息后等待此时长，"
+                "以收集同一时段连发的多条消息，避免对每条消息单独触发 LLM。"
+                "设为 0 则禁用积累窗口。"
+            ),
         )
-        min_interval: float = Field(
-            default=30.0, description="两次连续思考最小间隔(秒)"
+        accumulate_max_window: float = Field(
+            default=5.0,
+            description=(
+                "积累窗口最大总时长（秒）。即使消息持续到达，"
+                "超过此时长后强制提交，防止积累无限延迟。"
+            ),
+        )
+        interrupt_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否启用 LLM 生成打断。启用后，LLM 生成期间若检测到"
+                "新消息到达，将取消当前 LLM 请求并以全量消息重新发起。"
+            ),
+        )
+        interrupt_poll_seconds: float = Field(
+            default=0.5,
+            description=(
+                "打断检测轮询间隔（秒）。LLM 生成期间每隔此时间检查"
+                "一次是否有新消息到达。值越小响应越快，CPU 占用略高。"
+            ),
         )
 
     @config_section("debug")
@@ -191,7 +213,5 @@ class KFCConfig(BaseConfig):
     proactive: ProactiveSection = Field(default_factory=ProactiveSection)
     reply: ReplySection = Field(default_factory=ReplySection)
     prompt: PromptSection = Field(default_factory=PromptSection)
-    continuous_thinking: ContinuousThinkingSection = Field(
-        default_factory=ContinuousThinkingSection
-    )
+    buffer: BufferSection = Field(default_factory=BufferSection)
     debug: DebugSection = Field(default_factory=DebugSection)
