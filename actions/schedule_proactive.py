@@ -20,26 +20,33 @@ class ScheduleProactiveAction(BaseAction):
 
     action_name: str = "schedule_proactive"
     action_description: str = (
-        "在当前对话轮次结束后，预约一个时间点主动发起下一次对话。"
-        "当你判断当前话题暂告一段落、短期内无需等待对方回复、"
-        "但希望在某个时间点主动发起时，应调用此工具。"
-        "预约后，沉默自动触发逻辑将暂停，直到你指定的时间到达。"
-        "delay_seconds 应根据对话语境合理估计，范围限制为 1800~43200 秒。"
+        "预约一个时间点，届时系统会主动唤醒你去发起新一轮对话。"
+        "**新的预约会覆盖旧的预约。**\n"
+        "**不要只在话题结束时才想到这个工具**——下面这些日常场景都值得预约：\n"
+        "- 对方说去忙了、睡了、去做某件事了，你想等他/她回来后主动问候\n"
+        "- 聊了一段有趣的话题，你想晚些继续，或者想到了什么要告诉对方\n"
+        "- 约好了某件事（一起玩、明天见等），你想到时候提醒\n"
+        "- 对方今天心情不好，你想过段时间去关心一下\n"
+        "- 没什么特别的事，就是过一段时间想找对方说说话\n"
+        "只要你有「之后某个时间想主动联系」的念头，就调用它。\n"
+        "预约后，系统的沉默触发逻辑会暂停，直到你指定的时间到达。\n"
+        "delay_minutes 范围限制为 30~720 分钟（30 分钟~12 小时）。"
     )
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 
-    _MIN_DELAY = 1800    # 最小 30 分钟
-    _MAX_DELAY = 43200   # 最大 12 小时
+    _MIN_DELAY_MIN = 30    # 最小 30 分钟
+    _MAX_DELAY_MIN = 720   # 最大 12 小时
 
     async def execute(
         self,
-        delay_seconds: Annotated[
+        delay_minutes: Annotated[
             int,
-            "多少秒后发起主动思考，范围 1800~43200（30 分钟~12 小时）",
-        ] = 1800,
+            "多少分钟后发起主动思考，范围 30~720（30 分钟~12 小时）",
+        ] = 30,
         reason: Annotated[
             str,
-            "预约原因，简要说明为什么想在这个时间主动发起对话",
+            "预约原因（必填）：用一两句话说明届时你想主动聊什么、或者为什么想在这个时候联系对方。"
+            "这段理由会在预约时间到达时注入到你的上下文中，帮助你记住当时的意图。",
         ] = "",
     ) -> tuple[bool, str]:
         """设置主动思考预约时间。
@@ -47,7 +54,8 @@ class ScheduleProactiveAction(BaseAction):
         Returns:
             (True, 状态描述)
         """
-        delay_seconds = max(self._MIN_DELAY, min(self._MAX_DELAY, delay_seconds))
+        delay_minutes = max(self._MIN_DELAY_MIN, min(self._MAX_DELAY_MIN, delay_minutes))
+        delay_seconds = delay_minutes * 60
         at = time.time() + delay_seconds
         from datetime import datetime
 
@@ -56,4 +64,4 @@ class ScheduleProactiveAction(BaseAction):
             logger.debug(f"预约主动思考: {dt_str}（{reason}）")
         else:
             logger.debug(f"预约主动思考: {dt_str}")
-        return True, f"已预约在 {delay_seconds} 秒后主动思考"
+        return True, f"已预约在 {delay_minutes} 分钟后主动思考"

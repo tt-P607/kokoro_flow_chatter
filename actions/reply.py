@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Annotated
 
@@ -32,8 +31,7 @@ class KFCReplyAction(BaseAction):
     action_name = "kfc_reply"
     action_description = (
         "发送文本消息给对方。"
-        "content 支持传入字符串数组来分段发送多条消息，每个元素是一条独立消息，"
-        "系统会按顺序逐条发出并自动模拟打字延迟。"
+        "在需要分段的位置插入分段标记，系统会按标记自动拆成多条消息依次发出。"
         "也可以传单个字符串发送一条消息。"
         "可选的 reply_to 参数允许你引用消息（虽然私聊中较少用到，但引用旧消息时可能有用）。"
         "注意：本工具无法发送表情包等非文本内容。"
@@ -44,11 +42,8 @@ class KFCReplyAction(BaseAction):
     async def execute(
         self,
         content: Annotated[
-            str | list[str],
-            "要发送的文本内容。"
-            "可传字符串数组以分段发送多条消息，例如 [\"等等！\", \"你说什么意思啊\"]；"
-            "也可传单个字符串发送一条消息。"
-            "不要添加任何标记，只写你想说的话。",
+            str,
+            "要发送的文本内容。在需要分段的位置插入分段标记，系统会按标记自动拆成多条依次发出。",
         ],
         thought: Annotated[str, "你此刻的内心想法和感受，描述你为什么要这样回复"] = "",
         expected_reaction: Annotated[str, "你期望对方看到你这条消息后的反应"] = "",
@@ -58,38 +53,16 @@ class KFCReplyAction(BaseAction):
     ) -> tuple[bool, str]:
         """执行发送文本消息的逻辑。
 
-        content 支持字符串或字符串列表，列表时逐条发送（parser 层处理延迟，
-        此处仅作降级兜底：直接发送第一条非空内容）。
+        parser 层已处理分段拆分逻辑，此处仅作兜底：直接发送完整内容。
         reply_to 为可选的引用消息 ID。
         """
         # thought/expected_reaction/max_wait_seconds/mood 由 chatter.py 的策略层提取，
         # action 本身不使用这些参数
 
-        # 统一为列表，兼容三种格式：
-        # 1. 原生列表  2. JSON 字符串形式的列表  3. 普通字符串
-        if isinstance(content, list):
-            segments = [s.strip() for s in content if isinstance(s, str) and s.strip()]
-        elif isinstance(content, str):
-            stripped = content.strip()
-            if stripped.startswith("["):
-                try:
-                    parsed = json.loads(stripped)
-                    if isinstance(parsed, list):
-                        segments = [s.strip() for s in parsed if isinstance(s, str) and s.strip()]
-                    else:
-                        segments = [stripped] if stripped else []
-                except Exception:
-                    segments = [stripped] if stripped else []
-            else:
-                segments = [stripped] if stripped else []
-        else:
-            segments = []
-
-        if not segments:
+        # parser 层已处理分段拆分逻辑；此处仅作兜底，直接发送完整内容
+        segment = content.strip()
+        if not segment:
             return False, "内容为空，未发送"
-
-        # parser 层已处理多段逻辑；此处仅发送第一段作为兜底
-        segment = segments[0]
 
         # 最后防线：仅当 >=2 个元数据关键字同时出现时才截断，降低误伤
         keyword_matches = [

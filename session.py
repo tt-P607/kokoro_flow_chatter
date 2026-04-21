@@ -42,6 +42,7 @@ class KFCSession:
     # 模型预约的下一次主动思考时间（Unix 时间戳）
     # 若存在，条件主动发起逻辑不生效，直到预约时间到来或被清除
     scheduled_proactive_at: float | None = None
+    scheduled_proactive_reason: str = ""  # 预约时给出的理由，触发时注入提示词
 
     # 心理活动流
     mental_log: MentalLog = field(default_factory=MentalLog)
@@ -51,6 +52,12 @@ class KFCSession:
     # chain_cutoff_ts 为链头第一个 user 条目的时间戳，供 build_fused_narrative 做截断。
     chain_payloads: list[dict[str, Any]] = field(default_factory=list)
     chain_cutoff_ts: float = 0.0
+
+    # 近期记忆摘要（滚动压缩，替换式）：覆盖最近 compress_days_window 天的对话。
+    # 由主聊天模型异步生成，以第一人称书写，重启后持久保留。
+    history_summary: str = ""
+    last_compress_at: float = 0.0     # 上次触发压缩的时间戳
+    compress_round_count: int = 0     # 距上次压缩已完成的对话轮次数
 
     # 统计
     total_interactions: int = 0
@@ -131,13 +138,15 @@ class KFCSession:
         self.last_activity_at = time.time()
         return entry
 
-    def set_scheduled_proactive(self, at: float | None) -> None:
+    def set_scheduled_proactive(self, at: float | None, reason: str = "") -> None:
         """设置（或清除）模型预约的主动思考时间。
 
         Args:
             at: Unix 时间戳，None 表示清除预约
+            reason: 预约理由，触发时注入提示词
         """
         self.scheduled_proactive_at = at
+        self.scheduled_proactive_reason = reason if at is not None else ""
 
     def update_chain(
         self, new_entries: list[dict[str, Any]], max_payloads: int
@@ -210,10 +219,14 @@ class KFCSession:
             "last_user_message_at": self.last_user_message_at,
             "last_proactive_at": self.last_proactive_at,
             "scheduled_proactive_at": self.scheduled_proactive_at,
+            "scheduled_proactive_reason": self.scheduled_proactive_reason,
             "mental_log": self.mental_log.to_list(),
             "total_interactions": self.total_interactions,
             "chain_payloads": self.chain_payloads,
             "chain_cutoff_ts": self.chain_cutoff_ts,
+            "history_summary": self.history_summary,
+            "last_compress_at": self.last_compress_at,
+            "compress_round_count": self.compress_round_count,
         }
 
     @classmethod
@@ -240,6 +253,7 @@ class KFCSession:
         session.last_user_message_at = data.get("last_user_message_at")
         session.last_proactive_at = data.get("last_proactive_at")
         session.scheduled_proactive_at = data.get("scheduled_proactive_at")
+        session.scheduled_proactive_reason = data.get("scheduled_proactive_reason", "")
         session.mental_log = MentalLog.from_list(
             data.get("mental_log", []),
             max_entries=max_log_entries,
@@ -248,6 +262,10 @@ class KFCSession:
         # 持久化对话链
         session.chain_payloads = data.get("chain_payloads", [])
         session.chain_cutoff_ts = float(data.get("chain_cutoff_ts", 0.0))
+        # 近期记忆摘要
+        session.history_summary = data.get("history_summary", "")
+        session.last_compress_at = float(data.get("last_compress_at", 0.0))
+        session.compress_round_count = int(data.get("compress_round_count", 0))
         return session
 
 
@@ -341,6 +359,8 @@ class KFCSessionStore:
         if self._json_store is not None:
             try:
                 await self._json_store.save(session.stream_id, session.to_dict())
+                # 同步更新可读索引（stream_id → user_id + platform 的映射）
+                await self._update_index(session)
             except Exception as e:
                 logger.warning(
                     f"Session 持久化失败 (stream={session.stream_id[:8]}): {e}"
@@ -367,6 +387,31 @@ class KFCSessionStore:
                     return session
             except Exception as e:
                 logger.warning(f"Session 加载失败 (stream={stream_id[:8]}): {e}")
+        return None
+
+    async def peek(self, stream_id: str) -> KFCSession | None:
+        """从磁盘读取 Session 但不加入内存缓存。
+
+        适用于只需查看持久化字段、不希望副作用地污染内存缓存的场景。
+        若 session 已在内存中则直接返回（不重复加载）。
+
+        Args:
+            stream_id: 目标流 ID
+
+        Returns:
+            KFCSession 实例，或 None（文件不存在/解析失败）
+        """
+        if stream_id in self._sessions:
+            return self._sessions[stream_id]
+
+        await self._ensure_store()
+        if self._json_store is not None:
+            try:
+                data = await self._json_store.load(stream_id)
+                if data and isinstance(data, dict):
+                    return KFCSession.from_dict(data, max_log_entries=self._max_log_entries)
+            except Exception as e:
+                logger.warning(f"Session peek 失败 (stream={stream_id[:8]}): {e}")
         return None
 
     def get_all_cached(self) -> dict[str, KFCSession]:
@@ -401,8 +446,43 @@ class KFCSessionStore:
         await self._ensure_store()
         if self._json_store is not None:
             try:
-                return await self._json_store.list_all()
+                all_ids = await self._json_store.list_all()
+                # 过滤掉非 stream_id 的辅助文件（如 _index）
+                return [sid for sid in all_ids if not sid.startswith("_")]
             except Exception as e:
                 logger.warning(f"Session 列举失败: {e}")
                 return []
         return []
+
+    async def _update_index(self, session: KFCSession) -> None:
+        """更新 _index.json 索引文件（stream_id → 可读标识映射）。
+
+        每次 save() 后自动调用，让用户可通过 _index.json 对照文件名与 QQ 号。
+        """
+        import json as _json
+
+        if self._json_store is None:
+            return
+
+        index_path = self._json_store.get_storage_dir() / "_index.json"
+
+        # 读取现有索引
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index: dict[str, dict[str, str]] = _json.load(f)
+        except (FileNotFoundError, _json.JSONDecodeError):
+            index = {}
+
+        # 更新当前 session 的条目
+        entry: dict[str, str] = {
+            "platform": session.platform,
+            "user_id": session.user_id,
+        }
+        index[session.stream_id] = entry
+
+        # 写回
+        try:
+            with open(index_path, "w", encoding="utf-8") as f:
+                _json.dump(index, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.debug(f"索引文件写入失败: {e}")

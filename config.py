@@ -81,6 +81,20 @@ class KFCConfig(BaseConfig):
             default=True,
             description="回复模式。True（默认）：工具调用模式，新模型使用。False：JSON 解析模式，建议旧模型使用 。",
         )
+        split_marker: str = Field(
+            default="[分段]",
+            description=(
+                "消息分段标记。模型在希望分段的位置插入此标记，"
+                "系统自动将其拆成多条消息依次发送。"
+            ),
+        )
+        segment_instruction: str = Field(
+            default="",
+            description=(
+                "注入到提示词中的分段指令。{marker} 会被替换为实际分段标记。"
+                "留空则使用内置默认指令。"
+            ),
+        )
 
     @config_section("wait")
     class WaitSection(SectionBase):
@@ -147,6 +161,18 @@ class KFCConfig(BaseConfig):
         )
         max_context_payloads: int = Field(
             default=20, description="LLM 上下文持久化链最大条目数（超出时裁剪最旧的 USER/ASSISTANT 对）"
+        )
+        compress_every_n_rounds: int = Field(
+            default=50,
+            description="每完成 N 轮对话触发一次近期记忆压缩（1 轮 = 1 次 USER→ASSISTANT 交换）",
+        )
+        compress_days_window: float = Field(
+            default=3.0,
+            description="压缩时覆盖的历史时间窗口（天），只对该窗口内的消息做摘要",
+        )
+        min_compress_interval_minutes: float = Field(
+            default=120.0,
+            description="两次压缩之间的最短间隔（分钟），防止频繁触发",
         )
 
 

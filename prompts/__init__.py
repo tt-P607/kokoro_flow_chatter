@@ -8,7 +8,6 @@ from __future__ import annotations
 from .templates import (
     KFC_SYSTEM_PROMPT,
     KFC_PROACTIVE_PROMPT,
-    KFC_CONTINUOUS_THINKING_PROMPT,
     KFC_TIMEOUT_PROMPT,
 )
 from .builder import KFCPromptBuilder
@@ -16,7 +15,6 @@ from .builder import KFCPromptBuilder
 __all__ = [
     "KFC_SYSTEM_PROMPT",
     "KFC_PROACTIVE_PROMPT",
-    "KFC_CONTINUOUS_THINKING_PROMPT",
     "KFC_TIMEOUT_PROMPT",
     "KFCPromptBuilder",
 ]

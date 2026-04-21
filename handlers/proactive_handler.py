@@ -90,6 +90,7 @@ class ProactiveHandler(BaseEventHandler):
         # 尝试从 KFCSession 获取真实 user_id 和沉默时长
         target_user_id: str = ""
         silence_minutes: float = 0.0
+        scheduled_reason: str = ""
         try:
             from ..plugin import KFCPlugin
             if isinstance(self.plugin, KFCPlugin):
@@ -99,6 +100,7 @@ class ProactiveHandler(BaseEventHandler):
                         target_user_id = session.user_id
                     if session.last_activity_at:
                         silence_minutes = (time.time() - session.last_activity_at) / 60
+                    scheduled_reason = session.scheduled_proactive_reason or ""
         except Exception as e:
             logger.debug(f"获取 session 信息失败，将使用默认值: {e}")
 
@@ -123,6 +125,7 @@ class ProactiveHandler(BaseEventHandler):
             proactive_content = await build_proactive_context(
                 silence_minutes=silence_minutes,
                 recent_activity=recent_activity,
+                scheduled_reason=scheduled_reason,
             )
         except Exception as e:
             logger.debug(f"构建主动发起上下文失败，使用默认消息: {e}")

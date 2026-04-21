@@ -45,11 +45,26 @@ class ProactiveThinker:
             return []
 
         triggered: list[str] = []
-        sessions = self._session_store.get_all_cached()
 
-        for stream_id, session in sessions.items():
+        # 检查内存中的 session（完整逻辑：预约 + 沉默触发）
+        cached_sessions = self._session_store.get_all_cached()
+        for stream_id, session in cached_sessions.items():
             if await self._check_and_trigger(stream_id, session):
                 triggered.append(stream_id)
+
+        # 检查磁盘上未在内存中的 session（仅检查预约，避免大量沉默触发）
+        all_stream_ids = await self._session_store.list_all_stream_ids()
+        for stream_id in all_stream_ids:
+            if stream_id in cached_sessions:
+                continue
+            session = await self._session_store.peek(stream_id)  # 不缓存，避免污染内存
+            if session is None:
+                continue
+            if session.scheduled_proactive_at is not None:
+                now = time.time()
+                if now >= session.scheduled_proactive_at:
+                    logger.info(f"主动思考（磁盘 session）：触发预约 stream={stream_id[:8]}")
+                    triggered.append(stream_id)
 
         return triggered
 
@@ -122,5 +137,6 @@ class ProactiveThinker:
             session = await self._session_store.get(stream_id)
             if session:
                 session.last_proactive_at = time.time()
-                session.scheduled_proactive_at = None  # 清除已消费的预约
+                session.scheduled_proactive_at = None   # 清除已消费的预约
+                session.scheduled_proactive_reason = ""  # 同步清除预约理由
                 await self._session_store.save(session)

@@ -13,7 +13,6 @@ from src.core.prompt import get_prompt_manager, optional, wrap, min_len
 from .templates import (
     KFC_SYSTEM_PROMPT,
     KFC_PROACTIVE_PROMPT,
-    KFC_CONTINUOUS_THINKING_PROMPT,
     KFC_TIMEOUT_PROMPT,
     KFC_REPLY_MODE_JSON,
 )
@@ -73,18 +72,6 @@ def register_kfc_prompts() -> None:
         },
     )
 
-    # 连续思考提示词
-    pm.get_or_create(
-        name="kfc_continuous_thinking_prompt",
-        template=KFC_CONTINUOUS_THINKING_PROMPT,
-        policies={
-            "last_bot_message": optional("（消息内容不可用）"),
-            "expected_reaction": optional("无特定期望"),
-            "elapsed_minutes": optional("0"),
-            "progress": optional("0%"),
-        },
-    )
-
 
 def build_mental_log_hint() -> str:
     """构建活动流格式提示。"""
@@ -97,6 +84,7 @@ def build_mental_log_hint() -> str:
 async def build_proactive_context(
     silence_minutes: float,
     recent_activity: str,
+    scheduled_reason: str = "",
 ) -> str:
     """构建主动发起上下文。"""
     pm = get_prompt_manager()
@@ -111,7 +99,7 @@ async def build_proactive_context(
     else:
         silence_str = f"{silence_minutes:.0f} 分钟"
 
-    return await (
+    result = await (
         tmpl.clone()
         .set("current_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         .set("silence_duration", silence_str)
@@ -119,34 +107,10 @@ async def build_proactive_context(
         .build()
     )
 
+    if scheduled_reason:
+        result = f"【你在上次对话结束时为这次主动发起做了预约，预约理由：{scheduled_reason}】\n\n" + result
 
-async def build_continuous_thinking_context(
-    elapsed_seconds: float,
-    progress: float,
-    expected_reaction: str,
-    last_bot_message: str = "",
-) -> str:
-    """构建连续思考上下文。
-
-    Args:
-        elapsed_seconds: 已等待秒数
-        progress: 等待进度 (0.0~1.0)
-        expected_reaction: 预期对方的反应
-        last_bot_message: 最后一条 Bot 发送的消息
-    """
-    pm = get_prompt_manager()
-    tmpl = pm.get_template("kfc_continuous_thinking_prompt")
-    if not tmpl:
-        return f"已等待 {elapsed_seconds:.0f} 秒"
-
-    return await (
-        tmpl.clone()
-        .set("last_bot_message", last_bot_message or "（消息内容不可用）")
-        .set("expected_reaction", expected_reaction or "无特定期望")
-        .set("elapsed_minutes", f"{elapsed_seconds / 60:.1f}")
-        .set("progress", f"{progress:.0%}")
-        .build()
-    )
+    return result
 
 
 def build_timeout_context(
@@ -154,6 +118,8 @@ def build_timeout_context(
     expected_reaction: str,
     consecutive_timeouts: int,
     last_bot_message: str = "",
+    max_consecutive_timeouts: int = 3,
+    use_tool_calling: bool = False,
 ) -> str:
     """构建等待超时决策上下文。
 
@@ -162,34 +128,81 @@ def build_timeout_context(
         expected_reaction: 预期对方的反应
         consecutive_timeouts: 连续超时次数（含本次）
         last_bot_message: 最后一条 Bot 发送的消息
+        max_consecutive_timeouts: 配置的连续超时上限
+        use_tool_calling: 是否为工具调用模式
     """
     elapsed_minutes = elapsed_seconds / 60
+    is_first = consecutive_timeouts == 1
+    is_last = consecutive_timeouts >= max_consecutive_timeouts
+    msg_snippet = last_bot_message or "（消息内容不可用）"
 
-    # 根据追问次数生成递进式警告
-    followup_count = max(0, consecutive_timeouts - 1)
-    if followup_count >= 2:
-        followup_warning = (
-            f"\n⚠️ **强烈建议**: 你已经连续追问了 {followup_count} 次，对方仍未回复。"
-            "**极度推荐选择 do_nothing 并将 max_wait_seconds 设为 0**。"
-            "对方可能在忙或需要空间，给彼此一些空间会更好。"
-        )
-    elif followup_count == 1:
-        followup_warning = (
-            "\n📝 温馨提醒：这是你第 2 次等待回复（已追问 1 次）。"
-            "可以再试着追问一次，但如果对方还是没回复，"
-            "**建议**之后选择 do_nothing 结束等待。"
+    # ── 情境描述 ──
+    if is_first:
+        timeout_situation = (
+            f"你发出消息已经过去 {elapsed_minutes:.0f} 分钟了，对方还没有回应。\n"
+            f"**你发的最后一条消息**：「{msg_snippet}」"
         )
     else:
-        followup_warning = (
-            "\n💭 这是第一次等待超时。如果觉得话题还没结束，"
-            "可以适当追问一下，但也要考虑对方可能在忙。"
+        timeout_situation = (
+            f"你已经主动说了 {consecutive_timeouts} 次，对方一直没有回应。\n"
+            f"距上次发消息已有 {elapsed_minutes:.0f} 分钟。\n"
+            f"**你最后说的**：「{msg_snippet}」"
         )
 
+    # ── 引导语 ──
+    if is_last:
+        timeout_guidance = (
+            "你已经等了很久，对方始终没有出现。\n"
+            "这种时候，你会怎么做？"
+        )
+    elif is_first:
+        timeout_guidance = (
+            "你想想：有没有什么没说完的话，或者忽然想到什么想跟对方说的？\n"
+            "如果有，发出去就好；如果脑子里没什么，继续等一等也无妨。"
+        )
+    else:
+        timeout_guidance = (
+            "对方一直没有回复。\n"
+            "你有没有真的需要说的内容——还是只是想打破沉默？"
+        )
+
+    # ── 操作指令 ──
+    if is_last:
+        if use_tool_calling:
+            decision_instructions = (
+                "本次等待到此为止，**不得**再设置新的等待（`max_wait_seconds` 必须为 0）。"
+            )
+        else:
+            decision_instructions = (
+                "本次等待到此为止，`max_wait_seconds` 必须设置为 0。"
+            )
+    elif is_first:
+        if use_tool_calling:
+            decision_instructions = (
+                "可以调用 `kfc_reply(...)` 发送消息，"
+                "或调用 `do_nothing(max_wait_seconds>0)` 继续等待，"
+                "或调用 `do_nothing(max_wait_seconds=0)` 结束等待。"
+            )
+        else:
+            decision_instructions = (
+                "可以在 JSON 中填写 `content` 发送消息，"
+                "设置 `content: null, max_wait_seconds > 0` 继续等待，"
+                "或设置 `content: null, max_wait_seconds: 0` 结束等待。"
+            )
+    else:
+        if use_tool_calling:
+            decision_instructions = (
+                "如果确实有话说，可以调用 `kfc_reply(...)` 发送消息；"
+                "或调用 `do_nothing(max_wait_seconds=0)` 结束等待。"
+            )
+        else:
+            decision_instructions = (
+                "如果确实有话说，在 JSON 中填写 `content`；"
+                "否则设置 `content: null, max_wait_seconds: 0` 结束等待。"
+            )
+
     return KFC_TIMEOUT_PROMPT.format(
-        elapsed_seconds=elapsed_seconds,
-        elapsed_minutes=elapsed_minutes,
-        expected_reaction=expected_reaction or "对方能回复点什么",
-        last_bot_message=last_bot_message or "（消息内容不可用）",
-        followup_warning=followup_warning,
-        pending_thoughts_block="",
+        timeout_situation=timeout_situation,
+        timeout_guidance=timeout_guidance,
+        decision_instructions=decision_instructions,
     )

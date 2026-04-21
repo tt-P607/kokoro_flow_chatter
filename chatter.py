@@ -296,6 +296,7 @@ class KokoroFlowChatter(BaseChatter):
             # 历史图片仅注入一次（首次有新消息时，用剩余配额填充）
             _history_images_injected = False
             _has_pending_tool_results = False
+            _is_final_timeout = False
             # 链保存：记录每次 LLM 调用前最后一个 USER payload 的文本和时间戳
             _pre_send_user_text: str = ""
             _last_user_ts: float = 0.0
@@ -401,11 +402,11 @@ class KokoroFlowChatter(BaseChatter):
                     ):
                         last = response.payloads[-1]
                         if last.content and isinstance(last.content[-1], Text):
-                            existing = last.content[-1].text
+                            existing = last.content[-1].text  # type: ignore[attr-defined]
                             last.content[-1] = Text(
-                                f"{existing}\n{user_payload.content[-1].text}"
+                                f"{existing}\n{user_payload.content[-1].text}"  # type: ignore[attr-defined]
                                 if isinstance(user_payload.content, list)
-                                else f"{existing}\n{user_payload.content.text}"
+                                else f"{existing}\n{user_payload.content.text}"  # type: ignore[attr-defined]
                             )
                             _upserted = True
                             logger.debug("[KFC] Upsert USER payload（打断重来合并新消息）")
@@ -442,11 +443,7 @@ class KokoroFlowChatter(BaseChatter):
 
                         timeout_ctx = timeout_handler.handle_timeout(session)
 
-                        if timeout_handler.should_give_up(session):
-                            logger.info("连续超时次数过多，结束对话")
-                            await self._save_session(session)
-                            yield Stop(0)
-                            return
+                        _is_final_timeout = timeout_handler.should_give_up(session)
 
                         # 构建超时 payload（委托给 PromptBuilder）
                         from .prompts.builder import KFCPromptBuilder
@@ -455,6 +452,8 @@ class KokoroFlowChatter(BaseChatter):
                             expected_reaction=timeout_ctx["expected_reaction"],  # type: ignore[arg-type]
                             consecutive_timeouts=timeout_ctx["consecutive_timeouts"],  # type: ignore[arg-type]
                             last_bot_message=timeout_ctx.get("last_bot_message", ""),  # type: ignore[arg-type]
+                            max_consecutive_timeouts=config.wait.max_consecutive_timeouts,
+                            use_tool_calling=config.general.use_tool_calling,
                         )
                         # Upsert：若末尾已是 USER（如 warmup 末尾含未回复消息），合并而不是新建
                         _timeout_upserted = False
@@ -464,13 +463,13 @@ class KokoroFlowChatter(BaseChatter):
                         ):
                             last = response.payloads[-1]
                             timeout_text = (
-                                timeout_payload.content.text
+                                timeout_payload.content.text  # type: ignore[attr-defined]
                                 if isinstance(timeout_payload.content, Text)
                                 else ""
                             )
                             if timeout_text and last.content and isinstance(last.content[-1], Text):
                                 last.content[-1] = Text(
-                                    f"{last.content[-1].text}\n{timeout_text}"
+                                    f"{last.content[-1].text}\n{timeout_text}"  # type: ignore[attr-defined]
                                 )
                                 _timeout_upserted = True
                         if not _timeout_upserted:
@@ -491,7 +490,8 @@ class KokoroFlowChatter(BaseChatter):
                 for _p in reversed(response.payloads):
                     if _p.role == ROLE.USER:
                         _pre_send_user_text = "".join(
-                            c.text for c in _p.content if isinstance(c, Text)
+                            c.text  # type: ignore[attr-defined]
+                            for c in _p.content if isinstance(c, Text)
                         )
                         break
 
@@ -563,9 +563,11 @@ class KokoroFlowChatter(BaseChatter):
                             _args = call.args if isinstance(call.args, dict) else (
                                 _json.loads(call.args) if isinstance(call.args, str) else {}
                             )
-                            delay = max(1800.0, min(43200.0, float(_args.get("delay_seconds", 1800))))
-                            session.set_scheduled_proactive(time.time() + delay)
-                            logger.info(f"[KFC] 已预约主动思考: {delay:.0f}s 后")
+                            delay_min = max(30.0, min(720.0, float(_args.get("delay_minutes", 30))))
+                            delay = delay_min * 60
+                            _reason = str(_args.get("reason", "")).strip()
+                            session.set_scheduled_proactive(time.time() + delay, reason=_reason)
+                            logger.info(f"[KFC] 已预约主动思考: {delay_min:.0f} 分钟后" + (f"，理由：{_reason}" if _reason else ""))
                         except Exception as _e:
                             logger.warning(f"[KFC] schedule_proactive 参数解析失败: {_e}")
                         break
@@ -591,6 +593,19 @@ class KokoroFlowChatter(BaseChatter):
                         ],
                         config.prompt.max_context_payloads,
                     )
+                    # ── 近期记忆压缩触发 ──
+                    session.compress_round_count += 1
+                    from .compressor import compress_history, should_compress
+                    _trigger_empty = not session.history_summary
+                    _trigger_periodic = should_compress(session, config)
+                    if _trigger_empty or _trigger_periodic:
+                        _reason = "摘要为空（首次生成）" if _trigger_empty else f"满足周期条件（{session.compress_round_count}轮）"
+                        logger.info(f"[KFC] 触发近期记忆压缩：流 {session.stream_id}，原因：{_reason}")
+                        from src.kernel.concurrency import get_task_manager
+                        get_task_manager().create_task(
+                            compress_history(session, prompt_builder, config, model_set, chat_stream),
+                            name=f"kfc_compress_{session.stream_id}",
+                        )
 
                 # ── 控制流决策 ──
                 if not result.has_meaningful_action:
@@ -633,6 +648,12 @@ class KokoroFlowChatter(BaseChatter):
                     result.max_wait_seconds,
                     session.consecutive_timeout_count,
                 )
+
+                # 最后一次超时：无论 LLM 设置何值，强制不再等待
+                if _is_final_timeout and wait_seconds > 0:
+                    logger.info("最后一次超时决策完成，强制结束等待")
+                    wait_seconds = 0
+                    _is_final_timeout = False
 
                 if wait_seconds > 0:
                     from .models import WaitingConfig
@@ -697,16 +718,50 @@ class KokoroFlowChatter(BaseChatter):
         # 注入动态变量：回复模式指令 + 自定义决策提示词
         from .prompts.templates import KFC_REPLY_MODE_JSON, KFC_REPLY_MODE_TOOL_CALLING
 
+        _DEFAULT_SEGMENT_INSTRUCTION = (
+            "## 消息分段发送\n"
+            "你可以像在 QQ、微信聊天一样把回复拆成多条消息分开发送。\n"
+            "在需要分段的位置插入标记 `{marker}`，系统会自动将其拆分成多条依次发出。\n\n"
+            "**分段规则**：\n"
+            "- 分段标记本身承担标点的停顿功能，**标记前不要加任何标点符号**；\n"
+            "- 在话题转换、情绪切换、一问一答等自然停顿处分段；\n"
+            "- 每段保持语义完整，不要在一句话中途断开；\n"
+            "- 一般每段消息几到十几字，不要过长发的像大段豆腐块一样；\n"
+            "- 内容简短或只有一句话时不必分段。"
+        )
+        split_marker = config.general.split_marker
+        raw_segment_instr = config.general.segment_instruction.strip() or _DEFAULT_SEGMENT_INSTRUCTION
+        segment_instruction = raw_segment_instr.replace("{marker}", split_marker)
+
         extra_vars: dict[str, str] = {}
-        extra_vars["reply_mode_instruction"] = (
+        raw_mode = (
             KFC_REPLY_MODE_TOOL_CALLING
             if config.general.use_tool_calling
             else KFC_REPLY_MODE_JSON
+        )
+        extra_vars["reply_mode_instruction"] = raw_mode.format(
+            segment_instruction=segment_instruction,
+            split_marker=split_marker,
         )
         custom_prompt = config.general.custom_decision_prompt
         if custom_prompt and custom_prompt.strip():
             extra_vars["custom_decision_prompt"] = (
                 f"# 决策指导\n{custom_prompt.strip()}"
+            )
+
+        # 注入预约状态信息
+        sched_at = session.scheduled_proactive_at
+        if sched_at:
+            from datetime import datetime as _dt
+            import time as _time
+            remaining_min = max(0.0, (sched_at - _time.time()) / 60)
+            sched_time_str = _dt.fromtimestamp(sched_at).strftime("%H:%M")
+            sched_reason = session.scheduled_proactive_reason
+            reason_text = f"，理由：{sched_reason}" if sched_reason else ""
+            extra_vars["scheduled_proactive_info"] = (
+                f"# 当前预约状态\n"
+                f"你已预约在 **{sched_time_str}**（约 {remaining_min:.0f} 分钟后）主动发起{reason_text}。\n"
+                "如需修改，可重新调用 `schedule_proactive` 工具（新预约会覆盖旧的）。"
             )
 
         system_prompt = await prompt_builder.build_system_prompt(
@@ -722,6 +777,17 @@ class KokoroFlowChatter(BaseChatter):
         actor_reminder_text = get_system_reminder_store().get("actor")
         if actor_reminder_text:
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(actor_reminder_text)))
+
+        # ── 注入近期记忆摘要（由 compressor 异步生成，重启后持久保留）──
+        if session.history_summary:
+            user_name = (
+                getattr(chat_stream, "partner_name", None)
+                or getattr(chat_stream, "group_name", None)
+                or "对方"
+            )
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(
+                f"【你对{user_name}的近期记忆】\n{session.history_summary}"
+            )))
 
         # 图片预算初始化（bot 已发图片 > 用户新消息图片 > 历史补充，共用同一总配额）
         image_budget: ImageBudget | None = None
@@ -740,6 +806,10 @@ class KokoroFlowChatter(BaseChatter):
         # 持久化链存储了跨 execute() 重启的 USER/ASSISTANT 对话 pair。
         # fused_narrative 仅覆盖链起始时间戳之前的历史（叙事格式，节省 token），
         # 链之后的对话以真实对话格式（USER/ASSISTANT pair）延续——两者不重叠。
+        # chain_payloads 直接追加到 LLM request，不占 context.history_messages 的配额；
+        # fused_narrative 从 context.history_messages 读取，受 core.toml max_context_size 管。
+        # 二者共享的调节旋钮：max_context_payloads ← 越小则 chain_cutoff_ts 越近，
+        # fused_narrative 覆盖的 history 就越多。
         chain_payloads = self._restore_chain_payloads(session)
         before_ts = session.chain_cutoff_ts if session.chain_cutoff_ts > 0 else None
 

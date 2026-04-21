@@ -124,7 +124,7 @@ async def parse_tool_calls(
     if not config.general.use_tool_calling:
         json_data = extract_json_reply(getattr(response, "message", None))
     if json_data:
-        norm = normalize_reply_data(json_data)
+        norm = normalize_reply_data(json_data, split_marker=config.general.split_marker)
 
         result.thought = norm["thought"]
         result.expected_reaction = norm["expected_reaction"]
@@ -188,21 +188,10 @@ async def parse_tool_calls(
                 # JSON 解析未命中时，降级走旧 tool call 路径
                 result.has_reply = True
                 extract_metadata(result, args)
+                split_marker = config.general.split_marker
                 content_raw = args.get("content", "")
-                if isinstance(content_raw, list):
-                    segments = [s.strip() for s in content_raw if isinstance(s, str) and s.strip()]
-                elif isinstance(content_raw, str):
-                    stripped = content_raw.strip()
-                    if stripped.startswith("["):
-                        try:
-                            parsed = json.loads(stripped)
-                            segments = [s.strip() for s in parsed if isinstance(s, str) and s.strip()] if isinstance(parsed, list) else [stripped]
-                        except json.JSONDecodeError:
-                            segments = [stripped] if stripped else []
-                    else:
-                        segments = [stripped] if stripped else []
-                else:
-                    segments = []
+                raw_str = str(content_raw).strip() if isinstance(content_raw, str) else ""
+                segments = [s.strip() for s in raw_str.split(split_marker) if s.strip()] if (split_marker and split_marker in raw_str) else ([raw_str] if raw_str else [])
 
                 send_ok = True
                 for segment in segments:

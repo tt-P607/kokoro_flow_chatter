@@ -134,7 +134,11 @@ class MentalLog:
                 for action in entry.actions:
                     if action.get("type") in ("kfc_reply", "respond"):
                         content = action.get("content", "")
-                        if content:
+                        if isinstance(content, list):
+                            joined = " ".join(s for s in content if s)
+                            if joined:
+                                return joined
+                        elif isinstance(content, str) and content:
                             return content
         return ""
 

@@ -109,6 +109,8 @@ class KFCPromptBuilder:
         expected_reaction: str,
         consecutive_timeouts: int,
         last_bot_message: str = "",
+        max_consecutive_timeouts: int = 3,
+        use_tool_calling: bool = False,
     ) -> LLMPayload:
         """构建等待超时 Payload。
 
@@ -120,6 +122,8 @@ class KFCPromptBuilder:
             expected_reaction: 之前预期的对方反应
             consecutive_timeouts: 连续超时次数
             last_bot_message: 最后一条 Bot 发送的消息
+            max_consecutive_timeouts: 配置的连续超时上限
+            use_tool_calling: 是否为工具调用模式
 
         Returns:
             LLMPayload: USER 角色的超时 Payload
@@ -131,6 +135,8 @@ class KFCPromptBuilder:
             expected_reaction=expected_reaction,
             consecutive_timeouts=consecutive_timeouts,
             last_bot_message=last_bot_message,
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            use_tool_calling=use_tool_calling,
         )
 
         return LLMPayload(ROLE.USER, Text(timeout_text))
@@ -156,21 +162,27 @@ class KFCPromptBuilder:
         这是老版 KFC 的核心设计——让 LLM 在回顾历史时不仅看到
         对话内容，还能看到每个节点上自己当时的内心活动。
 
+        消息来源：context.history_messages（受 core.toml max_context_size 管控）。
+        chain_payloads 直接追加到 LLM request，不占此配额；
+        二者通过 before_ts（chain_cutoff_ts）分界、互不重叠。
+
         Args:
             chat_stream: 当前聊天流
             mental_log: 心理活动日志（MentalLog 实例）
             before_ts: 若指定，只包含时间戳严格小于该值的消息，
-                用于将叙事截止到 warmup 窗口开始前，避免内容重叠。
+                用于将叙事截止到链起始时间戳之前，避免与 chain_payloads 内容重叠。
 
         Returns:
             str: 融合叙事文本，无内容时返回空串
         """
         from ..models import KFCEventType
 
-        history_messages = getattr(
-            getattr(chat_stream, "context", None),
-            "history_messages",
-            [],
+        msgs: list[Any] = list(
+            getattr(
+                getattr(chat_stream, "context", None),
+                "history_messages",
+                [],
+            )
         )
         bot_id = str(chat_stream.bot_id or "")
 
@@ -178,7 +190,7 @@ class KFCPromptBuilder:
         timeline: list[tuple[float, str]] = []
 
         # ── 聊天记录 ──
-        for msg in history_messages:
+        for msg in msgs:
             raw_time = getattr(msg, "time", None)
             if not isinstance(raw_time, (int, float)):
                 continue
