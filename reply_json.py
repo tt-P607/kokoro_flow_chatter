@@ -122,7 +122,7 @@ def extract_json_reply(text: str | None) -> dict[str, Any] | None:
     return None
 
 
-def normalize_reply_data(data: dict[str, Any], split_marker: str = "[分段]") -> dict[str, Any]:
+def normalize_reply_data(data: dict[str, Any]) -> dict[str, Any]:
     """规范化 JSON 回复字段。
 
     - content: 统一为 list[str] 或 None（None 表示不回复）
@@ -131,7 +131,6 @@ def normalize_reply_data(data: dict[str, Any], split_marker: str = "[分段]") -
 
     Args:
         data: 从文本提取的原始 JSON dict
-        split_marker: 分段标记，用于将纯字符串 content 拆分为多段
 
     Returns:
         规范化后的字段字典
@@ -141,16 +140,12 @@ def normalize_reply_data(data: dict[str, Any], split_marker: str = "[分段]") -
     if raw_content is None:
         # 显式 null → do_nothing
         content: list[str] | None = None
+    elif isinstance(raw_content, list):
+        # 数组格式：每个元素是一条独立消息
+        content = [str(s).strip() for s in raw_content if str(s).strip()] or None
     elif isinstance(raw_content, str):
         stripped = raw_content.strip()
-        if not stripped:
-            content = None
-        elif split_marker and split_marker in stripped:
-            content = [s.strip() for s in stripped.split(split_marker) if s.strip()] or None
-        else:
-            content = [stripped]
-    elif isinstance(raw_content, list):
-        content = None
+        content = [stripped] if stripped else None
     else:
         content = None
 

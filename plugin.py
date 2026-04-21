@@ -134,14 +134,14 @@ class KFCPlugin(BasePlugin):
                 """定期检查是否需要主动发起。"""
                 triggered = await proactive.check_all_sessions()
                 for stream_id in triggered:
-                    await proactive.mark_triggered(stream_id)
+                    scheduled_reason = await proactive.mark_triggered(stream_id)
                     logger.info(f"主动发起触发: {stream_id[:8]}")
                     # 通过事件 API 触发 chatter
                     from src.app.plugin_system.api.event_api import publish_event
 
                     await publish_event(
                         "kfc.proactive_trigger",
-                        {"stream_id": stream_id},
+                        {"stream_id": stream_id, "scheduled_reason": scheduled_reason},
                     )
 
             # 注册周期性主动发起检查任务

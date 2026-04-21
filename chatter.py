@@ -585,6 +585,39 @@ class KokoroFlowChatter(BaseChatter):
                 # 将本轮 USER/ASSISTANT 交换追加到 session 链，超出 max_context_payloads 时
                 # 自动裁剪最老的条目（裁剪的部分由 fused_narrative 在下次启动时接管）。
                 _asst_text = getattr(response, "message", "") or ""
+                # tool calling 模式下，模型回复通过工具调用发出，response.message 为空；
+                # 优先序列化 kfc_reply 的完整参数（含 thought/expected_reaction 等），
+                # 无 kfc_reply 时则序列化全部调用列表，
+                # 确保每轮对话都被记录，与 JSON 模式下存 response.message 的完整性对等。
+                if not _asst_text and config.general.use_tool_calling:
+                    import json as _json
+                    _all_calls = getattr(response, "call_list", None) or []
+                    _kfc_reply_args: dict | None = None
+                    for _call in _all_calls:
+                        _n = _call.name.rsplit(":", 1)[-1] if ":" in _call.name else _call.name
+                        for _pfx in ("action-", "tool-", "agent-"):
+                            if _n.startswith(_pfx):
+                                _n = _n[len(_pfx):]
+                                break
+                        if _n == KFC_REPLY:
+                            _kfc_reply_args = _call.args if isinstance(_call.args, dict) else {}
+                            break
+                    if _kfc_reply_args is not None:
+                        _asst_text = _json.dumps(_kfc_reply_args, ensure_ascii=False)
+                    elif _all_calls:
+                        # 无 kfc_reply 的轮次，记录完整调用列表
+                        _asst_text = _json.dumps(
+                            [
+                                {
+                                    "name": (
+                                        _c.name.rsplit(":", 1)[-1] if ":" in _c.name else _c.name
+                                    ),
+                                    "args": _c.args if isinstance(_c.args, dict) else {},
+                                }
+                                for _c in _all_calls
+                            ],
+                            ensure_ascii=False,
+                        )
                 if _pre_send_user_text and _asst_text:
                     session.update_chain(
                         [
@@ -718,21 +751,6 @@ class KokoroFlowChatter(BaseChatter):
         # 注入动态变量：回复模式指令 + 自定义决策提示词
         from .prompts.templates import KFC_REPLY_MODE_JSON, KFC_REPLY_MODE_TOOL_CALLING
 
-        _DEFAULT_SEGMENT_INSTRUCTION = (
-            "## 消息分段发送\n"
-            "你可以像在 QQ、微信聊天一样把回复拆成多条消息分开发送。\n"
-            "在需要分段的位置插入标记 `{marker}`，系统会自动将其拆分成多条依次发出。\n\n"
-            "**分段规则**：\n"
-            "- 分段标记本身承担标点的停顿功能，**标记前不要加任何标点符号**；\n"
-            "- 在话题转换、情绪切换、一问一答等自然停顿处分段；\n"
-            "- 每段保持语义完整，不要在一句话中途断开；\n"
-            "- 一般每段消息几到十几字，不要过长发的像大段豆腐块一样；\n"
-            "- 内容简短或只有一句话时不必分段。"
-        )
-        split_marker = config.general.split_marker
-        raw_segment_instr = config.general.segment_instruction.strip() or _DEFAULT_SEGMENT_INSTRUCTION
-        segment_instruction = raw_segment_instr.replace("{marker}", split_marker)
-
         extra_vars: dict[str, str] = {}
         raw_mode = (
             KFC_REPLY_MODE_TOOL_CALLING
@@ -740,8 +758,8 @@ class KokoroFlowChatter(BaseChatter):
             else KFC_REPLY_MODE_JSON
         )
         extra_vars["reply_mode_instruction"] = raw_mode.format(
-            segment_instruction=segment_instruction,
-            split_marker=split_marker,
+            segment_instruction=config.general.segment_instruction,
+            wait_instruction=config.general.wait_instruction,
         )
         custom_prompt = config.general.custom_decision_prompt
         if custom_prompt and custom_prompt.strip():

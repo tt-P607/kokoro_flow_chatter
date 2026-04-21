@@ -124,7 +124,7 @@ async def parse_tool_calls(
     if not config.general.use_tool_calling:
         json_data = extract_json_reply(getattr(response, "message", None))
     if json_data:
-        norm = normalize_reply_data(json_data, split_marker=config.general.split_marker)
+        norm = normalize_reply_data(json_data)
 
         result.thought = norm["thought"]
         result.expected_reaction = norm["expected_reaction"]
@@ -159,8 +159,8 @@ async def parse_tool_calls(
                         logger.debug(f"[KFC-JSON] 模拟打字延迟 {delay:.2f}s")
                         await asyncio.sleep(delay)
                 is_first_reply = False
-                # 只在第一段应用引用，后续分段不重复引界
-                seg_reply_to = reply_to if (is_first_reply is False and reply_to) else reply_to
+                # 首段使用 reply_to 引用，发送后清零，后续段不重复引用（见下方 reply_to = ""）
+                seg_reply_to = reply_to
 
                 send_ok = await execute_reply_fn(segment, config, trigger_msg, seg_reply_to)
                 if not send_ok:
@@ -188,10 +188,14 @@ async def parse_tool_calls(
                 # JSON 解析未命中时，降级走旧 tool call 路径
                 result.has_reply = True
                 extract_metadata(result, args)
-                split_marker = config.general.split_marker
                 content_raw = args.get("content", "")
-                raw_str = str(content_raw).strip() if isinstance(content_raw, str) else ""
-                segments = [s.strip() for s in raw_str.split(split_marker) if s.strip()] if (split_marker and split_marker in raw_str) else ([raw_str] if raw_str else [])
+                if isinstance(content_raw, list):
+                    segments = [str(s).strip() for s in content_raw if str(s).strip()]
+                elif isinstance(content_raw, str):
+                    stripped = content_raw.strip()
+                    segments = [stripped] if stripped else []
+                else:
+                    segments = []
 
                 send_ok = True
                 for segment in segments:

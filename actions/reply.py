@@ -31,8 +31,7 @@ class KFCReplyAction(BaseAction):
     action_name = "kfc_reply"
     action_description = (
         "发送文本消息给对方。"
-        "在需要分段的位置插入分段标记，系统会按标记自动拆成多条消息依次发出。"
-        "也可以传单个字符串发送一条消息。"
+        "content 为消息段落列表，每个元素是一条独立消息，系统会依次发出。"
         "可选的 reply_to 参数允许你引用消息（虽然私聊中较少用到，但引用旧消息时可能有用）。"
         "注意：本工具无法发送表情包等非文本内容。"
     )
@@ -42,8 +41,8 @@ class KFCReplyAction(BaseAction):
     async def execute(
         self,
         content: Annotated[
-            str,
-            "要发送的文本内容。在需要分段的位置插入分段标记，系统会按标记自动拆成多条依次发出。",
+            list[str],
+            "要发送的消息段落列表，每个元素是一条独立消息，系统会依次发出。",
         ],
         thought: Annotated[str, "你此刻的内心想法和感受，描述你为什么要这样回复"] = "",
         expected_reaction: Annotated[str, "你期望对方看到你这条消息后的反应"] = "",
@@ -60,7 +59,11 @@ class KFCReplyAction(BaseAction):
         # action 本身不使用这些参数
 
         # parser 层已处理分段拆分逻辑；此处仅作兜底，直接发送完整内容
-        segment = content.strip()
+        # content 注解为 list[str]（供 LLM schema 使用），运行时由 parser 传入单条字符串
+        if isinstance(content, str):
+            segment = content.strip()
+        else:
+            segment = " ".join(str(s).strip() for s in content if str(s).strip())
         if not segment:
             return False, "内容为空，未发送"
 

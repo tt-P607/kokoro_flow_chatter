@@ -60,8 +60,9 @@ class ProactiveHandler(BaseEventHandler):
         if not stream_id:
             return EventDecision.PASS, params
 
+        scheduled_reason: str = params.get("scheduled_reason", "")
         try:
-            success = await self._wake_stream(stream_id)
+            success = await self._wake_stream(stream_id, scheduled_reason)
             if success:
                 logger.info(f"主动发起: 流 {stream_id[:8]} 已唤醒")
             return EventDecision.SUCCESS, params
@@ -69,28 +70,52 @@ class ProactiveHandler(BaseEventHandler):
             logger.error(f"主动发起处理异常: {e}", exc_info=True)
             return EventDecision.PASS, params
 
-    async def _wake_stream(self, stream_id: str) -> bool:
+    async def _wake_stream(self, stream_id: str, scheduled_reason: str = "") -> bool:
         """向目标流注入触发消息并唤醒流循环。
 
         Args:
             stream_id: 目标聊天流 ID
+            scheduled_reason: 预约理由（已在 mark_triggered 中读取并通过事件 payload 传入）
 
         Returns:
             bool: 是否成功唤醒
         """
-        from src.app.plugin_system.api.stream_api import get_stream
+        from src.app.plugin_system.api.stream_api import get_stream, get_or_create_stream
 
         chat_stream = await get_stream(stream_id)
-        if not chat_stream:
-            logger.warning(f"目标流 {stream_id[:8]} 不在内存中，跳过")
-            return False
+        is_cold_start = chat_stream is None
+
+        if is_cold_start:
+            # 流不在内存中，尝试从 KFC session 获取元信息并冷启动
+            cold_session = None
+            try:
+                from ..plugin import KFCPlugin
+                if isinstance(self.plugin, KFCPlugin):
+                    cold_session = await self.plugin._session_store.peek(stream_id)  # type: ignore[attr-defined]
+            except Exception as e:
+                logger.debug(f"读取 session 失败: {e}")
+
+            if cold_session is None:
+                logger.warning(f"目标流 {stream_id[:8]} 不在内存中且无 session 记录，跳过")
+                return False
+
+            try:
+                chat_stream = await get_or_create_stream(
+                    stream_id=stream_id,
+                    platform=cold_session.platform,
+                    user_id=cold_session.user_id,
+                )
+            except Exception as e:
+                logger.warning(f"冷启动流 {stream_id[:8]} 失败: {e}")
+                return False
+
+            logger.info(f"主动发起：冷启动流 {stream_id[:8]}")
 
         context = chat_stream.context
 
         # 尝试从 KFCSession 获取真实 user_id 和沉默时长
         target_user_id: str = ""
         silence_minutes: float = 0.0
-        scheduled_reason: str = ""
         try:
             from ..plugin import KFCPlugin
             if isinstance(self.plugin, KFCPlugin):
@@ -100,7 +125,7 @@ class ProactiveHandler(BaseEventHandler):
                         target_user_id = session.user_id
                     if session.last_activity_at:
                         silence_minutes = (time.time() - session.last_activity_at) / 60
-                    scheduled_reason = session.scheduled_proactive_reason or ""
+                    # scheduled_reason 已由调用方（mark_triggered）在清除前读取并通过参数传入
         except Exception as e:
             logger.debug(f"获取 session 信息失败，将使用默认值: {e}")
 
@@ -130,23 +155,35 @@ class ProactiveHandler(BaseEventHandler):
         except Exception as e:
             logger.debug(f"构建主动发起上下文失败，使用默认消息: {e}")
 
-        # 构造系统触发消息
+        # 构造系统触发消息并注入
         trigger_message = self._build_proactive_message(stream_id, chat_stream, target_user_id, proactive_content)
         context.add_unread_message(trigger_message)
         logger.debug(f"已注入主动发起触发消息到流 {stream_id[:8]}")
 
-        # 清除 StreamLoopManager 的等待状态，让下一次 tick 立即唤醒
-        try:
-            from src.core.transport.distribution.stream_loop_manager import (
-                get_stream_loop_manager,
-            )
+        if is_cold_start:
+            # 冷启动流需要主动启动流循环，等待状态不存在无需清除
+            try:
+                from src.core.transport.distribution.stream_loop_manager import (
+                    get_stream_loop_manager,
+                )
+                loop_mgr = get_stream_loop_manager()
+                await loop_mgr.start_stream_loop(stream_id)
+                logger.debug(f"已为冷启动流 {stream_id[:8]} 启动流循环")
+            except Exception as e:
+                logger.warning(f"启动流循环失败: {e}")
+        else:
+            # 热流：清除等待状态，让下一次 tick 立即唤醒
+            try:
+                from src.core.transport.distribution.stream_loop_manager import (
+                    get_stream_loop_manager,
+                )
 
-            loop_mgr = get_stream_loop_manager()
-            removed = loop_mgr._wait_states.pop(stream_id, None)  # HACK: 需要框架公开 API (loop_mgr.wake_stream)
-            if removed:
-                logger.debug(f"已清除流 {stream_id[:8]} 的等待状态")
-        except ImportError:
-            logger.warning("StreamLoopManager 不可用，无法清除等待状态")
+                loop_mgr = get_stream_loop_manager()
+                removed = loop_mgr._wait_states.pop(stream_id, None)  # HACK: 需要框架公开 API (loop_mgr.wake_stream)
+                if removed:
+                    logger.debug(f"已清除流 {stream_id[:8]} 的等待状态")
+            except ImportError:
+                logger.warning("StreamLoopManager 不可用，无法清除等待状态")
 
         return True
 

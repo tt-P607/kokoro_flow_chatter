@@ -131,12 +131,19 @@ class ProactiveThinker:
         except (ValueError, IndexError):
             return False
 
-    async def mark_triggered(self, stream_id: str) -> None:
-        """标记 Session 已触发主动发起，同时清除模型预约。"""
+    async def mark_triggered(self, stream_id: str) -> str:
+        """标记 Session 已触发主动发起，同时清除模型预约。
+
+        Returns:
+            str: 清除前的预约理由，无预约时为空字符串。
+        """
         async with self._session_store.lock(stream_id):
             session = await self._session_store.get(stream_id)
             if session:
+                reason = session.scheduled_proactive_reason
                 session.last_proactive_at = time.time()
                 session.scheduled_proactive_at = None   # 清除已消费的预约
                 session.scheduled_proactive_reason = ""  # 同步清除预约理由
                 await self._session_store.save(session)
+                return reason
+        return ""
