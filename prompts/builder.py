@@ -72,26 +72,59 @@ class KFCPromptBuilder:
 
         return await tmpl.build()
 
-    def build_user_payload(
+    async def build_user_payload(
         self,
         formatted_unreads: str,
         media_items: list[Any] | None = None,
-    ) -> LLMPayload:
+        stream_id: str = "",
+    ) -> tuple[LLMPayload, LLMPayload | None]:
         """构建用户消息 Payload。
 
         将格式化的未读消息构建为一个 USER 角色的 Payload。
         心理活动已在融合叙事时间线中展示，不再单独注入摘要。
         如果携带多模态图片，则打包为 Text + Image 混合内容。
 
+        触发 ``on_prompt_build`` 事件（模板名 ``kfc_user_prompt``），
+        允许外部插件（如 prompt_injector）向历史末尾追加额外的独立 USER payload。
+        注入内容不会拼入 user_text，而是作为单独的第二个 payload 返回，
+        由调用方在发送前临时追加、发送后移除，从而不进入持久历史。
+
         Args:
             formatted_unreads: 格式化后的未读消息文本
             media_items: 多模态图片列表（可选，来自 extract_media_from_messages）
+            stream_id: 当前聊天流 ID（供 on_prompt_build 事件处理器读取）
 
         Returns:
-            LLMPayload: USER 角色的 Payload
+            tuple: (user_payload, extra_payload | None)
+                - user_payload: USER 角色的 Payload（进入持久历史）
+                - extra_payload: 注入内容的独立 USER Payload（临时，不进历史），无注入时为 None
         """
-        # 心理活动已在融合叙事时间线中展示，不再单独注入摘要
         user_text = f"[新消息]\n{formatted_unreads}"
+        extra_text = ""
+
+        # 触发 on_prompt_build 事件，允许外部注入 extra 内容
+        # 注入内容通过 values["extra"] 传入，提取后作为独立 payload 返回，不拼入 user_text。
+        try:
+            from src.kernel.event import get_event_bus
+
+            event_bus = get_event_bus()
+            if event_bus.get_subscribers("on_prompt_build"):
+                _tmpl = "{content}\n{extra}"
+                _vals: dict[str, str] = {"content": user_text, "extra": "", "stream_id": stream_id}
+                _, final_params = await event_bus.publish(
+                    "on_prompt_build",
+                    {
+                        "name": "kfc_user_prompt",
+                        "template": _tmpl,
+                        "values": _vals,
+                        "policies": {},
+                        "strict": False,
+                    },
+                )
+                rendered_vals: dict[str, str] = dict(final_params.get("values", _vals))
+                extra_text = rendered_vals.get("extra", "").strip()
+        except Exception:
+            pass
 
         content: Content | list[Content]
         if media_items:
@@ -101,7 +134,9 @@ class KFCPromptBuilder:
         else:
             content = Text(user_text)
 
-        return LLMPayload(ROLE.USER, content)  # type: ignore[arg-type]
+        user_payload = LLMPayload(ROLE.USER, content)  # type: ignore[arg-type]
+        extra_payload = LLMPayload(ROLE.USER, Text(f"[SYSTEM REMINDER]\n{extra_text}")) if extra_text else None
+        return user_payload, extra_payload
 
     @staticmethod
     def build_timeout_payload(

@@ -1,7 +1,7 @@
 """KFC 近期记忆压缩模块。
 
 异步生成"近期记忆摘要"（history_summary），覆盖最近 N 天的对话。
-使用与正常对话相同的主聊天模型，以完整人设 + 第一人称书写，直接替换旧摘要。
+使用 actor 模型任务（config.general.model_task），以完整人设 + 第一人称书写，直接替换旧摘要。
 
 压缩时机由 KFCChatter 在每轮对话结束后检查并触发（见 chatter.py）。
 """
@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from .session import KFCSession
     from .prompts.builder import KFCPromptBuilder
 
+from src.app.plugin_system.api.llm_api import get_model_set_by_task
+
 logger = get_logger("kfc_compressor")
 
 
@@ -28,19 +30,18 @@ async def compress_history(
     session: "KFCSession",
     prompt_builder: "KFCPromptBuilder",
     config: "KFCConfig",
-    model_set: Any,
     chat_stream: Any,
 ) -> None:
     """对最近 N 天的对话生成近期记忆摘要，更新 session.history_summary。
 
     该函数为"替换式"：每次调用都基于原始消息重新生成摘要，不累积旧摘要。
     应在 task_manager 中异步调用，不阻塞主对话流程。
+    使用 config.general.model_task 对应的 actor 模型，避免继承对话 model_set 的 max_tokens 限制。
 
     Args:
         session: 当前用户的 KFCSession（会被直接修改）
         prompt_builder: KFC prompt 构建器（用于获取 system_prompt）
         config: KFC 配置
-        model_set: LLM 模型集合（与正常对话一致）
         chat_stream: 当前聊天流（用于 system_prompt 构建）
     """
     # 立即标记压缩时间，防止异步并发重复触发
@@ -134,6 +135,8 @@ async def compress_history(
     from src.core.prompt import get_system_reminder_store
     actor_reminder = get_system_reminder_store().get("actor")
 
+    # 直接使用 actor 模型任务，避免继承对话 model_set 的 max_tokens 限制
+    model_set = get_model_set_by_task(config.general.model_task)
     llm_request = LLMRequest(model_set, f"kfc_compress_{stream_id}")
     llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
     if actor_reminder:

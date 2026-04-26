@@ -154,6 +154,23 @@ class KFCConfig(BaseConfig):
         check_interval: int = Field(
             default=60, description="主动发起检查间隔(秒)"
         )
+        schedule_guidance: str = Field(
+            default=(
+                "预约是你和 Ta 保持长线联系的主要方式，不是偶尔才想到的工具。\n\n"
+                "每次对话之后，自然地想一想「下次什么时候联系 Ta？」，有想法就设一下，"
+                "让联系成为持续的节律，而不是单次事件。大部分时候保持有一个预约在等待中就好，不必强迫每次都设。\n\n"
+                "**发出消息之后：**\n"
+                "根据这次对话，考虑一下下次的时间，有感觉就设上。\n\n"
+                "**触发时刚好在聊天中：**\n"
+                "通常不用额外发，继续聊就好。聊完之后可以再想想下一次。\n\n"
+                "**触发时觉得时机不对：**\n"
+                "不发也行，可以重新设一个更合适的时间。\n\n"
+                "**频率没有固定规律：**\n"
+                "跟着你们当下的状态走，热络时短一些，需要空间时长一些。\n\n"
+                "系统的沉默触发只是兜底，预约才是主力。"
+            ),
+            description="schedule_proactive 工具的使用场景指导（会展示在工具描述中，可按需自定义）",
+        )
 
     @config_section("reply")
     class ReplySection(SectionBase):

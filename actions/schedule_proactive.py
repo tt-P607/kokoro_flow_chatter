@@ -7,53 +7,73 @@
 from __future__ import annotations
 
 import time
-from typing import Annotated
+from typing import Annotated, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base.action import BaseAction
 
 logger = get_logger("kfc_schedule_proactive")
 
+# 工具基础描述（固定，不可配置）
+_BASE_DESCRIPTION = (
+    "预约一个时间点，届时系统会主动唤醒你去发起新一轮对话。"
+    "**新的预约会覆盖旧的预约；传 delay_minutes=0 可取消当前预约。**\n"
+    "**预约不受勿扰时段限制**，即使是深夜或清晨设定的预约也会如期触发。\n"
+    "delay_minutes=0 取消预约；其他值范围限制为 30~1440 分钟（30 分钟~24 小时）。\n\n"
+    "**reason（必填）：**\n"
+    "记录此刻的真实想法。可以是一件具体的事，也可以只是「那个时间想找 Ta 说说话」"
+    "——怎么自然怎么写，重要的是让未来的你看到时能自然接上。取消预约时可留空。"
+)
+
 
 class ScheduleProactiveAction(BaseAction):
     """预约下一次主动思考时间。"""
 
     action_name: str = "schedule_proactive"
-    action_description: str = (
-        "预约一个时间点，届时系统会主动唤醒你去发起新一轮对话。"
-        "**新的预约会覆盖旧的预约。**\n"
-        "**不要只在话题结束时才想到这个工具**——下面这些日常场景都值得预约：\n"
-        "- 对方说去忙了、睡了、去做某件事了，你想等他/她回来后主动问候\n"
-        "- 聊了一段有趣的话题，你想晚些继续，或者想到了什么要告诉对方\n"
-        "- 约好了某件事（一起玩、明天见等），你想到时候提醒\n"
-        "- 对方今天心情不好，你想过段时间去关心一下\n"
-        "- 没什么特别的事，就是过一段时间想找对方说说话\n"
-        "只要你有「之后某个时间想主动联系」的念头，就调用它。\n"
-        "预约后，系统的沉默触发逻辑会暂停，直到你指定的时间到达。\n"
-        "delay_minutes 范围限制为 30~720 分钟（30 分钟~12 小时）。"
-    )
+    action_description: str = _BASE_DESCRIPTION
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 
+    # 可配置的指导语（由插件在 on_plugin_loaded 时从 config 写入，初始为空）
+    _guidance: ClassVar[str] = ""
+
     _MIN_DELAY_MIN = 30    # 最小 30 分钟
-    _MAX_DELAY_MIN = 720   # 最大 12 小时
+    _MAX_DELAY_MIN = 1440  # 最大 24 小时
+
+    @classmethod
+    def to_schema(cls) -> dict:  # type: ignore[override]
+        """动态拼接 base 描述 + 可配置指导语生成 schema。"""
+        schema = super().to_schema()
+        guidance = cls._guidance
+        if guidance:
+            func = schema.get("function", {})
+            func["description"] = _BASE_DESCRIPTION + "\n\n" + guidance
+        return schema
 
     async def execute(
         self,
         delay_minutes: Annotated[
             int,
-            "多少分钟后发起主动思考，范围 30~720（30 分钟~12 小时）",
+            "多少分钟后发起主动思考。传 0 表示取消当前预约；其他值范围 30~1440（30 分钟~24 小时）。",
         ] = 30,
         reason: Annotated[
             str,
-            "预约原因（必填）：用一两句话说明届时你想主动聊什么、或者为什么想在这个时候联系对方。"
-            "这段理由会在预约时间到达时注入到你的上下文中，帮助你记住当时的意图。",
+            "此刻的真实想法：可以是一件具体的事，也可以只是「那个时间想找 Ta 说说话」。"
+            "取消预约时（delay_minutes=0）可留空。",
         ] = "",
     ) -> tuple[bool, str]:
-        """设置主动思考预约时间。
+        """设置或取消主动思考预约。
+
+        Args:
+            delay_minutes: 延迟分钟数，0 表示取消当前预约，其他值会被夹到 30~720 范围。
+            reason: 预约原因，取消时可留空。
 
         Returns:
             (True, 状态描述)
         """
+        if delay_minutes == 0:
+            logger.debug("取消主动思考预约")
+            return True, "已取消当前主动思考预约"
+
         delay_minutes = max(self._MIN_DELAY_MIN, min(self._MAX_DELAY_MIN, delay_minutes))
         delay_seconds = delay_minutes * 60
         at = time.time() + delay_seconds

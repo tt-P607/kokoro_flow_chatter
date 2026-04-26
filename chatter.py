@@ -300,6 +300,12 @@ class KokoroFlowChatter(BaseChatter):
             # 链保存：记录每次 LLM 调用前最后一个 USER payload 的文本和时间戳
             _pre_send_user_text: str = ""
             _last_user_ts: float = 0.0
+            # 链保存：是否已预写 user 条目（用于防止重复追加）
+            _chain_user_pre_saved: bool = False
+            # 链保存：是否已预写 user 条目（用于防止重复追加）
+            _chain_user_pre_saved: bool = False
+            # 注入内容的临时 payload（不进持久历史）
+            _extra_payload: LLMPayload | None = None
 
             # ── 对话循环 ──
             while True:
@@ -371,9 +377,10 @@ class KokoroFlowChatter(BaseChatter):
                             )
 
                     # 构建 user payload（委托给 PromptBuilder）
-                    user_payload = prompt_builder.build_user_payload(
+                    user_payload, _extra_payload = await prompt_builder.build_user_payload(
                         formatted_unreads=formatted_text,
                         media_items=media_items,
+                        stream_id=self.stream_id,
                     )
 
                     # 工具链闭合守卫：若 response 尾部为 tool_result，
@@ -482,32 +489,67 @@ class KokoroFlowChatter(BaseChatter):
                     continue
 
                 # ── 调用 LLM（两阶段感知-决策循环） ──
-                if config.debug.show_prompt:
-                    self._log_prompt(response)
-
-                # 链保存：记录发送前最后一个 USER payload 的文本
-                _pre_send_user_text = ""
+                # 链保存：在追加临时 extra_payload 之前提取本轮 user 消息文本，
+                # 避免将注入内容误持久化进历史链。
+                _new_user_text = ""
                 for _p in reversed(response.payloads):
                     if _p.role == ROLE.USER:
-                        _pre_send_user_text = "".join(
+                        _new_user_text = "".join(
                             c.text  # type: ignore[attr-defined]
                             for c in _p.content if isinstance(c, Text)
                         )
                         break
+                if _new_user_text != _pre_send_user_text:
+                    _pre_send_user_text = _new_user_text
+                    _chain_user_pre_saved = False
+
+                # 预写 user 条目：LLM 请求前持久化用户消息，防止进程崩溃时丢失
+                # _chain_user_pre_saved 保证同一条消息不会重复写（工具续轮时跳过）
+                if _pre_send_user_text and not _chain_user_pre_saved:
+                    session.update_chain(
+                        [{"role": "user", "text": _pre_send_user_text, "ts": _last_user_ts}],
+                        config.prompt.max_context_payloads,
+                    )
+                    await self._save_session(session)
+                    _chain_user_pre_saved = True
+
+                # 临时追加注入内容（不进持久历史，发送后移除）
+                # 注意：不能用 add_payload()，因为相邻同角色 payload 会被自动合并。
+                # 直接 append 到 payloads 列表，确保对象引用唯一，移除时靠 identity 过滤。
+                _extra_payload_added = False
+                if _extra_payload is not None:
+                    response.payloads.append(_extra_payload)
+                    _extra_payload_added = True
+                if config.debug.show_prompt:
+                    self._log_prompt(response)
 
                 # 快照：LLM 调用前的已知消息 ID，用于检测打断
-                _known_ids: frozenset[str] = frozenset(
-                    mid for m in (unread_msgs or [])
-                    if (mid := getattr(m, "message_id", None)) is not None
-                )
+                # 超时触发时 unread_msgs 为空，需从 context 实时读取已知消息 ID
+                # 避免旧残留消息被误判为打断
+                if unread_msgs:
+                    _known_ids: frozenset[str] = frozenset(
+                        mid for m in unread_msgs
+                        if (mid := getattr(m, "message_id", None)) is not None
+                    )
+                else:
+                    _, _current_snapshot = await self.fetch_unreads(
+                        time_format="%Y-%m-%d %H:%M:%S"
+                    )
+                    _known_ids = frozenset(
+                        mid for m in _current_snapshot
+                        if (mid := getattr(m, "message_id", None)) is not None
+                    )
 
                 try:
-                    if config.buffer.interrupt_enabled and _known_ids:
+                    if config.buffer.interrupt_enabled:
                         new_response, interrupt_msgs = await self._send_interruptable(
                             response, config, _known_ids
                         )
                         if interrupt_msgs:
                             # 被打断：刷新原始消息，记录打断事件，循环重来
+                            if _extra_payload_added and _extra_payload is not None:
+                                response.payloads = [p for p in response.payloads if p is not _extra_payload]
+                            _extra_payload = None
                             await self.flush_unreads(unread_msgs or [])
                             session.add_interrupt_event(interrupt_msgs)
                             await self._save_session(session)
@@ -523,9 +565,18 @@ class KokoroFlowChatter(BaseChatter):
                     await self.flush_unreads(unread_msgs if unread_msgs else [])
                 except Exception as e:
                     logger.error(f"LLM 请求失败: {e}", exc_info=True)
+                    # 发送失败时也要移除临时 extra payload，避免下一轮重复追加
+                    if _extra_payload_added and _extra_payload is not None:
+                        response.payloads = [p for p in response.payloads if p is not _extra_payload]
+                    _extra_payload = None
                     await self._save_session(session)
                     yield Failure("LLM 请求失败", e)
                     continue
+
+                # 移除临时 extra payload（不应进入持久历史）
+                if _extra_payload_added and _extra_payload is not None:
+                    response.payloads = [p for p in response.payloads if p is not _extra_payload]
+                _extra_payload = None
 
                 # ── 解析 + 执行 ──
                 # 先打印本轮调用列表（对标 DFC 的调用列表日志），让 call_list 在执行前可见
@@ -563,11 +614,18 @@ class KokoroFlowChatter(BaseChatter):
                             _args = call.args if isinstance(call.args, dict) else (
                                 _json.loads(call.args) if isinstance(call.args, str) else {}
                             )
-                            delay_min = max(30.0, min(720.0, float(_args.get("delay_minutes", 30))))
-                            delay = delay_min * 60
-                            _reason = str(_args.get("reason", "")).strip()
-                            session.set_scheduled_proactive(time.time() + delay, reason=_reason)
-                            logger.info(f"[KFC] 已预约主动思考: {delay_min:.0f} 分钟后" + (f"，理由：{_reason}" if _reason else ""))
+                            delay_min = float(_args.get("delay_minutes", 30))
+                            if delay_min == 0:
+                                # delay=0：取消当前预约
+                                session.scheduled_proactive_at = None
+                                session.scheduled_proactive_reason = ""
+                                logger.info("[KFC] 已取消主动思考预约")
+                            else:
+                                delay_min = max(30.0, min(1440.0, delay_min))
+                                delay = delay_min * 60
+                                _reason = str(_args.get("reason", "")).strip()
+                                session.set_scheduled_proactive(time.time() + delay, reason=_reason)
+                                logger.info(f"[KFC] 已预约主动思考: {delay_min:.0f} 分钟后" + (f"，理由：{_reason}" if _reason else ""))
                         except Exception as _e:
                             logger.warning(f"[KFC] schedule_proactive 参数解析失败: {_e}")
                         break
@@ -603,7 +661,22 @@ class KokoroFlowChatter(BaseChatter):
                             _kfc_reply_args = _call.args if isinstance(_call.args, dict) else {}
                             break
                     if _kfc_reply_args is not None:
-                        _asst_text = _json.dumps(_kfc_reply_args, ensure_ascii=False)
+                        # kfc_reply 轮次：统一用列表格式，包含全部调用（kfc_reply + 第三方动作）
+                        # 避免第三方动作（emoji/图片等）因只序列化 kfc_reply 而丢失记录
+                        _all_call_records = []
+                        for _c in _all_calls:
+                            _cn = _c.name.rsplit(":", 1)[-1] if ":" in _c.name else _c.name
+                            for _pfx in ("action-", "tool-", "agent-"):
+                                if _cn.startswith(_pfx):
+                                    _cn = _cn[len(_pfx):]
+                                    break
+                            if _cn == DO_NOTHING:
+                                continue  # do_nothing 不需要记录
+                            _all_call_records.append({
+                                "name": _cn,
+                                "args": _c.args if isinstance(_c.args, dict) else {},
+                            })
+                        _asst_text = _json.dumps(_all_call_records, ensure_ascii=False)
                     elif _all_calls:
                         # 无 kfc_reply 的轮次，记录完整调用列表
                         _asst_text = _json.dumps(
@@ -619,13 +692,22 @@ class KokoroFlowChatter(BaseChatter):
                             ensure_ascii=False,
                         )
                 if _pre_send_user_text and _asst_text:
-                    session.update_chain(
-                        [
-                            {"role": "user", "text": _pre_send_user_text, "ts": _last_user_ts},
-                            {"role": "assistant", "text": _asst_text},
-                        ],
-                        config.prompt.max_context_payloads,
-                    )
+                    if _chain_user_pre_saved:
+                        # user 条目已预写，只追加 assistant 条目
+                        session.update_chain(
+                            [{"role": "assistant", "text": _asst_text}],
+                            config.prompt.max_context_payloads,
+                        )
+                    else:
+                        session.update_chain(
+                            [
+                                {"role": "user", "text": _pre_send_user_text, "ts": _last_user_ts},
+                                {"role": "assistant", "text": _asst_text},
+                            ],
+                            config.prompt.max_context_payloads,
+                        )
+                    # 立即持久化 assistant 条目，防止后续处理过程中崩溃导致丢失
+                    await self._save_session(session)
                     # ── 近期记忆压缩触发 ──
                     session.compress_round_count += 1
                     from .compressor import compress_history, should_compress
@@ -636,7 +718,7 @@ class KokoroFlowChatter(BaseChatter):
                         logger.info(f"[KFC] 触发近期记忆压缩：流 {session.stream_id}，原因：{_reason}")
                         from src.kernel.concurrency import get_task_manager
                         get_task_manager().create_task(
-                            compress_history(session, prompt_builder, config, model_set, chat_stream),
+                            compress_history(session, prompt_builder, config, chat_stream),
                             name=f"kfc_compress_{session.stream_id}",
                         )
 
@@ -779,7 +861,7 @@ class KokoroFlowChatter(BaseChatter):
             extra_vars["scheduled_proactive_info"] = (
                 f"# 当前预约状态\n"
                 f"你已预约在 **{sched_time_str}**（约 {remaining_min:.0f} 分钟后）主动发起{reason_text}。\n"
-                "如需修改，可重新调用 `schedule_proactive` 工具（新预约会覆盖旧的）。"
+                "如需修改，可重新调用 `schedule_proactive` 工具（新预约会覆盖旧的；传 delay_minutes=0 可取消预约）。"
             )
 
         system_prompt = await prompt_builder.build_system_prompt(
@@ -874,6 +956,10 @@ class KokoroFlowChatter(BaseChatter):
                 payloads.append(LLMPayload(ROLE.USER, Text(text)))
             elif role_str == "assistant":
                 payloads.append(LLMPayload(ROLE.ASSISTANT, Text(text)))
+        # 丢弃开头的孤立 assistant 条目，避免「对话不能以 assistant 开始」错误
+        # 这种情况发生在：user 预写后、LLM 回复时进程崩溃，下次启动 chain 头是 assistant
+        while payloads and payloads[0].role == ROLE.ASSISTANT:
+            payloads.pop(0)
         return payloads
 
     # ── 两阶段感知-决策循环 ──────────────────────────────────

@@ -163,6 +163,9 @@ class KFCSession:
         self.chain_payloads.extend(new_entries)
         if len(self.chain_payloads) > max_payloads:
             self.chain_payloads = self.chain_payloads[-max_payloads:]
+            # 确保裁剪后首条是 user，避免孤立的 assistant 导致上下文非法
+            while self.chain_payloads and self.chain_payloads[0].get("role") != "user":
+                self.chain_payloads.pop(0)
         # 更新截止时间戳为链头第一个 user 条目的时间
         self.chain_cutoff_ts = 0.0
         for entry in self.chain_payloads:

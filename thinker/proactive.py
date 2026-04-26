@@ -40,9 +40,8 @@ class ProactiveThinker:
         if not proactive_config.enabled:
             return []
 
-        # 检查是否在勿扰时段
-        if self._is_quiet_hours():
-            return []
+        # 注意：勿扰时段只对沉默触发生效，模型预约不受限制
+        # 勿扰时段检查已移入 _should_trigger
 
         triggered: list[str] = []
 
@@ -82,9 +81,15 @@ class ProactiveThinker:
     def _should_trigger(self, session: KFCSession) -> bool:
         """判断无预约情况下是否应主动发起（沉默条件 + 概率）。
 
+        勿扰时段只在本路径（沉默触发）中检查，模型预约不受此限制。
+
         Args:
             session: KFC 会话对象
         """
+        # 勿扰时段：仅拦截沉默触发，不影响模型预约
+        if self._is_quiet_hours():
+            return False
+
         proactive_config = self._config.proactive
         now = time.time()
 

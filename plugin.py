@@ -45,8 +45,12 @@ class KFCPlugin(BasePlugin):
         register_kfc_prompts()
         logger.info("KFC 提示词模板已注册")
 
-        # 预注册已知聊天流的 VLM 跳过（原生多模态模式）
+        # 将配置中的 schedule_proactive 指导语写入 Action 类变量
         config = self.config
+        if isinstance(config, KFCConfig) and config.proactive.schedule_guidance:
+            ScheduleProactiveAction._guidance = config.proactive.schedule_guidance
+
+        # 预注册已知聊天流的 VLM 跳过（原生多模态模式）
         if isinstance(config, KFCConfig) and config.general.native_multimodal:
             await self._preload_vlm_skip()
 
