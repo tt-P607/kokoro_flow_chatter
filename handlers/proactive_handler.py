@@ -147,10 +147,17 @@ class ProactiveHandler(BaseEventHandler):
         proactive_content = "[主动发起] 你已经沉默很久了，主动找对方聊聊吧。"
         try:
             from ..prompts.modules import build_proactive_context
+            from ..config import KFCConfig
+
+            use_tool_calling = True
+            if isinstance(self.plugin.config, KFCConfig):
+                use_tool_calling = self.plugin.config.general.use_tool_calling
+
             proactive_content = await build_proactive_context(
                 silence_minutes=silence_minutes,
                 recent_activity=recent_activity,
                 scheduled_reason=scheduled_reason,
+                use_tool_calling=use_tool_calling,
             )
         except Exception as e:
             logger.debug(f"构建主动发起上下文失败，使用默认消息: {e}")

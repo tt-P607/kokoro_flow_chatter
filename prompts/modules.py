@@ -15,6 +15,8 @@ from .templates import (
     KFC_PROACTIVE_PROMPT,
     KFC_TIMEOUT_PROMPT,
     KFC_REPLY_MODE_JSON,
+    KFC_PROACTIVE_DECISION_JSON,
+    KFC_PROACTIVE_DECISION_TOOL_CALLING,
 )
 
 
@@ -85,6 +87,7 @@ async def build_proactive_context(
     silence_minutes: float,
     recent_activity: str,
     scheduled_reason: str = "",
+    use_tool_calling: bool = False,
 ) -> str:
     """构建主动发起上下文。"""
     pm = get_prompt_manager()
@@ -99,11 +102,18 @@ async def build_proactive_context(
     else:
         silence_str = f"{silence_minutes:.0f} 分钟"
 
+    decision_instruction = (
+        KFC_PROACTIVE_DECISION_TOOL_CALLING
+        if use_tool_calling
+        else KFC_PROACTIVE_DECISION_JSON
+    )
+
     result = await (
         tmpl.clone()
         .set("current_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         .set("silence_duration", silence_str)
         .set("recent_activity", recent_activity or "（无近期活动记录）")
+        .set("proactive_decision_instruction", decision_instruction)
         .build()
     )
 
