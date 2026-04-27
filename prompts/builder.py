@@ -102,25 +102,6 @@ class KFCPromptBuilder:
         user_text = f"[新消息]\n{formatted_unreads}"
         extra_text = ""
 
-        # 1. 内部动态补强：身份与风格提醒
-        try:
-            from src.core.config import get_core_config
-            personality = get_core_config().personality
-            nickname = personality.nickname
-            style = personality.reply_style
-            
-            reminder_parts = []
-            if nickname:
-                reminder_parts.append(f"你是 {nickname}。")
-            if style:
-                reminder_parts.append(f"请始终保持你的独特表达风格，并以你的第一人称视角进行交互：\n{style}")
-            
-            if reminder_parts:
-                extra_text += "【身份提醒】\n" + "\n".join(reminder_parts) + "\n\n"
-                extra_text += "注意：禁止进行任何客观的任务分析，请直接输出带有你性格温度的回复。\n\n"
-        except Exception:
-            pass
-
         # 2. 外部插件注入：触发 on_prompt_build 事件
         try:
             from src.kernel.event import get_event_bus
