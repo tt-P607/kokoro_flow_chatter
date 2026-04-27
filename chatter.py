@@ -571,7 +571,7 @@ class KokoroFlowChatter(BaseChatter):
                     _extra_payload = None
                     await self._save_session(session)
                     yield Failure("LLM 请求失败", e)
-                    continue
+                    break  # 终止循环，避免无限重试导致死循环
 
                 # 移除临时 extra payload（不应进入持久历史）
                 if _extra_payload_added and _extra_payload is not None:

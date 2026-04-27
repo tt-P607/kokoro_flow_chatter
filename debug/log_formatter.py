@@ -187,7 +187,7 @@ def log_kfc_result(result: ToolCallResult, config: KFCConfig) -> None:
         elif action_type == DO_NOTHING:
             logger.info("[bold yellow]⏳[/bold yellow] 选择不回复")
         elif action_type not in ("no_action",):
-            logger.info(f"[bold cyan]🎯[/bold cyan] {action_type}")
+            logger.info(f"[bold cyan]{action_type}[/bold cyan]")
 
     meta_parts: list[str] = []
     if result.max_wait_seconds > 0:

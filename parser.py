@@ -96,12 +96,12 @@ async def parse_tool_calls(
 ) -> ToolCallResult:
     """遍历 LLM 返回的 call_list，提取元数据并执行动作。
 
-    按序处理 kfc_reply、do_nothing 和第三方工具。
-    pre_execute_hook 在所有动作执行完毕后统一触发，确保日志包含完整动作记录。
+    按模型返回的原始顺序执行，但第三方工具批量并行执行（在后台生成），
+    遇到 kfc_reply 时等待前面的第三方工具完成后再发送文本。
 
-    - kfc_reply: 提取元数据 + 调用 execute_reply_fn + 回传 ToolResult
+    - kfc_reply: 等待前面的第三方工具完成 → 分段发送文本 → 回传 ToolResult
     - do_nothing: 提取元数据 + 回传 ToolResult
-    - 其他: 通过 run_tool_call_fn 执行第三方工具
+    - 其他: 批量并行执行（遇到 kfc_reply 或循环结束时触发）
 
     Args:
         response: LLM 响应对象
@@ -117,6 +117,39 @@ async def parse_tool_calls(
     """
     result = ToolCallResult()
     is_first_reply = True
+    pending_third_party_calls: list[Any] = []  # 暂存第三方工具调用，批量并行执行
+
+    async def flush_pending_third_party() -> None:
+        """批量并行执行暂存的第三方工具。"""
+        if not pending_third_party_calls:
+            return
+
+        logger.debug(f"[KFC] 批量执行 {len(pending_third_party_calls)} 个第三方工具")
+        current_pending = list(pending_third_party_calls)
+        pending_third_party_calls.clear()
+        
+        results = await run_tool_call_fn(
+            current_pending, response, usable_map, trigger_msg
+        )
+        for call, (appended, success) in zip(current_pending, results, strict=False):
+            if not success:
+                logger.warning(
+                    f"[KFC] 工具 {call.name} 执行失败或被跳过"
+                    "（可能原因：工具未注册、无触发消息或执行异常）"
+                )
+
+    # ── 预处理：提前提取元数据用于日志展示 ──────────────────────────────
+    # 在执行任何动作前先扫描 call_list，提取 thought/expected_reaction 等元数据，
+    # 确保 pre_execute_hook 能在第三方动作执行前展示完整的内心想法。
+    _temp_metadata_extracted = False
+    if config.general.use_tool_calling and response.call_list:
+        for call in response.call_list:
+            args = _extract_args(call.args)
+            normalized_name = _normalize_call_name(call.name)
+            if normalized_name in (KFC_REPLY, DO_NOTHING):
+                extract_metadata(result, args)
+                _temp_metadata_extracted = True
+                break  # 找到第一个 kfc_reply/do_nothing 即可
 
     # ── 阶段一：从消息文本提取 JSON 回复（JSON 模式）─────────────────────
     # tool calling 模式下跳过此阶段，kfc_reply/do_nothing 直接通过 call_list 处理
@@ -174,7 +207,7 @@ async def parse_tool_calls(
                 f"preview={repr(segments[0][:80]) if segments else '(空)'}"
             )
 
-    # ── 阶段二：处理工具调用（第三方 action/tool/agent）───────────────
+    # ── 阶段二：按原始顺序处理工具调用（第三方工具批量并行，kfc_reply 等待前面完成）───
     for call in response.call_list or []:
         args = _extract_args(call.args)
         reason = args.pop("reason", "未提供原因")
@@ -185,6 +218,9 @@ async def parse_tool_calls(
         # （正常情况下模型不再生成这两个 tool call；保留分支作为边缘兜底）
         if normalized_name == KFC_REPLY:
             if not json_data:
+                # 先等待前面暂存的第三方工具完成（图片/语音在后台生成）
+                await flush_pending_third_party()
+
                 # JSON 解析未命中时，降级走旧 tool call 路径
                 result.has_reply = True
                 extract_metadata(result, args)
@@ -275,25 +311,18 @@ async def parse_tool_calls(
                 )
             continue
 
-        # 第三方工具
+        # 第三方工具：暂存到 pending 列表，遇到 kfc_reply 或循环结束时批量执行
         result.has_third_party = True
-        # agent-* / tool-* 有实际返回值，需要续轮让 LLM 看到结果后才能正式回复
+        # agent-* / tool-* 有实际返回值，需要续轮让 LLM 回复
         if call.name.startswith(("agent-", "tool-")):
             result.has_info_tool = True
         action_dict = {"type": normalized_name}
         action_dict.update(args)
         result.actions.append(action_dict)
+        pending_third_party_calls.append(call)
 
-        # 框架 API 变更：run_tool_call 现在接受批量 calls 并返回结果列表
-        # 这里传入单个 call 的列表以适配新接口
-        results = await run_tool_call_fn([call], response, usable_map, trigger_msg)
-        if results:
-            _, success = results[0]
-            if not success:
-                logger.warning(
-                    f"[KFC] 工具 {call.name} 执行失败或被跳过"
-                    "（可能原因：工具未注册、无触发消息或执行异常）"
-                )
+    # ── 阶段三：循环结束后，执行剩余的第三方工具（如果有）──────────────
+    await flush_pending_third_party()
 
     # 所有动作执行完毕后统一触发汇总日志，确保第三方工具也被记录
     if pre_execute_hook is not None:
