@@ -91,7 +91,7 @@ async def parse_tool_calls(
     config: KFCConfig,
     *,
     execute_reply_fn: Callable[[str, KFCConfig, Any | None, str], Awaitable[bool]],
-    run_tool_call_fn: Callable[[Any, Any, ToolRegistry, Any | None], Awaitable[tuple[bool, bool]]],
+    run_tool_call_fn: Callable[[Any, Any, ToolRegistry, Any | None], Awaitable[list[tuple[bool, bool]]]],
     pre_execute_hook: Callable[[ToolCallResult], None] | None = None,
 ) -> ToolCallResult:
     """遍历 LLM 返回的 call_list，提取元数据并执行动作。
@@ -284,12 +284,16 @@ async def parse_tool_calls(
         action_dict.update(args)
         result.actions.append(action_dict)
 
-        _, success = await run_tool_call_fn(call, response, usable_map, trigger_msg)
-        if not success:
-            logger.warning(
-                f"[KFC] 工具 {call.name} 执行失败或被跳过"
-                "（可能原因：工具未注册、无触发消息或执行异常）"
-            )
+        # 框架 API 变更：run_tool_call 现在接受批量 calls 并返回结果列表
+        # 这里传入单个 call 的列表以适配新接口
+        results = await run_tool_call_fn([call], response, usable_map, trigger_msg)
+        if results:
+            _, success = results[0]
+            if not success:
+                logger.warning(
+                    f"[KFC] 工具 {call.name} 执行失败或被跳过"
+                    "（可能原因：工具未注册、无触发消息或执行异常）"
+                )
 
     # 所有动作执行完毕后统一触发汇总日志，确保第三方工具也被记录
     if pre_execute_hook is not None:

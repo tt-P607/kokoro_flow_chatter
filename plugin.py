@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.kernel.concurrency import get_task_manager
@@ -16,6 +18,9 @@ from .chatter import KokoroFlowChatter
 from .config import KFCConfig
 from .handlers.proactive_handler import ProactiveHandler
 from .session import KFCSessionStore
+
+if TYPE_CHECKING:
+    from src.kernel.scheduler import UnifiedScheduler
 
 logger = get_logger("kfc_plugin")
 
@@ -67,18 +72,17 @@ class KFCPlugin(BasePlugin):
         """延迟注册调度器任务，等待调度器启动（最多 30 秒）。"""
         import asyncio
 
+        from src.kernel.scheduler import get_unified_scheduler
+
         for _ in range(30):
             await asyncio.sleep(1.0)
             try:
-                from src.kernel.scheduler import get_unified_scheduler
-
                 scheduler = get_unified_scheduler()
-                if scheduler._running:  # HACK: 需要框架公开 API (scheduler.is_running)
+                if getattr(scheduler, "_running", False):
                     await self._register_scheduler_tasks()
                     return
-            except ImportError:
-                logger.warning("Scheduler 不可用，放弃注册")
-                return
+            except Exception:
+                continue
         logger.warning("等待调度器启动超时(30s)，放弃注册后台任务")
 
     async def _preload_vlm_skip(self) -> None:
@@ -99,7 +103,7 @@ class KFCPlugin(BasePlugin):
                 logger.debug("无历史会话需要预注册 VLM 跳过")
                 return
 
-            from src.core.managers import get_media_manager
+            from src.core.managers.media_manager import get_media_manager
 
             media_manager = get_media_manager()
             for stream_id in stream_ids:
@@ -118,11 +122,12 @@ class KFCPlugin(BasePlugin):
             return
 
         try:
-            from src.kernel.scheduler import get_unified_scheduler, TriggerType
+            from src.kernel.scheduler import get_unified_scheduler
+            from src.kernel.scheduler.types import TriggerType
 
-            scheduler = get_unified_scheduler()
-        except ImportError:
-            logger.warning("Scheduler 不可用，跳过后台任务注册")
+            scheduler: UnifiedScheduler = get_unified_scheduler()
+        except Exception as e:
+            logger.warning(f"获取 Scheduler 失败: {e}")
             return
 
         # 主动发起检查

@@ -1176,7 +1176,7 @@ class KokoroFlowChatter(BaseChatter):
         调用是幂等的——多次注册同一 stream_id 不会产生副作用。
         """
         try:
-            from src.core.managers import get_media_manager
+            from src.core.managers.media_manager import get_media_manager
 
             get_media_manager().skip_vlm_for_stream(self.stream_id)
         except Exception as e:
@@ -1189,7 +1189,7 @@ class KokoroFlowChatter(BaseChatter):
         恢复框架对该 stream 的 VLM 识别能力。
         """
         try:
-            from src.core.managers import get_media_manager
+            from src.core.managers.media_manager import get_media_manager
 
             get_media_manager().unskip_vlm_for_stream(self.stream_id)
         except Exception as e:
