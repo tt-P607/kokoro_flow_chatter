@@ -1021,28 +1021,65 @@ class KokoroFlowChatter(BaseChatter):
                     logger.debug(f"[KFC] 检测到有效 JSON 回复 (is_do_nothing={norm['is_do_nothing']})，直接返回")
                     return new_response
 
-            # 模型输出了纯文本但没有工具调用（"破防"）
-            if attempt < max_retries:
-                perceive_text = (new_response.message or "").strip()
-                logger.info(
-                    f"模型感知阶段输出纯文本，进入决策阶段 "
-                    f"(第 {attempt + 1} 轮): "
-                    f"{perceive_text[:80]}{'...' if len(perceive_text) > 80 else ''}"
-                )
-                # 感言已通过 auto_append 进入上下文，
-                # 注入轻量提示引导模型进入决策阶段
-                followup = (
-                    KFC_PERCEIVE_FOLLOWUP_PROMPT_TOOL_CALLING
-                    if use_tool_calling
-                    else KFC_PERCEIVE_FOLLOWUP_PROMPT_JSON
-                )
-                new_response.add_payload(
-                    LLMPayload(ROLE.USER, Text(followup))
-                )
-                response = new_response
-                continue
+            # 检查是否为格式错误（输出了 JSON 数组或其他非预期格式）
+            response_text = (new_response.message or "").strip()
+            if response_text:
+                # 检测常见的格式错误模式
+                is_format_error = False
+                if response_text.startswith("[") and response_text.endswith("]"):
+                    # JSON 数组格式（工具调用描述）
+                    is_format_error = True
+                    logger.warning(
+                        f"[KFC] 模型输出格式错误：返回了 JSON 数组而非原生工具调用或有效回复 JSON。"
+                        f"预览：{response_text[:100]}"
+                    )
+                elif response_text.startswith("{") and not use_tool_calling:
+                    # JSON 对象但不含有效字段（已被 extract_json_reply 过滤）
+                    is_format_error = True
+                    logger.warning(
+                        f"[KFC] 模型输出格式错误：JSON 对象缺少必需字段（content/thought/expected_reaction 等）。"
+                        f"预览：{response_text[:100]}"
+                    )
+                
+                if is_format_error:
+                    if attempt < max_retries:
+                        logger.info(f"[KFC] 格式错误，重试 (第 {attempt + 1}/{max_retries} 轮)")
+                        followup = (
+                            KFC_PERCEIVE_FOLLOWUP_PROMPT_TOOL_CALLING
+                            if use_tool_calling
+                            else KFC_PERCEIVE_FOLLOWUP_PROMPT_JSON
+                        )
+                        new_response.add_payload(
+                            LLMPayload(ROLE.USER, Text(followup))
+                        )
+                        response = new_response
+                        continue
+                    else:
+                        logger.error(f"[KFC] 格式错误重试次数耗尽，返回空响应")
+                        return new_response
 
-            # 重试次数耗尽，返回最后一次响应（由调用方处理空 call_list）
+            # 模型输出了自然语言文本（真正的"破防"场景，如看图后的感言）
+            # 仅当文本内容看起来像自然语言描述时才进入感知-决策循环
+            if attempt < max_retries and response_text and len(response_text) > 20:
+                # 简单启发式：长度 > 20 且不以特殊符号开头，可能是自然语言
+                if not response_text.startswith(("{", "[", "<")):
+                    logger.info(
+                        f"[KFC] 模型感知阶段输出自然语言，进入决策阶段 "
+                        f"(第 {attempt + 1} 轮): "
+                        f"{response_text[:80]}{'...' if len(response_text) > 80 else ''}"
+                    )
+                    followup = (
+                        KFC_PERCEIVE_FOLLOWUP_PROMPT_TOOL_CALLING
+                        if use_tool_calling
+                        else KFC_PERCEIVE_FOLLOWUP_PROMPT_JSON
+                    )
+                    new_response.add_payload(
+                        LLMPayload(ROLE.USER, Text(followup))
+                    )
+                    response = new_response
+                    continue
+
+            # 重试次数耗尽或无法识别的输出，返回最后一次响应（由调用方处理空 call_list）
             return new_response
 
     # ── 可打断 LLM 调用 ─────────────────────────────────────

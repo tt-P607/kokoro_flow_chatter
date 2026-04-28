@@ -99,7 +99,13 @@ class KFCPromptBuilder:
                 - user_payload: USER 角色的 Payload（进入持久历史）
                 - extra_payload: 注入内容的独立 USER Payload（临时，不进历史），无注入时为 None
         """
-        user_text = f"[新消息]\n{formatted_unreads}"
+        # 添加表达风格强化提醒（对标 DFC）
+        style_reminder = (
+            "\n---\n"
+            "请务必保持你的回复符合你的人设和表达风格。"
+        )
+        
+        user_text = f"[新消息]\n{formatted_unreads}{style_reminder}"
         extra_text = ""
 
         # 2. 外部插件注入：触发 on_prompt_build 事件

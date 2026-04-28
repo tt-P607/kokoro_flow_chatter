@@ -210,7 +210,7 @@ async def parse_tool_calls(
     # ── 阶段二：按原始顺序处理工具调用（第三方工具批量并行，kfc_reply 等待前面完成）───
     for call in response.call_list or []:
         args = _extract_args(call.args)
-        reason = args.pop("reason", "未提供原因")
+        reason = args.get("reason", "未提供原因")
         normalized_name = _normalize_call_name(call.name)
         logger.info(f"LLM 调用 {call.name}，原因: {reason}")
 
