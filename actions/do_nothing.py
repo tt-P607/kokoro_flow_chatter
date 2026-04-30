@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from src.core.components.base.action import BaseAction
+from src.app.plugin_system.base import BaseAction
 
 
 class DoNothingAction(BaseAction):

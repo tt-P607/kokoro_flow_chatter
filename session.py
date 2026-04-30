@@ -15,6 +15,7 @@ from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
+from .domain.scene_state import SceneState
 from .mental_log import MentalLog, MentalLogEntry
 from .models import KFCEventType, WaitingConfig
 
@@ -58,6 +59,9 @@ class KFCSession:
     history_summary: str = ""
     last_compress_at: float = 0.0     # 上次触发压缩的时间戳
     compress_round_count: int = 0     # 距上次压缩已完成的对话轮次数
+
+    # 显式场景状态：只记录有证据支撑的场景信息，默认 unknown。
+    scene_state: SceneState = field(default_factory=SceneState)
 
     # 统计
     total_interactions: int = 0
@@ -230,6 +234,7 @@ class KFCSession:
             "history_summary": self.history_summary,
             "last_compress_at": self.last_compress_at,
             "compress_round_count": self.compress_round_count,
+            "scene_state": self.scene_state.to_dict(),
         }
 
     @classmethod
@@ -269,6 +274,7 @@ class KFCSession:
         session.history_summary = data.get("history_summary", "")
         session.last_compress_at = float(data.get("last_compress_at", 0.0))
         session.compress_round_count = int(data.get("compress_round_count", 0))
+        session.scene_state = SceneState.from_dict(data.get("scene_state", {}))
         return session
 
 

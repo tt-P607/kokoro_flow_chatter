@@ -10,7 +10,6 @@ from .templates import (
     KFC_PROACTIVE_PROMPT,
     KFC_TIMEOUT_PROMPT,
 )
-from .builder import KFCPromptBuilder
 
 __all__ = [
     "KFC_SYSTEM_PROMPT",
@@ -18,3 +17,12 @@ __all__ = [
     "KFC_TIMEOUT_PROMPT",
     "KFCPromptBuilder",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """惰性导出 builder，避免 context/planner 导入 templates 时触发循环导入。"""
+    if name == "KFCPromptBuilder":
+        from .builder import KFCPromptBuilder
+
+        return KFCPromptBuilder
+    raise AttributeError(name)

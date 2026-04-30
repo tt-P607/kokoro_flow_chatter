@@ -14,9 +14,8 @@ from .templates import (
     KFC_SYSTEM_PROMPT,
     KFC_PROACTIVE_PROMPT,
     KFC_TIMEOUT_PROMPT,
-    KFC_REPLY_MODE_JSON,
-    KFC_PROACTIVE_DECISION_JSON,
     KFC_PROACTIVE_DECISION_TOOL_CALLING,
+    KFC_REPLY_MODE_TOOL_CALLING,
 )
 
 
@@ -53,8 +52,9 @@ def register_kfc_prompts() -> None:
                 "\n".join(personality.safety_guidelines)
             ),
             "custom_decision_prompt": optional(""),
-            # reply_mode_instruction 由 _build_initial_context 动态注入，此处提供空串兜底
-            "reply_mode_instruction": optional(KFC_REPLY_MODE_JSON),
+            "scene_state_info": optional(""),
+            # reply_mode_instruction 由 _build_initial_context 动态注入，此处提供 tool calling 兜底
+            "reply_mode_instruction": optional(KFC_REPLY_MODE_TOOL_CALLING),
             "current_time": optional(
                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ),
@@ -87,7 +87,7 @@ async def build_proactive_context(
     silence_minutes: float,
     recent_activity: str,
     scheduled_reason: str = "",
-    use_tool_calling: bool = False,
+    use_tool_calling: bool = True,
 ) -> str:
     """构建主动发起上下文。"""
     pm = get_prompt_manager()
@@ -102,11 +102,8 @@ async def build_proactive_context(
     else:
         silence_str = f"{silence_minutes:.0f} 分钟"
 
-    decision_instruction = (
-        KFC_PROACTIVE_DECISION_TOOL_CALLING
-        if use_tool_calling
-        else KFC_PROACTIVE_DECISION_JSON
-    )
+    _ = use_tool_calling
+    decision_instruction = KFC_PROACTIVE_DECISION_TOOL_CALLING
 
     result = await (
         tmpl.clone()
@@ -129,7 +126,7 @@ def build_timeout_context(
     consecutive_timeouts: int,
     last_bot_message: str = "",
     max_consecutive_timeouts: int = 3,
-    use_tool_calling: bool = False,
+    use_tool_calling: bool = True,
 ) -> str:
     """构建等待超时决策上下文。
 
@@ -139,7 +136,7 @@ def build_timeout_context(
         consecutive_timeouts: 连续超时次数（含本次）
         last_bot_message: 最后一条 Bot 发送的消息
         max_consecutive_timeouts: 配置的连续超时上限
-        use_tool_calling: 是否为工具调用模式
+        use_tool_calling: 兼容旧调用参数；当前始终走工具调用协议
     """
     elapsed_minutes = elapsed_seconds / 60
     is_first = consecutive_timeouts == 1
@@ -177,39 +174,22 @@ def build_timeout_context(
         )
 
     # ── 操作指令 ──
+    _ = use_tool_calling
     if is_last:
-        if use_tool_calling:
-            decision_instructions = (
-                "本次等待到此为止，**不得**再设置新的等待（`max_wait_seconds` 必须为 0）。"
-            )
-        else:
-            decision_instructions = (
-                "本次等待到此为止，`max_wait_seconds` 必须设置为 0。"
-            )
+        decision_instructions = (
+            "本次等待到此为止，**不得**再设置新的等待（`max_wait_seconds` 必须为 0）。"
+        )
     elif is_first:
-        if use_tool_calling:
-            decision_instructions = (
-                "可以调用 `kfc_reply(...)` 发送消息，"
-                "或调用 `do_nothing(max_wait_seconds>0)` 继续等待，"
-                "或调用 `do_nothing(max_wait_seconds=0)` 结束等待。"
-            )
-        else:
-            decision_instructions = (
-                "可以在 JSON 中填写 `content` 发送消息，"
-                "设置 `content: null, max_wait_seconds > 0` 继续等待，"
-                "或设置 `content: null, max_wait_seconds: 0` 结束等待。"
-            )
+        decision_instructions = (
+            "可以调用 `kfc_reply(...)` 发送消息，"
+            "或调用 `do_nothing(max_wait_seconds>0)` 继续等待，"
+            "或调用 `do_nothing(max_wait_seconds=0)` 结束等待。"
+        )
     else:
-        if use_tool_calling:
-            decision_instructions = (
-                "如果确实有话说，可以调用 `kfc_reply(...)` 发送消息；"
-                "或调用 `do_nothing(max_wait_seconds=0)` 结束等待。"
-            )
-        else:
-            decision_instructions = (
-                "如果确实有话说，在 JSON 中填写 `content`；"
-                "否则设置 `content: null, max_wait_seconds: 0` 结束等待。"
-            )
+        decision_instructions = (
+            "如果确实有话说，可以调用 `kfc_reply(...)` 发送消息；"
+            "或调用 `do_nothing(max_wait_seconds=0)` 结束等待。"
+        )
 
     return KFC_TIMEOUT_PROMPT.format(
         timeout_situation=timeout_situation,

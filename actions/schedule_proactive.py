@@ -10,7 +10,7 @@ import time
 from typing import Annotated, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base.action import BaseAction
+from src.app.plugin_system.base import BaseAction
 
 logger = get_logger("kfc_schedule_proactive")
 
@@ -64,7 +64,7 @@ class ScheduleProactiveAction(BaseAction):
         """设置或取消主动思考预约。
 
         Args:
-            delay_minutes: 延迟分钟数，0 表示取消当前预约，其他值会被夹到 30~720 范围。
+            delay_minutes: 延迟分钟数，0 表示取消当前预约，其他值会被夹到 30~1440 范围。
             reason: 预约原因，取消时可留空。
 
         Returns:

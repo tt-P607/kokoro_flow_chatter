@@ -20,7 +20,17 @@
         },
         {
             "component_type": "action",
+            "component_name": "do_nothing",
+            "dependencies": []
+        },
+        {
+            "component_type": "action",
             "component_name": "schedule_proactive",
+            "dependencies": []
+        },
+        {
+            "component_type": "event_handler",
+            "component_name": "kfc_proactive_handler",
             "dependencies": []
         },
         {

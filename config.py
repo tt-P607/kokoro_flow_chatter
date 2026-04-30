@@ -58,9 +58,9 @@ class KFCConfig(BaseConfig):
         max_compat_retries: int = Field(
             default=1,
             description=(
-                "tool_call_compat 解析失败时的最大重试次数。"
-                "当模型输出纯自然语言而非 JSON 格式时，"
-                "注入格式提醒后重试。0 表示不重试。"
+                "纯文本感知草稿未形成工具调用时的最大重试次数。"
+                "KFC 会把该轮输出视为未发送草稿，并注入 tool-call 约束后重试。"
+                "0 表示不重试。"
             ),
         )
         custom_decision_prompt: str = Field(
@@ -76,10 +76,6 @@ class KFCConfig(BaseConfig):
                 "需要从工具列表中屏蔽的工具末段名称（不含组件类型前缀）。"
                 "列表中的工具不会暴露给 LLM。"
             ),
-        )
-        use_tool_calling: bool = Field(
-            default=True,
-            description="回复模式。True（默认）：工具调用模式，新模型使用。False：JSON 解析模式，建议旧模型使用 。",
         )
         segment_instruction: str = Field(
             default=(

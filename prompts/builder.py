@@ -6,13 +6,11 @@ KFCPromptBuilder 负责在 execute() 中构建完整的系统提示词，
 
 from __future__ import annotations
 
-import datetime
 from typing import TYPE_CHECKING, Any
 
-from src.core.prompt import get_prompt_manager
-from src.kernel.llm import Content, LLMPayload, ROLE, Text
+from src.kernel.llm import LLMPayload, ROLE, Text
 
-from .modules import build_mental_log_hint
+from ..context import ContextPlanner, ContextRenderer
 
 if TYPE_CHECKING:
     from src.core.models.stream import ChatStream
@@ -24,6 +22,11 @@ class KFCPromptBuilder:
     从 PromptManager 中获取已注册的模板，
     填入动态变量后构建最终的系统提示词。
     """
+
+    def __init__(self) -> None:
+        """初始化上下文规划器与渲染器。"""
+        self._planner = ContextPlanner()
+        self._renderer = ContextRenderer()
 
     async def build_system_prompt(
         self,
@@ -39,38 +42,31 @@ class KFCPromptBuilder:
         Returns:
             str: 完整的系统提示词
         """
-        pm = get_prompt_manager()
-        tmpl = pm.get_template("kfc_system_prompt")
-        if not tmpl:
-            return ""
+        return await self._renderer.build_system_prompt(
+            chat_stream,
+            extra_vars=extra_vars,
+        )
 
-        # 复制模板以避免污染全局状态
-        tmpl = tmpl.clone()
-
-        # 设置动态变量
-        # 只用 chat_stream 属性补充模板中未设置的字段
-        # nickname/alias_names 等已在 modules.py 的 register_kfc_prompts() 中
-        # 从 core_config.personality 正确设置，此处不再覆盖
-        tmpl.set("platform", chat_stream.platform or "unknown")
-        tmpl.set("chat_type", str(chat_stream.chat_type or "unknown"))
-        tmpl.set("bot_id", chat_stream.bot_id or "")
-        tmpl.set("stream_id", str(chat_stream.stream_id or ""))
-        # 活动流格式提示
-        tmpl.set("mental_log_hint", build_mental_log_hint())
-
-        # 场景引导
-        theme_guide = self._get_theme_guide(chat_stream)
-        tmpl.set("theme_guide", theme_guide)
-
-        # 聊天流标识（供 on_prompt_build 事件处理器读取）
-        tmpl.set("stream_id", chat_stream.stream_id or "")
-
-        # 额外变量
-        if extra_vars:
-            for key, value in extra_vars.items():
-                tmpl.set(key, value)
-
-        return await tmpl.build()
+    async def build_initial_payloads(
+        self,
+        chat_stream: ChatStream,
+        config: Any,
+        session: Any,
+    ) -> tuple[list[LLMPayload], bool]:
+        """构建 execute 启动所需的初始 payload 列表。"""
+        plan = self._planner.plan_initial_context(
+            chat_stream=chat_stream,
+            config=config,
+            session=session,
+        )
+        return await self._renderer.render_initial_context(
+            chat_stream=chat_stream,
+            plan=plan,
+            mental_log=getattr(session, "mental_log", None),
+            serialized_chain_payloads=list(getattr(session, "chain_payloads", []) or []),
+            build_system_prompt_fn=self.build_system_prompt,
+            build_fused_narrative_fn=self.build_fused_narrative,
+        )
 
     async def build_user_payload(
         self,
@@ -99,51 +95,11 @@ class KFCPromptBuilder:
                 - user_payload: USER 角色的 Payload（进入持久历史）
                 - extra_payload: 注入内容的独立 USER Payload（临时，不进历史），无注入时为 None
         """
-        # 添加表达风格强化提醒（对标 DFC）
-        style_reminder = (
-            "\n---\n"
-            "请务必保持你的回复符合你的人设和表达风格。"
+        plan = await self._planner.plan_user_turn(
+            formatted_unreads=formatted_unreads,
+            stream_id=stream_id,
         )
-        
-        user_text = f"[新消息]\n{formatted_unreads}{style_reminder}"
-        extra_text = ""
-
-        # 2. 外部插件注入：触发 on_prompt_build 事件
-        try:
-            from src.kernel.event import get_event_bus
-
-            event_bus = get_event_bus()
-            if event_bus.get_subscribers("on_prompt_build"):
-                _tmpl = "{content}\n{extra}"
-                _vals: dict[str, str] = {"content": user_text, "extra": "", "stream_id": stream_id}
-                _, final_params = await event_bus.publish(
-                    "on_prompt_build",
-                    {
-                        "name": "kfc_user_prompt",
-                        "template": _tmpl,
-                        "values": _vals,
-                        "policies": {},
-                        "strict": False,
-                    },
-                )
-                rendered_vals: dict[str, str] = dict(final_params.get("values", _vals))
-                plugin_extra = rendered_vals.get("extra", "").strip()
-                if plugin_extra:
-                    extra_text += f"{plugin_extra}\n"
-        except Exception:
-            pass
-
-        content: Content | list[Content]
-        if media_items:
-            from ..multimodal import build_multimodal_content
-
-            content = build_multimodal_content(user_text, media_items)
-        else:
-            content = Text(user_text)
-
-        user_payload = LLMPayload(ROLE.USER, content)  # type: ignore[arg-type]
-        extra_payload = LLMPayload(ROLE.USER, Text(f"[SYSTEM REMINDER]\n{extra_text.strip()}")) if extra_text.strip() else None
-        return user_payload, extra_payload
+        return self._renderer.render_user_payload(plan, media_items=media_items)
 
     @staticmethod
     def build_timeout_payload(
@@ -152,7 +108,7 @@ class KFCPromptBuilder:
         consecutive_timeouts: int,
         last_bot_message: str = "",
         max_consecutive_timeouts: int = 3,
-        use_tool_calling: bool = False,
+        use_tool_calling: bool = True,
     ) -> LLMPayload:
         """构建等待超时 Payload。
 
@@ -165,7 +121,7 @@ class KFCPromptBuilder:
             consecutive_timeouts: 连续超时次数
             last_bot_message: 最后一条 Bot 发送的消息
             max_consecutive_timeouts: 配置的连续超时上限
-            use_tool_calling: 是否为工具调用模式
+            use_tool_calling: 兼容旧调用参数；当前始终走工具调用协议
 
         Returns:
             LLMPayload: USER 角色的超时 Payload
@@ -183,16 +139,8 @@ class KFCPromptBuilder:
 
         return LLMPayload(ROLE.USER, Text(timeout_text))
 
-    @staticmethod
-    def _get_theme_guide(chat_stream: ChatStream) -> str:
-        """根据聊天类型返回场景引导文本。
-        
-        由于 KFC 是私聊特化的，暂不需要特殊的场景引导。
-        """
-        return ""
-
-    @staticmethod
     def build_fused_narrative(
+        self,
         chat_stream: ChatStream,
         mental_log: Any,
         before_ts: float | None = None,
@@ -217,93 +165,9 @@ class KFCPromptBuilder:
         Returns:
             str: 融合叙事文本，无内容时返回空串
         """
-        from ..models import KFCEventType
-
-        msgs: list[Any] = list(
-            getattr(
-                getattr(chat_stream, "context", None),
-                "history_messages",
-                [],
-            )
-        )
-        bot_id = str(chat_stream.bot_id or "")
-
-        # timeline: (timestamp, formatted_line)
-        timeline: list[tuple[float, str]] = []
-
-        # ── 聊天记录 ──
-        for msg in msgs:
-            raw_time = getattr(msg, "time", None)
-            if not isinstance(raw_time, (int, float)):
-                continue
-            ts = float(raw_time)
-            try:
-                time_str = datetime.datetime.fromtimestamp(ts).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-            except (OSError, ValueError, OverflowError):
-                continue
-
-            sender = getattr(msg, "sender_name", "未知")
-            sender_id = str(getattr(msg, "sender_id", ""))
-            message_id = str(getattr(msg, "message_id", "") or "")
-            text = getattr(msg, "processed_plain_text", "")
-            if not text or not text.strip():
-                continue
-
-            # 跳过 warmup 窗口内的消息，避免与热启动 pair 内容重叠
-            if before_ts is not None and ts >= before_ts:
-                continue
-
-            is_bot = bool(
-                (bot_id and sender_id == bot_id)
-                or message_id.startswith("action_kfc_reply")
-            )
-            if is_bot:
-                timeline.append((ts, f"[{time_str}] 你回复：{text}"))
-            else:
-                msg_id_part = f" [消息id:{message_id}]" if message_id else ""
-                timeline.append((ts, f"[{time_str}] {sender}{msg_id_part}说：{text}"))
-
-        # ── 内心独白（仅展示最近 7 条聊天消息范围内的思考） ──
-        # 找到倒数第 7 条聊天消息的时间戳作为截止点
-        chat_timestamps = [ts for ts, _ in timeline]
-        mental_cutoff = (
-            chat_timestamps[-7] if len(chat_timestamps) >= 7 else 0.0
-        )
-
-        if mental_log:
-            for entry in mental_log.entries:
-                if entry.timestamp < mental_cutoff:
-                    continue
-                ts = entry.timestamp
-                try:
-                    time_str = datetime.datetime.fromtimestamp(ts).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
-                except (OSError, ValueError, OverflowError):
-                    continue
-
-                # 同样跳过 warmup 窗口内的思考条目
-                if before_ts is not None and entry.timestamp >= before_ts:
-                    continue
-
-                if (
-                    entry.event_type == KFCEventType.BOT_PLANNING
-                    and entry.thought
-                ):
-                    timeline.append(
-                        (ts, f"[{time_str}] （你的内心：{entry.thought}）")
-                    )
-
-        if not timeline:
-            return ""
-
-        # 按时间排序
-        timeline.sort(key=lambda x: x[0])
-
-        lines = [item[1] for item in timeline]
-        return (
-            "以下为融合了聊天记录与你内心活动的时间线：\n"
-            + "\n".join(lines)
+        _ = self
+        return ContextRenderer.build_fused_narrative(
+            chat_stream,
+            mental_log,
+            before_ts=before_ts,
         )

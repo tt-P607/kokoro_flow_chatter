@@ -57,6 +57,37 @@ class ToolCallResult:
         return self.has_reply or self.has_do_nothing or self.has_third_party
 
 
+def extract_visible_reply_text(result: ToolCallResult) -> str:
+    """从工具调用结果中提取用户实际看到的回复文本。
+
+    KFC 在 tool-calling 模式下会把 thought、第三方动作、预约等信息
+    记录到 MentalLog，但持久化对话链只应保留用户真正看到的回复内容。
+
+    Args:
+        result: 工具调用解析结果
+
+    Returns:
+        str: 按发送顺序拼接的可见回复文本；无可见回复时返回空串
+    """
+    segments: list[str] = []
+
+    for action in result.actions:
+        if action.get("type") != KFC_REPLY:
+            continue
+
+        raw_content = action.get("content")
+        if isinstance(raw_content, list):
+            segments.extend(
+                str(item).strip() for item in raw_content if str(item).strip()
+            )
+        elif isinstance(raw_content, str):
+            stripped = raw_content.strip()
+            if stripped:
+                segments.append(stripped)
+
+    return "\n".join(segments)
+
+
 class KFCEventType(Enum):
     """活动流事件类型，用于标记 mental_log 中不同类型的事件。"""
 
