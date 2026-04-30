@@ -11,7 +11,7 @@ from src.app.plugin_system.api.llm_api import (
 )
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import Failure, Stop, Success, Wait
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import LLMPayload
 
 from ..debug.log_formatter import log_kfc_result
 from ..protocol.compat_adapter import prepare_kfc_model_set
@@ -146,18 +146,13 @@ async def execute_orchestrator(
                     default=time.time(),
                 )
 
-            new_user_text = ""
-            for payload in reversed(response.payloads):
-                if payload.role == ROLE.USER:
-                    new_user_text = "".join(
-                        chunk.text  # type: ignore[attr-defined]
-                        for chunk in payload.content
-                        if isinstance(chunk, Text)
-                    )
-                    break
-            if new_user_text != pre_send_user_text:
-                pre_send_user_text = new_user_text
-                chain_user_pre_saved = False
+            # 用原始 formatted_unreads 而非从 payloads 反向提取，
+            # 避免 _apply_reminders 把 reminder 前缀混入持久化的 user text
+            if turn_input.formatted_unreads:
+                new_user_text = turn_input.formatted_unreads
+                if new_user_text != pre_send_user_text:
+                    pre_send_user_text = new_user_text
+                    chain_user_pre_saved = False
 
             if pre_send_user_text and not chain_user_pre_saved:
                 session.update_chain(

@@ -49,6 +49,7 @@ class TurnInputResult:
     history_images_injected: bool = False
     has_pending_tool_results: bool = False
     is_final_timeout: bool = False
+    formatted_unreads: str = ""
 
 
 async def prepare_turn_input(
@@ -197,6 +198,7 @@ async def prepare_turn_input(
         history_images_injected=history_images_injected,
         has_pending_tool_results=has_pending_tool_results,
         is_final_timeout=is_final_timeout,
+        formatted_unreads=formatted_text,
     )
 
 
