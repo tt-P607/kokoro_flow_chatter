@@ -147,17 +147,11 @@ class ProactiveHandler(BaseEventHandler):
         proactive_content = "[主动发起] 你已经沉默很久了，主动找对方聊聊吧。"
         try:
             from ..prompts.modules import build_proactive_context
-            from ..config import KFCConfig
-
-            use_tool_calling = True
-            if isinstance(self.plugin.config, KFCConfig):
-                use_tool_calling = self.plugin.config.general.use_tool_calling
 
             proactive_content = await build_proactive_context(
                 silence_minutes=silence_minutes,
                 recent_activity=recent_activity,
                 scheduled_reason=scheduled_reason,
-                use_tool_calling=use_tool_calling,
             )
         except Exception as e:
             logger.debug(f"构建主动发起上下文失败，使用默认消息: {e}")
@@ -168,29 +162,21 @@ class ProactiveHandler(BaseEventHandler):
         logger.debug(f"已注入主动发起触发消息到流 {stream_id[:8]}")
 
         if is_cold_start:
-            # 冷启动流需要主动启动流循环，等待状态不存在无需清除
-            try:
-                from src.core.transport.distribution.stream_loop_manager import (
-                    get_stream_loop_manager,
-                )
-                loop_mgr = get_stream_loop_manager()
-                await loop_mgr.start_stream_loop(stream_id)
-                logger.debug(f"已为冷启动流 {stream_id[:8]} 启动流循环")
-            except Exception as e:
-                logger.warning(f"启动流循环失败: {e}")
-        else:
-            # 热流：清除等待状态，让下一次 tick 立即唤醒
+            # 冷启动流（不在内存中）：消息已注入队列，需主动启动该流的循环任务。
+            # 使用 StreamLoopManager 的公开方法启动，不访问私有属性。
             try:
                 from src.core.transport.distribution.stream_loop_manager import (
                     get_stream_loop_manager,
                 )
 
                 loop_mgr = get_stream_loop_manager()
-                removed = loop_mgr._wait_states.pop(stream_id, None)  # HACK: 需要框架公开 API (loop_mgr.wake_stream)
-                if removed:
-                    logger.debug(f"已清除流 {stream_id[:8]} 的等待状态")
-            except ImportError:
-                logger.warning("StreamLoopManager 不可用，无法清除等待状态")
+                await loop_mgr.start_stream_loop(stream_id)
+                logger.info(f"冷启动流 {stream_id[:8]} 流循环已启动")
+            except Exception as e:
+                logger.warning(f"冷启动流 {stream_id[:8]} 启动流循环失败: {e}")
+        else:
+            # 热流：消息已注入未读队列，流循环在下一次 tick 时会自然处理。
+            logger.debug(f"主动触发消息已注入热流 {stream_id[:8]} 未读队列，等待下一次 tick 处理")
 
         return True
 
@@ -212,7 +198,7 @@ class ProactiveHandler(BaseEventHandler):
         Returns:
             Message: 系统触发消息对象
         """
-        from src.core.models.message import Message
+        from src.app.plugin_system.types import Message
 
         extra_kwargs: dict[str, Any] = {}
         if target_user_id:

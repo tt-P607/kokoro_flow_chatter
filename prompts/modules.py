@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import datetime
 
-from src.core.config import get_core_config
-from src.core.prompt import get_prompt_manager, optional, wrap, min_len
+from src.core.config import get_core_config  # TODO: 待 prompt_api 暴露 get_bot_personality() 后迁移
+from src.core.prompt import optional, wrap, min_len  # 纯工具函数，无状态副作用
+
+from src.app.plugin_system.api.prompt_api import get_or_create as _pm_get_or_create
+from src.app.plugin_system.api.prompt_api import get_template as _pm_get_template
 
 from .templates import (
     KFC_SYSTEM_PROMPT,
@@ -27,10 +30,8 @@ def register_kfc_prompts() -> None:
     config = get_core_config()
     personality = config.personality
 
-    pm = get_prompt_manager()
-
     # 主系统提示词
-    pm.get_or_create(
+    _pm_get_or_create(
         name="kfc_system_prompt",
         template=KFC_SYSTEM_PROMPT,
         policies={
@@ -62,7 +63,7 @@ def register_kfc_prompts() -> None:
     )
 
     # 主动发起提示词
-    pm.get_or_create(
+    _pm_get_or_create(
         name="kfc_proactive_prompt",
         template=KFC_PROACTIVE_PROMPT,
         policies={
@@ -87,12 +88,10 @@ async def build_proactive_context(
     silence_minutes: float,
     recent_activity: str,
     scheduled_reason: str = "",
-    use_tool_calling: bool = True,
 ) -> str:
     """构建主动发起上下文。"""
-    pm = get_prompt_manager()
-    tmpl = pm.get_template("kfc_proactive_prompt")
-    if not tmpl:
+    tmpl_base = _pm_get_template("kfc_proactive_prompt")
+    if not tmpl_base:
         return f"已沉默 {silence_minutes:.0f} 分钟"
 
     # 格式化沉默持续时间为可读文本
@@ -102,11 +101,10 @@ async def build_proactive_context(
     else:
         silence_str = f"{silence_minutes:.0f} 分钟"
 
-    _ = use_tool_calling
     decision_instruction = KFC_PROACTIVE_DECISION_TOOL_CALLING
 
     result = await (
-        tmpl.clone()
+        tmpl_base.clone()
         .set("current_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         .set("silence_duration", silence_str)
         .set("recent_activity", recent_activity or "（无近期活动记录）")
@@ -126,7 +124,6 @@ def build_timeout_context(
     consecutive_timeouts: int,
     last_bot_message: str = "",
     max_consecutive_timeouts: int = 3,
-    use_tool_calling: bool = True,
 ) -> str:
     """构建等待超时决策上下文。
 
@@ -136,7 +133,6 @@ def build_timeout_context(
         consecutive_timeouts: 连续超时次数（含本次）
         last_bot_message: 最后一条 Bot 发送的消息
         max_consecutive_timeouts: 配置的连续超时上限
-        use_tool_calling: 兼容旧调用参数；当前始终走工具调用协议
     """
     elapsed_minutes = elapsed_seconds / 60
     is_first = consecutive_timeouts == 1
@@ -174,7 +170,6 @@ def build_timeout_context(
         )
 
     # ── 操作指令 ──
-    _ = use_tool_calling
     if is_last:
         decision_instructions = (
             "本次等待到此为止，**不得**再设置新的等待（`max_wait_seconds` 必须为 0）。"

@@ -14,14 +14,14 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.stream_api import get_stream_messages
-from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 if TYPE_CHECKING:
     from .config import KFCConfig
     from .session import KFCSession
     from .prompts.builder import KFCPromptBuilder
 
-from src.app.plugin_system.api.llm_api import get_model_set_by_task
+from src.app.plugin_system.api.llm_api import get_model_set_by_task, create_llm_request
 
 logger = get_logger("kfc_compressor")
 
@@ -132,12 +132,12 @@ async def compress_history(
     )
 
     # 注入 actor_reminder（如有）
-    from src.core.prompt import get_system_reminder_store
-    actor_reminder = get_system_reminder_store().get("actor")
+    from src.app.plugin_system.api.prompt_api import get_system_reminder
+    actor_reminder = get_system_reminder("actor")
 
     # 直接使用 actor 模型任务，避免继承对话 model_set 的 max_tokens 限制
     model_set = get_model_set_by_task(config.general.model_task)
-    llm_request = LLMRequest(model_set, f"kfc_compress_{stream_id}")
+    llm_request = create_llm_request(model_set, f"kfc_compress_{stream_id}")
     llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
     if actor_reminder:
         llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(actor_reminder)))
@@ -152,7 +152,7 @@ async def compress_history(
         return
 
     if not summary:
-        logger.warning(f"[KFC] 压缩：LLM 返回空摘要，跳过")
+        logger.warning("[KFC] 压缩：LLM 返回空摘要，跳过")
         return
 
     # ── 5. 更新 session（直接替换）──
@@ -194,6 +194,7 @@ def should_compress(session: "KFCSession", config: "KFCConfig") -> bool:
 # ── 私有辅助函数 ──────────────────────────────────────────
 
 def _msg_time(msg: Any) -> float:
+    """从消息对象中提取时间戳，不存在或类型错误时返回 0.0。"""
     t = getattr(msg, "time", None)
     return float(t) if isinstance(t, (int, float)) else 0.0
 

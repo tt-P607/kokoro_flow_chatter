@@ -25,10 +25,16 @@ async def send_interruptable_response(
     """以可打断方式发送 LLM 请求。"""
 
     async def _llm_work() -> Any:
-        return await chatter._send_with_perceive_loop(
-            response,
-            config.general.max_compat_retries,
-        )
+        from src.kernel.concurrency import get_watchdog
+        from ..protocol.response_normalizer import normalize_response
+
+        watchdog = get_watchdog()
+        watchdog.feed_dog(chatter.stream_id)
+        result = await response.send(auto_append_response=True, stream=False)
+        await result
+        watchdog.feed_dog(chatter.stream_id)
+        normalize_response(result)
+        return result
 
     tm = get_task_manager()
     task_handle = tm.create_task(

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 from ..thinker.timeout_handler import TimeoutHandler
 

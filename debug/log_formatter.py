@@ -10,7 +10,7 @@ import json
 from typing import Any, TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.kernel.llm import ROLE
+from src.app.plugin_system.types import ROLE
 
 from ..models import KFC_REPLY, DO_NOTHING
 
@@ -63,7 +63,7 @@ def _extract_payload_text(payload: Any) -> tuple[list[str], list[dict[str, Any]]
     return text_parts, tool_schemas
 
 
-def format_prompt_for_log(response: Any) -> str:
+def format_prompt_for_log(response: Any, chain_payloads: list[dict[str, Any]] | None = None) -> str:
     """从 LLM request/response 的 payload 列表中提取并格式化提示词。
 
     渲染顺序（符合阅读习惯，首尾最重要）：
@@ -78,10 +78,19 @@ def format_prompt_for_log(response: Any) -> str:
 
     Args:
         response: LLMRequest 或 LLMResponse 对象
+        chain_payloads: session.chain_payloads，用于将历史 ASSISTANT 的文本还原为工具调用展示
 
     Returns:
         str: 格式化后的提示词文本
     """
+    # 构建 text→tool_calls 的查找表，仅针对 assistant 条目
+    chain_tool_calls_map: dict[str, list[dict[str, Any]]] = {}
+    if chain_payloads:
+        for entry in chain_payloads:
+            if entry.get("role") == "assistant" and entry.get("tool_calls"):
+                text_key = str(entry.get("text", "") or "")
+                chain_tool_calls_map[text_key] = entry["tool_calls"]
+
     payloads = getattr(response, "payloads", None)
     if not payloads:
         return "（无 payload）"
@@ -100,6 +109,27 @@ def format_prompt_for_log(response: Any) -> str:
             continue
 
         role_name = str(role.value).upper() if role is not None and hasattr(role, "value") else str(role)
+
+        # 历史 ASSISTANT payload（Text 格式）：尝试从 chain_payloads 还原工具调用展示
+        if role == ROLE.ASSISTANT and chain_tool_calls_map and len(text_parts) == 1:
+            assistant_text = text_parts[0]
+            tool_calls_raw = chain_tool_calls_map.get(assistant_text)
+            if tool_calls_raw:
+                tool_call_lines: list[str] = []
+                for tc in tool_calls_raw:
+                    tc_name = tc.get("name", "?")
+                    tc_args = tc.get("args", {})
+                    try:
+                        args_str = json.dumps(tc_args, ensure_ascii=False)
+                    except Exception:
+                        args_str = str(tc_args)
+                    if len(args_str) > 400:
+                        args_str = args_str[:400] + "..."
+                    tool_call_lines.append(f"ToolCall(name={tc_name!r}, args={args_str})")
+                text = "\n".join(tool_call_lines)
+                convo_parts.append(f"── {role_name} ──\n{text}")
+                continue
+
         text = "\n".join(text_parts) if text_parts else "（空）"
         line = f"── {role_name} ──\n{text}"
 

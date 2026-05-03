@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 from ..context import ContextPlanner, ContextRenderer
 
 if TYPE_CHECKING:
-    from src.core.models.stream import ChatStream
+    from src.app.plugin_system.types import ChatStream
 
 
 class KFCPromptBuilder:
@@ -108,7 +108,6 @@ class KFCPromptBuilder:
         consecutive_timeouts: int,
         last_bot_message: str = "",
         max_consecutive_timeouts: int = 3,
-        use_tool_calling: bool = True,
     ) -> LLMPayload:
         """构建等待超时 Payload。
 
@@ -121,7 +120,6 @@ class KFCPromptBuilder:
             consecutive_timeouts: 连续超时次数
             last_bot_message: 最后一条 Bot 发送的消息
             max_consecutive_timeouts: 配置的连续超时上限
-            use_tool_calling: 兼容旧调用参数；当前始终走工具调用协议
 
         Returns:
             LLMPayload: USER 角色的超时 Payload
@@ -134,7 +132,6 @@ class KFCPromptBuilder:
             consecutive_timeouts=consecutive_timeouts,
             last_bot_message=last_bot_message,
             max_consecutive_timeouts=max_consecutive_timeouts,
-            use_tool_calling=use_tool_calling,
         )
 
         return LLMPayload(ROLE.USER, Text(timeout_text))

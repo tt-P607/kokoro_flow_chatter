@@ -13,13 +13,11 @@ from collections.abc import Awaitable, Callable
 from typing import Any, TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.kernel.llm import LLMPayload, ROLE, ToolResult
+from src.app.plugin_system.types import LLMPayload, ROLE, ToolRegistry, ToolResult
 
 from .models import KFC_REPLY, DO_NOTHING, ToolCallResult
 
 if TYPE_CHECKING:
-    from src.kernel.llm import ToolRegistry
-
     from .config import KFCConfig
 
 logger = get_logger("kfc_parser")

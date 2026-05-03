@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import Stop, Wait
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 from ..models import WaitingConfig
 from ..services import SummaryService
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from ..prompts.builder import KFCPromptBuilder
     from ..session import KFCSession
     from ..chatter import KokoroFlowChatter
-    from src.core.models.stream import ChatStream
+    from src.app.plugin_system.types import ChatStream
     from ..services.timeout_service import TimeoutService
 
 
@@ -113,7 +113,7 @@ async def prepare_turn_input(
             )
             from ..services import MultimodalService
 
-            MultimodalService.append_history_reference(response, history_imgs)
+            MultimodalService.append_history_reference(response, history_imgs or [])
 
         user_payload, extra_payload = await prompt_builder.build_user_payload(
             formatted_unreads=formatted_text,
@@ -227,17 +227,26 @@ async def commit_turn_decision(
     assistant_text = (getattr(response, "message", "") or "").strip()
     if not assistant_text:
         assistant_text = decision.reply_text
-    if pre_send_user_text and assistant_text:
+    call_list = getattr(response, "call_list", None) or []
+    serialized_tool_calls = [
+        {"name": tc.name, "args": tc.args, "id": tc.id}
+        for tc in call_list
+        if hasattr(tc, "name") and hasattr(tc, "args")
+    ]
+    if pre_send_user_text and (assistant_text or serialized_tool_calls):
+        assistant_entry: dict = {"role": "assistant", "text": assistant_text}
+        if serialized_tool_calls:
+            assistant_entry["tool_calls"] = serialized_tool_calls
         if chain_user_pre_saved:
             session.update_chain(
-                [{"role": "assistant", "text": assistant_text}],
+                [assistant_entry],
                 config.prompt.max_context_payloads,
             )
         else:
             session.update_chain(
                 [
                     {"role": "user", "text": pre_send_user_text, "ts": last_user_ts},
-                    {"role": "assistant", "text": assistant_text},
+                    assistant_entry,
                 ],
                 config.prompt.max_context_payloads,
             )

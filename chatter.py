@@ -16,9 +16,8 @@ import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
 from src.app.plugin_system.api.llm_api import (
+    LLMContextManager,
     create_llm_request,
-    get_model_set_by_task,
-    get_model_set_by_name,
 )
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import (
@@ -28,26 +27,13 @@ from src.app.plugin_system.base import (
     Success,
     Wait,
 )
-from src.core.components.types import ChatType
-from src.kernel.concurrency import get_watchdog
-from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
+from src.app.plugin_system.types import ChatType
 
-from .debug.log_formatter import format_prompt_for_log, log_kfc_result
-from .protocol.compat_adapter import (
-    build_tool_call_compat_retry_prompt,
-    is_deepseek_model_set,
-    prepare_kfc_model_set,
-    rewrite_response_as_unsent_draft,
-)
-from .protocol.decision_parser import parse_response_decision
-from .protocol.response_normalizer import normalize_response
+from .debug.log_formatter import format_prompt_for_log
 from .models import KFC_REPLY, DO_NOTHING
-from .prompts.templates import (
-    KFC_PERCEIVE_FOLLOWUP_PROMPT_TOOL_CALLING,
-)
 
 if TYPE_CHECKING:
-    from src.core.models.stream import ChatStream
+    from src.app.plugin_system.types import ChatStream
     from src.app.plugin_system.api.llm_api import ToolRegistry
 
     from .config import KFCConfig
@@ -237,91 +223,6 @@ class KokoroFlowChatter(BaseChatter):
         usable_map = await self.inject_usables(request)
 
         return request, image_budget, usable_map, prompt_builder, has_history
-
-    # ── 两阶段感知-决策循环 ──────────────────────────────────
-
-    async def _send_with_perceive_loop(
-        self,
-        response: Any,
-        max_retries: int,
-        *,
-        use_tool_calling: bool = True,
-    ) -> Any:
-        """发送 LLM 请求，实现两阶段"感知→决策"循环。
-
-        当模型收到图片后"破防"——输出纯自然语言感言而非 JSON 工具调用时，
-        不将其视为错误，而是先让响应进入 response 链，随后把该纯文本
-        改写成“未发送草稿”说明，再注入轻量提示进入决策阶段。
-        这样既保留本轮感知结果，又避免模型把草稿误当成已经发给对方的
-        assistant 历史，导致重试时自行推进话题。
-
-        流程:
-            1. send(auto_append_response=True) → 模型可能输出纯文本
-            2. 检查 call_list 是否为空
-            3. 若为空且有文本内容 → 感知阶段完成，注入跟进提示
-            4. 再次 send() → 模型基于已有记忆输出工具调用
-
-        Args:
-            response: LLM 请求/响应链对象（LLMRequest 或 LLMResponse）
-            max_retries: 最大感知-决策循环次数（0 表示不做二次发送）
-
-        Returns:
-            已消费（await）的 LLMResponse 对象
-        """
-        watchdog = get_watchdog()
-
-        for attempt in range(max_retries + 1):
-            # 喂狗：LLM 请求前刷新心跳，防止长时间阻塞触发 WatchDog 重启
-            watchdog.feed_dog(self.stream_id)
-
-            # auto_append_response=True：先把响应接到 response 链上；
-            # 若本轮只是纯文本草稿，会在下方改写成未发送草稿说明。
-            new_response = await response.send(
-                auto_append_response=True, stream=False
-            )
-            await new_response
-
-            normalized = normalize_response(new_response)
-            if normalized.used_reasoning_content and not normalized.has_tool_calls:
-                logger.debug("[KFC] 响应 content 为空，回退使用 reasoning_content")
-            if normalized.used_compat_tool_calls:
-                logger.debug("[KFC] 从正文 compat JSON 成功解析工具调用")
-
-            # LLM 请求完成后再次喂狗
-            watchdog.feed_dog(self.stream_id)
-
-            # 模型成功输出了工具调用 → 直接返回
-            if normalized.has_tool_calls:
-                return new_response
-
-            # 模型输出了纯文本但没有工具调用（"破防"）
-            if attempt < max_retries:
-                perceive_text = normalized.text or (new_response.message or "").strip()
-                logger.info(
-                    f"模型感知阶段输出纯文本，进入决策阶段 "
-                    f"(第 {attempt + 1} 轮): "
-                    f"{perceive_text[:80]}{'...' if len(perceive_text) > 80 else ''}"
-                )
-                if not rewrite_response_as_unsent_draft(new_response, perceive_text):
-                    logger.debug("[KFC] 未能将纯文本响应改写为未发送草稿，保留原始上下文")
-
-                # 注入轻量提示，引导模型基于“未发送草稿”进入决策阶段。
-                followup = None
-                if is_deepseek_model_set(getattr(new_response, "model_set", None)):
-                    followup = build_tool_call_compat_retry_prompt(new_response.payloads)
-                    if followup:
-                        logger.debug("[KFC] DeepSeek 纯文本重试使用 compat JSON 提示")
-
-                if not followup:
-                    followup = KFC_PERCEIVE_FOLLOWUP_PROMPT_TOOL_CALLING
-                new_response.add_payload(
-                    LLMPayload(ROLE.USER, Text(followup))
-                )
-                response = new_response
-                continue
-
-            # 重试次数耗尽，返回最后一次响应（由调用方处理空 call_list）
-            return new_response
 
     # ── 可打断 LLM 调用 ─────────────────────────────────────
 
@@ -587,7 +488,7 @@ class KokoroFlowChatter(BaseChatter):
         if context and hasattr(context, "history_messages") and context.history_messages:
             return context.history_messages[-1]
 
-        from src.core.models.message import Message
+        from src.app.plugin_system.types import Message
 
         return Message(
             message_id="virtual_timeout_trigger",
@@ -639,9 +540,9 @@ class KokoroFlowChatter(BaseChatter):
 
     # ── 调试日志方法 ────────────────────────────────────────
 
-    def _log_prompt(self, response: Any) -> None:
+    def _log_prompt(self, response: Any, chain_payloads: list[dict] | None = None) -> None:
         """输出发送给 LLM 的完整提示词（面板格式）。"""
-        prompt_text = format_prompt_for_log(response)
+        prompt_text = format_prompt_for_log(response, chain_payloads=chain_payloads)
         logger.print_panel(
             prompt_text,
             title=f"KFC 提示词 (stream={self.stream_id[:8]})",

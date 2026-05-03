@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.kernel.llm import LLMPayload, ROLE
+from src.app.plugin_system.types import LLMPayload, ROLE
 
 from ..multimodal import MediaItem, build_multimodal_content
 

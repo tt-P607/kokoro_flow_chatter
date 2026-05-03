@@ -61,6 +61,8 @@ class KFCSession:
     compress_round_count: int = 0     # 距上次压缩已完成的对话轮次数
 
     # 显式场景状态：只记录有证据支撑的场景信息，默认 unknown。
+    # TODO: scene_state 目前始终为 unknown，业务层尚未接入更新逻辑。
+    #       等待后续功能迭代（如场景感知工具、场景推断模块）接入后再实现。
     scene_state: SceneState = field(default_factory=SceneState)
 
     # 统计
@@ -477,8 +479,8 @@ class KFCSessionStore:
 
         # 读取现有索引
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                index: dict[str, dict[str, str]] = _json.load(f)
+            raw = await asyncio.to_thread(index_path.read_bytes)
+            index: dict[str, dict[str, str]] = _json.loads(raw)
         except (FileNotFoundError, _json.JSONDecodeError):
             index = {}
 
@@ -491,7 +493,7 @@ class KFCSessionStore:
 
         # 写回
         try:
-            with open(index_path, "w", encoding="utf-8") as f:
-                _json.dump(index, f, ensure_ascii=False, indent=2)
+            data_bytes = _json.dumps(index, ensure_ascii=False, indent=2).encode("utf-8")
+            await asyncio.to_thread(index_path.write_bytes, data_bytes)
         except Exception as e:
             logger.debug(f"索引文件写入失败: {e}")

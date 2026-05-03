@@ -55,14 +55,6 @@ class KFCConfig(BaseConfig):
                 "例如设为 4 时，若 bot 最近发了 1 张、用户本轮发了 2 张，则历史图片最多补 1 张。"
             ),
         )
-        max_compat_retries: int = Field(
-            default=1,
-            description=(
-                "纯文本感知草稿未形成工具调用时的最大重试次数。"
-                "KFC 会把该轮输出视为未发送草稿，并注入 tool-call 约束后重试。"
-                "0 表示不重试。"
-            ),
-        )
         custom_decision_prompt: str = Field(
             default="",
             description=(

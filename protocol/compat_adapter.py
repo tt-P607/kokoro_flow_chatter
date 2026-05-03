@@ -6,10 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from src.kernel.llm import LLMPayload, ROLE, ReasoningText, Text, ToolCall
-from src.kernel.llm.tool_call_compat import (
-    build_tool_call_compat_prompt,
-    parse_tool_call_compat_response,
-)
+from src.kernel.llm.tool_call_compat import parse_tool_call_compat_response
 
 
 def _is_deepseek_model_entry(model_entry: Any) -> bool:
@@ -116,64 +113,3 @@ def _sync_last_assistant_payload(response: Any) -> bool:
     payloads.append(LLMPayload(ROLE.ASSISTANT, content_parts))
     return True
 
-
-def build_tool_call_compat_retry_prompt(payloads: Any) -> str | None:
-    """为 DeepSeek 的纯文本重试构造 compat JSON 跟进提示。"""
-    if not isinstance(payloads, list):
-        return None
-
-    from src.kernel.llm.model_client.openai_client import _to_openai_tool
-
-    tool_schemas: list[dict[str, Any]] = []
-    for payload in payloads:
-        if getattr(payload, "role", None) != ROLE.TOOL:
-            continue
-        for item in getattr(payload, "content", []):
-            try:
-                tool_schemas.append(_to_openai_tool(item))
-            except Exception:
-                continue
-
-    if not tool_schemas:
-        return None
-
-    compat_prompt = build_tool_call_compat_prompt(tool_schemas)
-    return (
-        "<perception_completed>\n"
-        "你已经看过了上面的未发送草稿。\n"
-        "它还没有真正发给对方，只是供你内部决策参考。\n"
-        "上一轮你没有成功输出可执行的工具调用。\n"
-        "这一轮不要输出普通聊天文本，不要解释。\n"
-        "请严格只返回一个 JSON 对象，并把决策放进 tool_calls。\n"
-        f"{compat_prompt}\n"
-        "</perception_completed>"
-    )
-
-
-def build_unsent_perception_draft(perceive_text: str) -> str:
-    """构造“未发送草稿”说明，避免模型误判为已发送消息。"""
-    draft_text = perceive_text.strip() or "（本轮仅完成内部感知，尚未形成可发送正文）"
-    return (
-        "<unsent_perception_draft>\n"
-        "以下内容是你刚才形成的内部感知/未发送草稿，并没有发送给对方：\n"
-        f"{draft_text}\n"
-        "请把它视为内部草稿，而不是已经发出的消息。\n"
-        "</unsent_perception_draft>"
-    )
-
-
-def rewrite_response_as_unsent_draft(response: Any, perceive_text: str) -> bool:
-    """将自动追加的纯文本响应改写成“未发送草稿”标记。"""
-    if getattr(response, "call_list", None):
-        return False
-
-    payloads = getattr(response, "payloads", None)
-    if not isinstance(payloads, list) or not payloads:
-        return False
-
-    last_payload = payloads[-1]
-    if getattr(last_payload, "role", None) != ROLE.ASSISTANT:
-        return False
-
-    last_payload.content = [Text(build_unsent_perception_draft(perceive_text))]
-    return True

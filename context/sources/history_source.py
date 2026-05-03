@@ -5,7 +5,11 @@ from __future__ import annotations
 import datetime
 from typing import Any
 
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import LLMPayload, ROLE, Text, ToolCall, ToolResult
+
+# mental_log 回溯的对话消息条数：取最近 N 条消息的时间戳作为剪切点，
+# 使 mental_log 中的思考记录仅覆盖近期对话窗口。
+_MENTAL_LOG_LOOKBACK = 7
 
 
 def build_history_summary_payload(
@@ -47,11 +51,33 @@ def restore_chain_payloads(
     for entry in serialized_chain_payloads:
         role_str = str(entry.get("role", "") or "")
         text = str(entry.get("text", "") or "")
-        if not text:
+        has_tool_calls = bool(entry.get("tool_calls")) and role_str == "assistant"
+        if not text and not has_tool_calls:
             continue
         if role_str == "user":
+            if not text:
+                continue
             payloads.append(LLMPayload(ROLE.USER, Text(text)))
         elif role_str == "assistant":
+            tool_calls_raw = entry.get("tool_calls")
+            if tool_calls_raw:
+                tool_calls = [
+                    ToolCall(id=tc.get("id"), name=tc["name"], args=tc.get("args", {}))
+                    for tc in tool_calls_raw
+                    if isinstance(tc, dict) and tc.get("name")
+                ]
+                if tool_calls:
+                    # 还原为 ToolCall payload，并生成对应的 ToolResult 和承接 ASSISTANT
+                    # 格式：ASSISTANT(ToolCall) → TOOL_RESULT → ASSISTANT(text) → USER
+                    payloads.append(LLMPayload(ROLE.ASSISTANT, list(tool_calls)))  # type: ignore[arg-type]
+                    tool_results = [
+                        ToolResult(value="ok", call_id=tc.id, name=tc.name)
+                        for tc in tool_calls
+                    ]
+                    payloads.append(LLMPayload(ROLE.TOOL_RESULT, list(tool_results)))  # type: ignore[arg-type]
+                    if text:
+                        payloads.append(LLMPayload(ROLE.ASSISTANT, Text(text)))
+                    continue
             payloads.append(LLMPayload(ROLE.ASSISTANT, Text(text)))
 
     while payloads and payloads[0].role == ROLE.ASSISTANT:
@@ -110,7 +136,7 @@ def build_fused_narrative(
             timeline.append((ts, f"[{time_str}] {sender}{msg_id_part}说：{text}"))
 
     chat_timestamps = [ts for ts, _ in timeline]
-    mental_cutoff = chat_timestamps[-7] if len(chat_timestamps) >= 7 else 0.0
+    mental_cutoff = chat_timestamps[-_MENTAL_LOG_LOOKBACK] if len(chat_timestamps) >= _MENTAL_LOG_LOOKBACK else 0.0
 
     for entry in getattr(mental_log, "entries", []) or []:
         if entry.timestamp < mental_cutoff:

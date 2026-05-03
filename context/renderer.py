@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import datetime
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-from src.core.prompt import get_prompt_manager
-from src.kernel.llm import Content, LLMPayload, ROLE, Text
+from src.app.plugin_system.api.prompt_api import get_template as _get_prompt_template
+from src.app.plugin_system.types import Content, LLMPayload, ROLE, Text
 
 from .sources.history_source import (
     build_current_time_payload,
@@ -18,7 +17,7 @@ from .sources.history_source import (
 from .types import ContextContribution, ContextPlan, InitialContextPlan
 
 if TYPE_CHECKING:
-    from src.core.models.stream import ChatStream
+    from src.app.plugin_system.types import ChatStream
 
 
 class ContextRenderer:
@@ -64,7 +63,7 @@ class ContextRenderer:
 
         system_prompt = await system_prompt_builder(
             chat_stream,
-            extra_vars=plan.system_extra_vars,
+            plan.system_extra_vars,
         )
         payloads.append(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
@@ -79,7 +78,7 @@ class ContextRenderer:
         history_text = fused_narrative_builder(
             chat_stream,
             mental_log,
-            before_ts=plan.history_before_ts,
+            plan.history_before_ts,
         )
         if history_text:
             payloads.append(LLMPayload(ROLE.SYSTEM, Text(history_text)))
@@ -97,19 +96,17 @@ class ContextRenderer:
         """构建系统提示词。"""
         from ..prompts.modules import build_mental_log_hint
 
-        pm = get_prompt_manager()
-        tmpl = pm.get_template("kfc_system_prompt")
-        if not tmpl:
+        tmpl_base = _get_prompt_template("kfc_system_prompt")
+        if not tmpl_base:
             return ""
 
-        tmpl = tmpl.clone()
+        tmpl = tmpl_base.clone()
         tmpl.set("platform", chat_stream.platform or "unknown")
         tmpl.set("chat_type", str(chat_stream.chat_type or "unknown"))
         tmpl.set("bot_id", chat_stream.bot_id or "")
-        tmpl.set("stream_id", str(chat_stream.stream_id or ""))
-        tmpl.set("mental_log_hint", build_mental_log_hint())
-        tmpl.set("theme_guide", self._get_theme_guide(chat_stream))
         tmpl.set("stream_id", chat_stream.stream_id or "")
+        tmpl.set("mental_log_hint", build_mental_log_hint())
+        tmpl.set("theme_guide", "")
 
         if extra_vars:
             for key, value in extra_vars.items():
@@ -197,13 +194,6 @@ class ContextRenderer:
         return f"{section_title}\n{joined_contents}"
 
     @staticmethod
-    def restore_chain_payloads(
-        serialized_chain_payloads: list[dict[str, Any]],
-    ) -> list[LLMPayload]:
-        """从序列化的 USER/ASSISTANT pair 恢复 payload。"""
-        return restore_history_chain_payloads(serialized_chain_payloads)
-
-    @staticmethod
     def _render_contribution_text(contribution: ContextContribution) -> str:
         """渲染单条上下文贡献文本。"""
         content = contribution.content.strip()
@@ -216,12 +206,6 @@ class ContextRenderer:
             return f"[SYSTEM REMINDER]\n{content}"
 
         return content
-
-    @staticmethod
-    def _get_theme_guide(chat_stream: ChatStream) -> str:
-        """根据聊天类型返回场景引导文本。"""
-        _ = chat_stream
-        return ""
 
     @staticmethod
     def build_fused_narrative(

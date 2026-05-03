@@ -9,10 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
-from src.kernel.llm import Content, Image, Text
+from src.app.plugin_system.types import Content, Image, Text
 
 if TYPE_CHECKING:
-    from src.core.models.message import Message
+    from src.app.plugin_system.types import Message
 
 
 @dataclass

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, get_args
+from typing import Any, cast, get_args
 
 from src.app.plugin_system.api.log_api import get_logger
 
@@ -34,8 +34,8 @@ def _normalize_context_contribution(raw: Any) -> ContextContribution | None:
 
         return ContextContribution(
             source=str(raw.get("source", "plugin.on_prompt_build") or "plugin.on_prompt_build"),
-            owner=normalized_owner,
-            scope=normalized_scope,
+            owner=cast(ContextOwner, normalized_owner),
+            scope=cast(ContextScope, normalized_scope),
             priority=int(raw.get("priority", 0) or 0),
             ttl_turns=(
                 int(raw["ttl_turns"])
@@ -62,15 +62,11 @@ async def collect_plugin_turn_contributions(
     直接拼接 raw extra user payload。
     """
     try:
-        from src.kernel.event import get_event_bus
-
-        event_bus = get_event_bus()
-        if not event_bus.get_subscribers("on_prompt_build"):
-            return []
+        from src.app.plugin_system.api.event_api import publish_event
 
         template = "{content}\n{extra}"
         values: dict[str, Any] = {"content": content, "extra": "", "stream_id": stream_id}
-        _, final_params = await event_bus.publish(
+        result = await publish_event(
             "on_prompt_build",
             {
                 "name": prompt_name,
@@ -80,6 +76,7 @@ async def collect_plugin_turn_contributions(
                 "strict": False,
             },
         )
+        final_params: dict[str, Any] = result.get("params", {})
 
         contributions: list[ContextContribution] = []
         for raw in final_params.get("context_contributions", []) or []:

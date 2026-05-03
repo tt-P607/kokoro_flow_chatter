@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from typing import TYPE_CHECKING, AsyncGenerator
 
 from src.app.plugin_system.api.llm_api import (
     get_model_set_by_name,
@@ -11,15 +11,15 @@ from src.app.plugin_system.api.llm_api import (
 )
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import Failure, Stop, Success, Wait
-from src.kernel.llm import LLMPayload
+from src.kernel.concurrency import get_watchdog
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 from ..debug.log_formatter import log_kfc_result
 from ..protocol.compat_adapter import prepare_kfc_model_set
 from ..protocol.decision_parser import parse_response_decision
+from ..protocol.response_normalizer import normalize_response
 from ..services import (
-    MultimodalService,
     ProactiveService,
-    SummaryService,
     TimeoutService,
 )
 from .turn_controller import commit_turn_decision, prepare_turn_input
@@ -163,11 +163,17 @@ async def execute_orchestrator(
                 chain_user_pre_saved = True
 
             extra_payload_added = False
+            extra_payload_index: int | None = None
+            # 发送前确保链末尾合法：tool_result 后不能直接发给 LLM
+            if response.payloads and response.payloads[-1].role == ROLE.TOOL_RESULT:
+                response.add_payload(LLMPayload(ROLE.ASSISTANT, Text("好的。")))
+                logger.debug("[KFC] LLM 发送前：末尾 tool_result 未闭合，插入 assistant 桥接")
             if extra_payload is not None:
+                extra_payload_index = len(response.payloads)
                 response.payloads.append(extra_payload)
                 extra_payload_added = True
             if config.debug.show_prompt:
-                self._log_prompt(response)
+                self._log_prompt(response, chain_payloads=session.chain_payloads)
 
             if unread_msgs:
                 known_ids: frozenset[str] = frozenset(
@@ -193,13 +199,11 @@ async def execute_orchestrator(
                         known_ids,
                     )
                     if interrupt_msgs:
-                        if extra_payload_added and extra_payload is not None:
-                            response.payloads = [
-                                payload
-                                for payload in response.payloads
-                                if payload is not extra_payload
-                            ]
+                        if extra_payload_added and extra_payload_index is not None:
+                            if extra_payload_index < len(response.payloads):
+                                response.payloads.pop(extra_payload_index)
                         extra_payload = None
+                        extra_payload_index = None
                         await self.flush_unreads(unread_msgs or [])
                         session.add_interrupt_event(interrupt_msgs)
                         await self._save_session(session)
@@ -207,29 +211,29 @@ async def execute_orchestrator(
                     assert new_response is not None
                     response = new_response
                 else:
-                    response = await self._send_with_perceive_loop(
-                        response,
-                        config.general.max_compat_retries,
-                    )
+                    watchdog = get_watchdog()
+                    watchdog.feed_dog(self.stream_id)
+                    response = await response.send(auto_append_response=True, stream=False)
+                    await response
+                    watchdog.feed_dog(self.stream_id)
+                    normalize_response(response)
                 await self.flush_unreads(unread_msgs if unread_msgs else [])
             except Exception as exc:
                 logger.error(f"LLM 请求失败: {exc}", exc_info=True)
-                if extra_payload_added and extra_payload is not None:
-                    response.payloads = [
-                        payload
-                        for payload in response.payloads
-                        if payload is not extra_payload
-                    ]
+                if extra_payload_added and extra_payload_index is not None:
+                    if extra_payload_index < len(response.payloads):
+                        response.payloads.pop(extra_payload_index)
                 extra_payload = None
+                extra_payload_index = None
                 await self._save_session(session)
                 yield Failure("LLM 请求失败", exc)
                 break
 
-            if extra_payload_added and extra_payload is not None:
-                response.payloads = [
-                    payload for payload in response.payloads if payload is not extra_payload
-                ]
+            if extra_payload_added and extra_payload_index is not None:
+                if extra_payload_index < len(response.payloads):
+                    response.payloads.pop(extra_payload_index)
             extra_payload = None
+            extra_payload_index = None
 
             call_list = getattr(response, "call_list", None) or []
             if call_list:
