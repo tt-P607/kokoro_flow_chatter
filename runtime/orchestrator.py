@@ -164,10 +164,6 @@ async def execute_orchestrator(
 
             extra_payload_added = False
             extra_payload_index: int | None = None
-            # 发送前确保链末尾合法：tool_result 后不能直接发给 LLM
-            if response.payloads and response.payloads[-1].role == ROLE.TOOL_RESULT:
-                response.add_payload(LLMPayload(ROLE.ASSISTANT, Text("好的。")))
-                logger.debug("[KFC] LLM 发送前：末尾 tool_result 未闭合，插入 assistant 桥接")
             if extra_payload is not None:
                 extra_payload_index = len(response.payloads)
                 response.payloads.append(extra_payload)

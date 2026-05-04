@@ -169,6 +169,12 @@ async def prepare_turn_input(
                     )
                     timeout_upserted = True
             if not timeout_upserted:
+                if response.payloads and response.payloads[-1].role == ROLE.TOOL_RESULT:
+                    logger.debug(
+                        "超时触发时 response 尾部为 tool_result，"
+                        "插入 assistant 桥接 payload 以闭合工具链"
+                    )
+                    response.add_payload(LLMPayload(ROLE.ASSISTANT, Text("好的。")))
                 response.add_payload(timeout_result.payload)
         else:
             return TurnInputResult(
