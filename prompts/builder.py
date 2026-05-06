@@ -62,8 +62,8 @@ class KFCPromptBuilder:
         return await self._renderer.render_initial_context(
             chat_stream=chat_stream,
             plan=plan,
-            mental_log=getattr(session, "mental_log", None),
-            serialized_chain_payloads=list(getattr(session, "chain_payloads", []) or []),
+            mental_log=session.mental_log,
+            serialized_chain_payloads=list(session.chain_payloads or []),
             build_system_prompt_fn=self.build_system_prompt,
             build_fused_narrative_fn=self.build_fused_narrative,
         )

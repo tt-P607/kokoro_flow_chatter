@@ -32,15 +32,15 @@ def build_initial_context_plan(
 
     extra_vars["scene_state_info"] = build_scene_state_info(
         chat_stream=chat_stream,
-        scene_state=getattr(session, "scene_state", None) or SceneState(),
+        scene_state=session.scene_state or SceneState(),
     )
 
-    sched_at = getattr(session, "scheduled_proactive_at", None)
+    sched_at = session.scheduled_proactive_at
     if sched_at:
         remaining_min = max(0.0, (sched_at - time.time()) / 60)
         sched_time_str = datetime.fromtimestamp(sched_at).strftime("%H:%M")
         sched_reason = str(
-            getattr(session, "scheduled_proactive_reason", "") or ""
+            session.scheduled_proactive_reason or ""
         ).strip()
         reason_text = f"，理由：{sched_reason}" if sched_reason else ""
         extra_vars["scheduled_proactive_info"] = (
@@ -49,8 +49,8 @@ def build_initial_context_plan(
             "如需修改，可重新调用 `schedule_proactive` 工具（新预约会覆盖旧的；传 delay_minutes=0 可取消预约）。"
         )
 
-    history_summary = str(getattr(session, "history_summary", "") or "")
-    chain_cutoff_ts = getattr(session, "chain_cutoff_ts", 0.0) or 0.0
+    history_summary = session.history_summary or ""
+    chain_cutoff_ts = session.chain_cutoff_ts or 0.0
     history_before_ts = chain_cutoff_ts if chain_cutoff_ts > 0 else None
 
     return InitialContextPlan(

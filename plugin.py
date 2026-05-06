@@ -55,11 +55,9 @@ class KFCPlugin(BasePlugin):
         if isinstance(config, KFCConfig) and config.proactive.schedule_guidance:
             ScheduleProactiveAction._guidance = config.proactive.schedule_guidance
 
-        # 预注册已知聊天流的 VLM 跳过（原生多模态模式）
-        if isinstance(config, KFCConfig) and config.general.native_multimodal:
-            await self._preload_vlm_skip()
-
         # 延迟注册调度器任务：等待调度器启动
+        # 注意：VLM 跳过预注册也合并进延迟逻辑，因为 get_media_manager() 首次
+        # 实例化会启动一个清理调度任务，必须在调度器 start() 之后才能成功。
         get_task_manager().create_task(
             self._delayed_scheduler_register(),
             name="kfc_scheduler_init",
@@ -74,11 +72,15 @@ class KFCPlugin(BasePlugin):
 
         from src.kernel.scheduler import get_unified_scheduler
 
+        config = self.config
         for _ in range(30):
             await asyncio.sleep(1.0)
             try:
                 scheduler = get_unified_scheduler()
                 if getattr(scheduler, "_running", False):
+                    # 调度器已启动后再做 VLM 预注册（会触发 MediaManager 单例创建）
+                    if isinstance(config, KFCConfig) and config.general.native_multimodal:
+                        await self._preload_vlm_skip()
                     await self._register_scheduler_tasks()
                     return
             except Exception:

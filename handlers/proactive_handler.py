@@ -136,8 +136,8 @@ class ProactiveHandler(BaseEventHandler):
             if recent_msgs:
                 lines = []
                 for msg in recent_msgs:
-                    sender = getattr(msg, "sender_name", "") or "未知"
-                    content = getattr(msg, "processed_plain_text", "") or str(getattr(msg, "content", ""))
+                    sender = msg.sender_name or "未知"
+                    content = msg.processed_plain_text or str(msg.content or "")
                     lines.append(f"{sender}: {content}")
                 recent_activity = "\n".join(lines)
         except Exception as e:

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import LLMPayload
 
 from ..thinker.timeout_handler import TimeoutHandler
 
@@ -27,7 +27,12 @@ class TimeoutResult:
 
 
 class TimeoutService:
-    """封装等待超时处理与 payload 构建。"""
+    """封装等待超时处理与 payload 构建。
+
+    本服务保持纯函数：不会对 ``response.payloads`` 做任何写入，
+    调用方负责使用 ``safe_add_payload`` / ``ensure_tool_chain_closed``
+    将返回的 payload 安全合并到上下文。
+    """
 
     def __init__(self, config: KFCConfig) -> None:
         self._config = config
@@ -37,9 +42,8 @@ class TimeoutService:
         """检查是否达到超时条件。"""
         return self._handler.check_timeout(session)
 
-    def build_timeout_result(self, response: Any, session: KFCSession) -> TimeoutResult:
+    def build_timeout_result(self, session: KFCSession) -> TimeoutResult:
         """处理超时并返回追加到 response 的 user payload。"""
-        self._close_pending_tool_chain(response)
         timeout_ctx = self._handler.handle_timeout(session)
         is_final_timeout = self._handler.should_give_up(session)
 
@@ -53,13 +57,3 @@ class TimeoutService:
             max_consecutive_timeouts=self._config.wait.max_consecutive_timeouts,
         )
         return TimeoutResult(payload=payload, is_final_timeout=is_final_timeout)
-
-    @staticmethod
-    def _close_pending_tool_chain(response: Any) -> None:
-        """必要时插入 assistant 桥接 payload，闭合 tool_result 链。"""
-        if response.payloads and response.payloads[-1].role == ROLE.TOOL_RESULT:
-            logger.debug(
-                "超时触发时 response 尾部为 tool_result，"
-                "插入 assistant 桥接 payload 闭合工具链后继续处理超时"
-            )
-            response.add_payload(LLMPayload(ROLE.ASSISTANT, Text("好的。")))

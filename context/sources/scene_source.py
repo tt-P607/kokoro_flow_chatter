@@ -14,9 +14,9 @@ def build_scene_state_info(
 ) -> str:
     """把 SceneState 渲染为系统提示词中的场景状态说明。"""
     state = scene_state or SceneState()
-    platform = str(getattr(chat_stream, "platform", "unknown") or "unknown")
-    chat_type = str(getattr(chat_stream, "chat_type", "unknown") or "unknown")
-    bot_id = str(getattr(chat_stream, "bot_id", "") or "")
+    platform = chat_stream.platform or "unknown"
+    chat_type = chat_stream.chat_type or "unknown"
+    bot_id = chat_stream.bot_id or ""
     social_channel = state.social_channel.strip() or f"{platform}/{chat_type}"
     location_type = state.location_type.strip() or "unknown"
     device_assumption = "允许" if state.device_assumption_allowed else "禁止"

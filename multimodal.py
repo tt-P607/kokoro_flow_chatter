@@ -80,7 +80,7 @@ def extract_media_from_messages(
         if not media_list:
             continue
 
-        msg_id = getattr(msg, "message_id", "")
+        msg_id = msg.message_id or ""
 
         for media in media_list:
             if len(items) >= max_items:
@@ -150,7 +150,7 @@ def _get_media_list(msg: Message) -> list[dict[str, Any]]:
     Returns:
         媒体字典列表，每项为 ``{"type": str, "data": str}``
     """
-    content = getattr(msg, "content", None)
+    content = msg.content
 
     # 路径 1: content 是 dict（当前会话内存中的消息，含完整 base64）
     if isinstance(content, dict):
@@ -161,7 +161,7 @@ def _get_media_list(msg: Message) -> list[dict[str, Any]]:
                 return media
 
     # 路径 2: extra 中的 media（converter 构造时通过 **extra 传入）
-    extra = getattr(msg, "extra", {})
+    extra = msg.extra
     if isinstance(extra, dict):
         media = extra.get("media")
         if isinstance(media, list) and media:
@@ -174,7 +174,7 @@ def _get_media_list(msg: Message) -> list[dict[str, Any]]:
 
     # 路径 4: EMOJI 类型消息的原始 content（base64 字符串）
     # Bot 发送的表情包通过 send_api 构建，content 是原始 base64 数据
-    msg_type = getattr(msg, "message_type", None)
+    msg_type = msg.message_type
     if (
         msg_type is not None
         and str(msg_type) == "emoji"

@@ -12,9 +12,10 @@ from src.app.plugin_system.api.llm_api import (
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import Failure, Stop, Success, Wait
 from src.kernel.concurrency import get_watchdog
-from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import LLMPayload
 
 from ..debug.log_formatter import log_kfc_result
+from ..domain.chain_entry import ChainEntry
 from ..protocol.compat_adapter import prepare_kfc_model_set
 from ..protocol.decision_parser import parse_response_decision
 from ..protocol.response_normalizer import normalize_response
@@ -22,6 +23,7 @@ from ..services import (
     ProactiveService,
     TimeoutService,
 )
+from ..services.context_bridge import ensure_tool_chain_closed, heal_orphan_tool_results
 from .turn_controller import commit_turn_decision, prepare_turn_input
 
 if TYPE_CHECKING:
@@ -115,6 +117,7 @@ async def execute_orchestrator(
         extra_payload: LLMPayload | None = None
 
         while True:
+            heal_orphan_tool_results(response, where="loop-top")
             turn_input = await prepare_turn_input(
                 self,
                 response,
@@ -156,7 +159,7 @@ async def execute_orchestrator(
 
             if pre_send_user_text and not chain_user_pre_saved:
                 session.update_chain(
-                    [{"role": "user", "text": pre_send_user_text, "ts": last_user_ts}],
+                    [ChainEntry.user(pre_send_user_text, ts=last_user_ts).to_dict()],
                     config.prompt.max_context_payloads,
                 )
                 await self._save_session(session)
@@ -165,6 +168,9 @@ async def execute_orchestrator(
             extra_payload_added = False
             extra_payload_index: int | None = None
             if extra_payload is not None:
+                # extra_payload 是 USER，需先闭合可能仍为 tool_result 的尾部，
+                # 否则 validate_for_send 会因 tool_result→user 直连而拒绝。
+                ensure_tool_chain_closed(response, reason="extra_payload 注入")
                 extra_payload_index = len(response.payloads)
                 response.payloads.append(extra_payload)
                 extra_payload_added = True
@@ -173,18 +179,18 @@ async def execute_orchestrator(
 
             if unread_msgs:
                 known_ids: frozenset[str] = frozenset(
-                    message_id
+                    message.message_id
                     for message in unread_msgs
-                    if (message_id := getattr(message, "message_id", None)) is not None
+                    if message.message_id
                 )
             else:
                 _, current_snapshot = await self.fetch_unreads(
                     time_format="%Y-%m-%d %H:%M:%S"
                 )
                 known_ids = frozenset(
-                    message_id
+                    message.message_id
                     for message in current_snapshot
-                    if (message_id := getattr(message, "message_id", None)) is not None
+                    if message.message_id
                 )
 
             try:
@@ -231,10 +237,12 @@ async def execute_orchestrator(
             extra_payload = None
             extra_payload_index = None
 
-            call_list = getattr(response, "call_list", None) or []
+            heal_orphan_tool_results(response, where="post-send")
+
+            call_list = response.call_list or []
             if call_list:
                 logger.info(f"本轮调用列表：{[call.name for call in call_list]}")
-            elif getattr(response, "message", ""):
+            elif response.message:
                 logger.debug("[KFC] 本轮无 tool call，等待标准化器判定是否需要重试")
 
             trigger_msg = unread_msgs[-1] if unread_msgs else None

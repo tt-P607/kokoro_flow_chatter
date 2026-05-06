@@ -200,7 +200,7 @@ class KFCSession:
         """
         count = len(interrupt_msgs)
         senders = {
-            getattr(m, "sender_name", "") or getattr(m, "sender_id", "未知")
+            (m.sender_name or m.sender_id or "未知")
             for m in interrupt_msgs
         }
         sender_str = "、".join(sorted(senders))
@@ -320,7 +320,7 @@ class KFCSessionStore:
         if self._store_initialized:
             return
         try:
-            from src.kernel.storage import JSONStore
+            from src.app.plugin_system.api.storage_api import JSONStore
 
             self._json_store = JSONStore(
                 storage_dir="data/kokoro_flow_chatter/sessions"

@@ -59,7 +59,7 @@ async def send_interruptable_response(
             interrupt_msgs = [
                 message
                 for message in current_msgs
-                if getattr(message, "message_id", None) not in known_unread_ids
+                if message.message_id not in known_unread_ids
             ]
             if interrupt_msgs:
                 llm_task.cancel()

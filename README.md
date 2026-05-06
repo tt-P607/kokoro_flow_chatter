@@ -111,7 +111,6 @@ kokoro_flow_chatter/
 ├── config.py                # 配置定义（7 个 Section）
 ├── chatter.py               # 聊天器门面与 helper
 ├── parser.py                # Tool Calling 执行器兼容门面
-├── llm_compat.py            # 旧兼容导入路径（转发到 protocol/）
 ├── models.py                # 旧共享模型（事件枚举、等待配置）
 ├── domain/
 │   ├── decision.py          # 统一内部决策对象

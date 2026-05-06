@@ -7,6 +7,9 @@ from typing import Any
 
 from src.app.plugin_system.types import LLMPayload, ROLE, Text, ToolCall, ToolResult
 
+from ...domain.chain_entry import ChainEntry
+from ...models import KFCEventType
+
 # mental_log 回溯的对话消息条数：取最近 N 条消息的时间戳作为剪切点，
 # 使 mental_log 中的思考记录仅覆盖近期对话窗口。
 _MENTAL_LOG_LOOKBACK = 7
@@ -46,39 +49,46 @@ def build_current_time_payload(
 def restore_chain_payloads(
     serialized_chain_payloads: list[dict[str, Any]],
 ) -> list[LLMPayload]:
-    """从序列化的 USER/ASSISTANT pair 恢复 payload。"""
+    """从序列化的 USER/ASSISTANT pair 恢复 payload。
+
+    输入 ``list[dict]`` 经 :class:`ChainEntry` 校验后再渲染，
+    保证 ASSISTANT(tool_calls) → TOOL_RESULT 链路一定有 ASSISTANT 桥接。
+    """
+    entries: list[ChainEntry] = []
+    for raw in serialized_chain_payloads:
+        entry = ChainEntry.from_dict(raw)
+        if entry is not None:
+            entries.append(entry)
+
     payloads: list[LLMPayload] = []
-    for entry in serialized_chain_payloads:
-        role_str = str(entry.get("role", "") or "")
-        text = str(entry.get("text", "") or "")
-        has_tool_calls = bool(entry.get("tool_calls")) and role_str == "assistant"
-        if not text and not has_tool_calls:
+    for entry in entries:
+        if entry.is_user:
+            payloads.append(LLMPayload(ROLE.USER, Text(entry.text)))
             continue
-        if role_str == "user":
-            if not text:
-                continue
-            payloads.append(LLMPayload(ROLE.USER, Text(text)))
-        elif role_str == "assistant":
-            tool_calls_raw = entry.get("tool_calls")
-            if tool_calls_raw:
-                tool_calls = [
-                    ToolCall(id=tc.get("id"), name=tc["name"], args=tc.get("args", {}))
-                    for tc in tool_calls_raw
-                    if isinstance(tc, dict) and tc.get("name")
-                ]
-                if tool_calls:
-                    # 还原为 ToolCall payload，并生成对应的 ToolResult 和承接 ASSISTANT
-                    # 格式：ASSISTANT(ToolCall) → TOOL_RESULT → ASSISTANT(text) → USER
-                    payloads.append(LLMPayload(ROLE.ASSISTANT, list(tool_calls)))  # type: ignore[arg-type]
-                    tool_results = [
+        # assistant
+        if entry.has_tool_calls:
+            tool_calls = [
+                ToolCall(
+                    id=tc.get("id"),
+                    name=tc["name"],
+                    args=tc.get("args", {}),
+                )
+                for tc in entry.tool_calls
+            ]
+            # 格式：ASSISTANT(ToolCall) → TOOL_RESULT → ASSISTANT(text) → ...
+            payloads.append(LLMPayload(ROLE.ASSISTANT, list(tool_calls)))  # type: ignore[arg-type]
+            payloads.append(
+                LLMPayload(
+                    ROLE.TOOL_RESULT,
+                    [
                         ToolResult(value="ok", call_id=tc.id, name=tc.name)
                         for tc in tool_calls
-                    ]
-                    payloads.append(LLMPayload(ROLE.TOOL_RESULT, list(tool_results)))  # type: ignore[arg-type]
-                    if text:
-                        payloads.append(LLMPayload(ROLE.ASSISTANT, Text(text)))
-                    continue
-            payloads.append(LLMPayload(ROLE.ASSISTANT, Text(text)))
+                    ],  # type: ignore[arg-type]
+                )
+            )
+            payloads.append(LLMPayload(ROLE.ASSISTANT, Text(entry.text)))
+        else:
+            payloads.append(LLMPayload(ROLE.ASSISTANT, Text(entry.text)))
 
     while payloads and payloads[0].role == ROLE.ASSISTANT:
         payloads.pop(0)
@@ -91,20 +101,12 @@ def build_fused_narrative(
     before_ts: float | None = None,
 ) -> str:
     """构建聊天历史与内心独白的融合叙事。"""
-    from ...models import KFCEventType
-
-    msgs: list[Any] = list(
-        getattr(
-            getattr(chat_stream, "context", None),
-            "history_messages",
-            [],
-        )
-    )
+    msgs: list[Any] = list(chat_stream.context.history_messages)
     bot_id = str(chat_stream.bot_id or "")
     timeline: list[tuple[float, str]] = []
 
     for msg in msgs:
-        raw_time = getattr(msg, "time", None)
+        raw_time = msg.time
         if not isinstance(raw_time, (int, float)):
             continue
         ts = float(raw_time)
@@ -115,10 +117,10 @@ def build_fused_narrative(
         except (OSError, ValueError, OverflowError):
             continue
 
-        sender = getattr(msg, "sender_name", "未知")
-        sender_id = str(getattr(msg, "sender_id", ""))
-        message_id = str(getattr(msg, "message_id", "") or "")
-        text = getattr(msg, "processed_plain_text", "")
+        sender = msg.sender_name or "未知"
+        sender_id = msg.sender_id or ""
+        message_id = msg.message_id or ""
+        text = msg.processed_plain_text or ""
         if not text or not text.strip():
             continue
 
@@ -138,7 +140,7 @@ def build_fused_narrative(
     chat_timestamps = [ts for ts, _ in timeline]
     mental_cutoff = chat_timestamps[-_MENTAL_LOG_LOOKBACK] if len(chat_timestamps) >= _MENTAL_LOG_LOOKBACK else 0.0
 
-    for entry in getattr(mental_log, "entries", []) or []:
+    for entry in (mental_log.entries if mental_log else []):
         if entry.timestamp < mental_cutoff:
             continue
         ts = entry.timestamp

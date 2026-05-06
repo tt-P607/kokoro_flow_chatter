@@ -16,6 +16,8 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.stream_api import get_stream_messages
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
+from .models import KFCEventType
+
 if TYPE_CHECKING:
     from .config import KFCConfig
     from .session import KFCSession
@@ -68,7 +70,7 @@ async def compress_history(
         return
 
     # ── 2. 格式化消息文本（同 fused_narrative 格式）──
-    bot_id = str(getattr(chat_stream, "bot_id", "") or "")
+    bot_id = chat_stream.bot_id or ""
     formatted_lines: list[str] = []
 
     for msg in window_msgs:
@@ -78,13 +80,13 @@ async def compress_history(
         except (OSError, ValueError, OverflowError):
             continue
 
-        text = (getattr(msg, "processed_plain_text", "") or "").strip()
+        text = (msg.processed_plain_text or "").strip()
         if not text:
             continue
 
-        sender_id = str(getattr(msg, "sender_id", ""))
-        message_id = str(getattr(msg, "message_id", "") or "")
-        sender = getattr(msg, "sender_name", "用户")
+        sender_id = msg.sender_id or ""
+        message_id = msg.message_id or ""
+        sender = msg.sender_name or "用户"
 
         is_bot = bool(
             (bot_id and sender_id == bot_id)
@@ -195,6 +197,7 @@ def should_compress(session: "KFCSession", config: "KFCConfig") -> bool:
 
 def _msg_time(msg: Any) -> float:
     """从消息对象中提取时间戳，不存在或类型错误时返回 0.0。"""
+    # msg 可能来自 DB 层原始记录不一定是 Message 实例，这里保留 getattr。
     t = getattr(msg, "time", None)
     return float(t) if isinstance(t, (int, float)) else 0.0
 
@@ -205,9 +208,7 @@ def _merge_mental_log(
     since_ts: float,
 ) -> None:
     """将 mental_log 中的 BOT_PLANNING thought 合并入 lines。"""
-    from .models import KFCEventType
-
-    mental_log = getattr(session, "mental_log", None)
+    mental_log = session.mental_log
     if not mental_log:
         return
 

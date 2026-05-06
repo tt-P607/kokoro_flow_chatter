@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
 from src.app.plugin_system.api.llm_api import (
@@ -20,6 +21,7 @@ from src.app.plugin_system.api.llm_api import (
     create_llm_request,
 )
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.stream_api import get_stream
 from src.app.plugin_system.base import (
     BaseChatter,
     Failure,
@@ -27,18 +29,30 @@ from src.app.plugin_system.base import (
     Success,
     Wait,
 )
-from src.app.plugin_system.types import ChatType
+from src.app.plugin_system.types import ChatType, Message
 
+from .actions.reply import KFCReplyAction
 from .debug.log_formatter import format_prompt_for_log
-from .models import KFC_REPLY, DO_NOTHING
+from .mental_log import MentalLogEntry
+from .models import KFC_REPLY, DO_NOTHING, KFCEventType
+from .multimodal import (
+    ImageBudget,
+    MediaItem,
+    extract_media_from_messages,
+    get_media_list,
+)
+from .prompts.builder import KFCPromptBuilder
+from .runtime import (
+    accumulate_message_buffer,
+    execute_orchestrator,
+    send_interruptable_response,
+)
 
 if TYPE_CHECKING:
     from src.app.plugin_system.types import ChatStream
     from src.app.plugin_system.api.llm_api import ToolRegistry
 
     from .config import KFCConfig
-    from .multimodal import ImageBudget
-    from .prompts.builder import KFCPromptBuilder
     from .session import KFCSession, KFCSessionStore
 
 logger = get_logger("kfc_chatter")
@@ -75,40 +89,37 @@ class KokoroFlowChatter(BaseChatter):
         return KFCConfig()
 
     @staticmethod
-    def format_message_line(msg: Any, time_format: str = "%Y-%m-%d %H:%M:%S") -> str:  # type: ignore[override]
+    def format_message_line(msg: "Message", time_format: str = "%Y-%m-%d %H:%M:%S") -> str:  # type: ignore[override]
         """将单条消息格式化为带标签的显示行（KFC 层覆盖）。
 
-        格式：》时间》[QQ:xxx] 昵称 [\u6d88\u606fid:xxx]\uff1a \u5185\u5bb9
-        两种括号将意義明确区分，避免模型将 QQ 号与消息 ID 混淡。
+        格式：》时间》[QQ:xxx] 昵称 [消息id:xxx]： 内容
+        两种括号将含义明确区分，避免模型将 QQ 号与消息 ID 混淆。
         """
-        from datetime import datetime as _dt
-
-        raw_time = getattr(msg, "time", None)
+        raw_time = msg.time
         if isinstance(raw_time, (int, float)):
-            time_str = _dt.fromtimestamp(raw_time).strftime(time_format)
-        elif isinstance(raw_time, _dt):
+            time_str = datetime.fromtimestamp(raw_time).strftime(time_format)
+        elif isinstance(raw_time, datetime):
             time_str = raw_time.strftime(time_format)
         else:
             time_str = str(raw_time or "")
 
-        role_raw = getattr(msg, "sender_role", None)
-        role_str = BaseChatter._format_role(role_raw)
+        role_str = BaseChatter._format_role(msg.sender_role)
         role_part = f"<{role_str}> " if role_str else ""
 
-        platform_id = getattr(msg, "sender_id", "") or ""
+        platform_id = msg.sender_id or ""
         id_part = f"[QQ:{platform_id}] " if platform_id else ""
 
-        nickname = getattr(msg, "sender_name", "") or ""
-        cardname = getattr(msg, "sender_cardname", None)
+        nickname = msg.sender_name or ""
+        cardname = msg.sender_cardname
         if cardname and cardname != nickname:
             name_part = f"{nickname}${cardname}"
         else:
             name_part = nickname or "未知发送者"
 
-        message_id = getattr(msg, "message_id", "") or ""
+        message_id = msg.message_id or ""
         msg_id_part = f"[消息id:{message_id}]" if message_id else ""
 
-        content = getattr(msg, "processed_plain_text", None) or str(getattr(msg, "content", ""))
+        content = msg.processed_plain_text or str(msg.content or "")
         return f"》{time_str}》{role_part}{id_part}{name_part} {msg_id_part}： {content}"
 
     async def _get_session(self) -> KFCSession:
@@ -126,8 +137,6 @@ class KokoroFlowChatter(BaseChatter):
         config: KFCConfig,
     ) -> tuple[str, list[Any]]:
         """在积累窗口内等待并聚合连发消息。"""
-        from .runtime import accumulate_message_buffer
-
         return await accumulate_message_buffer(self, config)
 
     async def modify_llm_usables(self, llm_usables: list[Any]) -> list[Any]:  # type: ignore[override]
@@ -159,8 +168,6 @@ class KokoroFlowChatter(BaseChatter):
 
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:  # type: ignore[override]
         """执行聊天器对话循环，委托 runtime orchestrator。"""
-        from .runtime import execute_orchestrator
-
         async for result in execute_orchestrator(self):
             yield result
 
@@ -198,8 +205,6 @@ class KokoroFlowChatter(BaseChatter):
         )
 
         # 系统提示词
-        from .prompts.builder import KFCPromptBuilder
-
         prompt_builder = KFCPromptBuilder()
 
         initial_payloads, has_history = await prompt_builder.build_initial_payloads(
@@ -213,8 +218,6 @@ class KokoroFlowChatter(BaseChatter):
         # 图片预算初始化（bot 已发图片 > 用户新消息图片 > 历史补充，共用同一总配额）
         image_budget: ImageBudget | None = None
         if config.general.native_multimodal:
-            from .multimodal import ImageBudget
-
             image_budget = ImageBudget(config.general.max_images_per_payload)
             # 预扣除 bot 自身近期发送的图片，确保其始终优先占用配额
             self._deduct_bot_sent_images(chat_stream, image_budget)
@@ -233,8 +236,6 @@ class KokoroFlowChatter(BaseChatter):
         known_unread_ids: frozenset[str],
     ) -> tuple[Any | None, list[Any]]:
         """以可打断方式发送 LLM 请求。"""
-        from .runtime import send_interruptable_response
-
         return await send_interruptable_response(
             self,
             response,
@@ -262,8 +263,6 @@ class KokoroFlowChatter(BaseChatter):
         Returns:
             bool: 是否发送成功
         """
-        from .actions.reply import KFCReplyAction
-
         if trigger_msg is None:
             trigger_msg = await self._get_virtual_trigger_message()
             if trigger_msg is None:
@@ -326,26 +325,20 @@ class KokoroFlowChatter(BaseChatter):
             chat_stream: 当前聊天流
             image_budget: 图片预算追踪器（刚完成初始化，尚未有任何消耗）
         """
-        bot_id = str(getattr(chat_stream, "bot_id", "") or "")
+        bot_id = chat_stream.bot_id or ""
         if not bot_id:
             return
 
-        history_msgs = getattr(
-            getattr(chat_stream, "context", None), "history_messages", []
-        )
+        history_msgs = chat_stream.context.history_messages
         if not history_msgs:
             return
-
-        from .multimodal import extract_media_from_messages
 
         # 逆序取最近 20 条，仅保留 bot 自己发送的消息
         recent_bot_msgs = [
             m
             for m in reversed(history_msgs[-20:])
-            if str(getattr(m, "sender_id", "")) == bot_id
+            if m.sender_id == bot_id
         ]
-        if not recent_bot_msgs:
-            return
 
         bot_items = extract_media_from_messages(
             recent_bot_msgs, max_items=image_budget.remaining
@@ -377,21 +370,17 @@ class KokoroFlowChatter(BaseChatter):
         if image_budget.is_exhausted():
             return None
 
-        history_msgs = getattr(
-            getattr(chat_stream, "context", None), "history_messages", []
-        )
+        history_msgs = chat_stream.context.history_messages
         if not history_msgs:
             return None
 
-        from .multimodal import MediaItem, get_media_list
-
         # 过滤掉 bot 自身发送的消息
-        bot_id = str(getattr(chat_stream, "bot_id", "") or "")
+        bot_id = chat_stream.bot_id or ""
         recent_msgs = list(reversed(history_msgs[-20:]))
         if bot_id:
             recent_msgs = [
                 m for m in recent_msgs
-                if str(getattr(m, "sender_id", "")) != bot_id
+                if m.sender_id != bot_id
             ]
 
         if not recent_msgs:
@@ -402,7 +391,7 @@ class KokoroFlowChatter(BaseChatter):
         for msg in recent_msgs:
             if image_budget.is_exhausted() or len(items) >= image_budget.remaining:
                 break
-            msg_id = getattr(msg, "message_id", "")
+            msg_id = msg.message_id or ""
             media_list = get_media_list(msg)
             for media in media_list:
                 if len(items) >= image_budget.remaining:
@@ -458,8 +447,6 @@ class KokoroFlowChatter(BaseChatter):
         else:
             max_items = config.general.max_images_per_payload
 
-        from .multimodal import extract_media_from_messages
-
         raw_items = extract_media_from_messages(
             unread_msgs,
             max_items=max_items,
@@ -478,17 +465,13 @@ class KokoroFlowChatter(BaseChatter):
 
     async def _get_virtual_trigger_message(self) -> Any:
         """构造虚拟触发消息，用于超时主动发言等无真实触发消息的场景。"""
-        from src.app.plugin_system.api.stream_api import get_stream
-
         chat_stream = await get_stream(self.stream_id)
         if not chat_stream:
             return None
 
-        context = getattr(chat_stream, "context", None)
-        if context and hasattr(context, "history_messages") and context.history_messages:
+        context = chat_stream.context
+        if context and context.history_messages:
             return context.history_messages[-1]
-
-        from src.app.plugin_system.types import Message
 
         return Message(
             message_id="virtual_timeout_trigger",
@@ -507,12 +490,13 @@ class KokoroFlowChatter(BaseChatter):
             await store.save(session)
 
     @staticmethod
-    def _extract_timestamp(msg: Any) -> float:
+    def _extract_timestamp(msg: "Message") -> float:
         """从消息对象提取时间戳。
 
-        框架 Message.time 定义为 float | int，此处做最小防御。
+        框架 ``Message.time`` 类型为 ``datetime | float | None``，
+        这里只在 ``int|float`` 时接受，其余回退到当前时间。
         """
-        raw_time = getattr(msg, "time", None)
+        raw_time = msg.time
         if isinstance(raw_time, (int, float)):
             return float(raw_time)
         return time.time()
@@ -520,9 +504,6 @@ class KokoroFlowChatter(BaseChatter):
     @staticmethod
     def _record_reply_timing(session: KFCSession) -> None:
         """记录回复时效到活动流。"""
-        from .mental_log import MentalLogEntry
-        from .models import KFCEventType
-
         elapsed = session.waiting_config.get_elapsed_seconds()
         max_wait = session.waiting_config.max_wait_seconds
 

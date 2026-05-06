@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.types import LLMPayload, ROLE, ToolRegistry, ToolResult
+from src.app.plugin_system.types import LLMPayload, ROLE, ToolCall, ToolRegistry, ToolResult
 
 from .models import KFC_REPLY, DO_NOTHING, ToolCallResult
 
@@ -48,22 +48,16 @@ def _extract_args(raw_args: Any) -> dict[str, Any]:
     return {}
 
 
-def _ensure_call_id(call: Any) -> str:
-    """确保工具调用具备稳定的 call_id。"""
-    current_id = getattr(call, "id", None)
-    if isinstance(current_id, str) and current_id:
-        return current_id
+def _ensure_call_id(call: ToolCall) -> str:
+    """确保工具调用具备稳定的 call_id。
+
+    `ToolCall` 为 `frozen=True, slots=True` dataclass，不能用普通 `setattr` 赋值；
+    但其 `id` 字段在 slots 中已声明，可以通过 `object.__setattr__` 合法写入。
+    """
+    if isinstance(call.id, str) and call.id:
+        return call.id
     generated_id = f"call_{uuid.uuid4().hex[:8]}"
-    try:
-        setattr(call, "id", generated_id)
-    except Exception:
-        try:
-            object.__setattr__(call, "id", generated_id)
-        except Exception:
-            pass
-    resolved_id = getattr(call, "id", None)
-    if isinstance(resolved_id, str) and resolved_id:
-        return resolved_id
+    object.__setattr__(call, "id", generated_id)
     return generated_id
 
 
