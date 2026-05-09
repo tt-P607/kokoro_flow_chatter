@@ -8,7 +8,7 @@ from typing import Any
 
 from ..domain.decision import Decision, ProactiveSchedule, ToolCallSpec
 from ..models import DO_NOTHING, KFC_REPLY, ToolCallResult
-from ..parser import parse_tool_calls
+from .tool_call_adapter import build_decision_draft
 
 
 def _normalize_call_name(name: str) -> str:
@@ -113,8 +113,12 @@ async def parse_response_decision(
     run_tool_call_fn: Callable[[list[Any], Any, Any, Any | None], Awaitable[list[tuple[bool, bool]]]],
     pre_execute_hook: Callable[[ToolCallResult], None] | None = None,
 ) -> Decision:
-    """执行工具并将结果统一收敛为 Decision。"""
-    tool_result = await parse_tool_calls(
+    """将模型响应拆为草稿、执行结果，并统一收敛为 Decision。"""
+    from ..execution.decision_executor import execute_decision_draft
+
+    draft = build_decision_draft(getattr(response, "call_list", None))
+    tool_result = await execute_decision_draft(
+        draft,
         response,
         usable_map,
         trigger_msg,

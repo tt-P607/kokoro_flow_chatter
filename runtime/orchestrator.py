@@ -19,6 +19,12 @@ from ..domain.chain_entry import ChainEntry
 from ..protocol.compat_adapter import prepare_kfc_model_set
 from ..protocol.decision_parser import parse_response_decision
 from ..protocol.response_normalizer import normalize_response
+from .phase_machine import (
+    ConversationPhase,
+    phase_for_model_result,
+    phase_for_turn_start,
+)
+from .request_view import build_request_view
 from ..services import (
     ProactiveService,
     TimeoutService,
@@ -111,9 +117,16 @@ async def execute_orchestrator(
         last_user_ts = 0.0
         chain_user_pre_saved = False
         extra_payload: LLMPayload | None = None
+        phase = ConversationPhase.WAIT_INPUT
 
         while True:
             heal_orphan_tool_results(response, where="loop-top")
+            phase = phase_for_turn_start(
+                response,
+                has_pending_tool_results=has_pending_tool_results,
+            )
+            if phase is ConversationPhase.FOLLOW_UP:
+                logger.debug("[KFC] role-phase=FOLLOW_UP，跳过新增 USER 输入并续轮")
             turn_input = await prepare_turn_input(
                 self,
                 response,
@@ -157,17 +170,13 @@ async def execute_orchestrator(
                 await self._save_session(session)
                 chain_user_pre_saved = True
 
-            extra_payload_added = False
-            extra_payload_index: int | None = None
+            transient_payloads: list[LLMPayload] = []
             if extra_payload is not None:
-                # extra_payload 是 USER，需先闭合可能仍为 tool_result 的尾部，
-                # 否则 validate_for_send 会因 tool_result→user 直连而拒绝。
                 ensure_tool_chain_closed(response, reason="extra_payload 注入")
-                extra_payload_index = len(response.payloads)
-                response.payloads.append(extra_payload)
-                extra_payload_added = True
+                transient_payloads.append(extra_payload)
+            send_target = build_request_view(response, transient_payloads)
             if config.debug.show_prompt:
-                self._log_prompt(response, chain_payloads=session.chain_payloads)
+                self._log_prompt(send_target, chain_payloads=session.chain_payloads)
 
             if unread_msgs:
                 known_ids: frozenset[str] = frozenset(
@@ -186,18 +195,15 @@ async def execute_orchestrator(
                 )
 
             try:
-                if config.buffer.interrupt_enabled:
+                phase = ConversationPhase.MODEL_TURN
+                if config.buffer.interrupt_enabled and not transient_payloads:
                     new_response, interrupt_msgs = await self._send_interruptable(
                         response,
                         config,
                         known_ids,
                     )
                     if interrupt_msgs:
-                        if extra_payload_added and extra_payload_index is not None:
-                            if extra_payload_index < len(response.payloads):
-                                response.payloads.pop(extra_payload_index)
                         extra_payload = None
-                        extra_payload_index = None
                         await self.flush_unreads(unread_msgs or [])
                         session.add_interrupt_event(interrupt_msgs)
                         await self._save_session(session)
@@ -207,27 +213,19 @@ async def execute_orchestrator(
                 else:
                     watchdog = get_watchdog()
                     watchdog.feed_dog(self.stream_id)
-                    response = await response.send(auto_append_response=True, stream=False)
-                    await response
+                    response = await send_target.send(auto_append_response=True, stream=False)
                     watchdog.feed_dog(self.stream_id)
                     normalize_response(response)
                 await self.flush_unreads(unread_msgs if unread_msgs else [])
             except Exception as exc:
                 logger.error(f"LLM 请求失败: {exc}", exc_info=True)
-                if extra_payload_added and extra_payload_index is not None:
-                    if extra_payload_index < len(response.payloads):
-                        response.payloads.pop(extra_payload_index)
                 extra_payload = None
-                extra_payload_index = None
                 await self._save_session(session)
                 yield Failure("LLM 请求失败", exc)
                 break
 
-            if extra_payload_added and extra_payload_index is not None:
-                if extra_payload_index < len(response.payloads):
-                    response.payloads.pop(extra_payload_index)
             extra_payload = None
-            extra_payload_index = None
+            phase = phase_for_model_result(response)
 
             heal_orphan_tool_results(response, where="post-send")
 
@@ -240,6 +238,7 @@ async def execute_orchestrator(
             trigger_msg = unread_msgs[-1] if unread_msgs else None
             if trigger_msg is None:
                 trigger_msg = await self._get_virtual_trigger_message()
+            phase = ConversationPhase.TOOL_EXEC if call_list else ConversationPhase.COMMIT
             decision = await parse_response_decision(
                 response,
                 usable_map,
@@ -259,6 +258,7 @@ async def execute_orchestrator(
                 except Exception as exc:
                     logger.warning(f"[KFC] schedule_proactive 参数解析失败: {exc}")
 
+            phase = ConversationPhase.COMMIT
             turn_control = await commit_turn_decision(
                 self,
                 decision,

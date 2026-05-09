@@ -165,9 +165,9 @@ async def prepare_turn_input(
                 logger.debug("[KFC] Upsert USER payload（打断重来合并新消息）")
         if not upserted:
             response.add_payload(user_payload)
-    elif trigger is TurnTrigger.TOOL_CONTINUE:
+    elif trigger is TurnTrigger.FOLLOWUP_TOOL_RESULT:
         has_pending_tool_results = False
-    elif trigger is TurnTrigger.TIMEOUT:
+    elif trigger is TurnTrigger.TIMEOUT_EXPIRED:
         timeout_result = timeout_service.build_timeout_result(session)
         is_final_timeout = timeout_result.is_final_timeout
         timeout_upserted = False

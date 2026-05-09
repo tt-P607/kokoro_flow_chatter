@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 from typing import Any
 
-from src.app.plugin_system.types import LLMPayload, ROLE, Text, ToolCall, ToolResult
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 from ...domain.chain_entry import ChainEntry
 from ...models import KFCEventType
@@ -49,10 +49,15 @@ def build_current_time_payload(
 def restore_chain_payloads(
     serialized_chain_payloads: list[dict[str, Any]],
 ) -> list[LLMPayload]:
-    """从序列化的 USER/ASSISTANT pair 恢复 payload。
+    """从序列化的 USER/ASSISTANT pair 恢复可读历史 payload。
 
-    输入 ``list[dict]`` 经 :class:`ChainEntry` 校验后再渲染，
-    保证 ASSISTANT(tool_calls) → TOOL_RESULT 链路一定有 ASSISTANT 桥接。
+    ``chain_payloads`` 中的 ``tool_calls`` 只作为审计/调试数据持久化，
+    不再还原为 ``ASSISTANT(tool_calls) -> TOOL_RESULT -> ASSISTANT(text)``。
+    原还原方式会把 ``kfc_reply.content`` 暴露在 tool call 参数中，同时又把
+    同一回复作为 assistant 文本放入上下文，造成模型输入层面的重复。
+
+    运行期尚未完成的 tool-call 链仍由 ``response.payloads`` 保持；跨 execute
+    重载的历史链只需要保留用户可读对话文本，动作细节由 ``mental_log`` 提供。
     """
     entries: list[ChainEntry] = []
     for raw in serialized_chain_payloads:
@@ -65,30 +70,7 @@ def restore_chain_payloads(
         if entry.is_user:
             payloads.append(LLMPayload(ROLE.USER, Text(entry.text)))
             continue
-        # assistant
-        if entry.has_tool_calls:
-            tool_calls = [
-                ToolCall(
-                    id=tc.get("id"),
-                    name=tc["name"],
-                    args=tc.get("args", {}),
-                )
-                for tc in entry.tool_calls
-            ]
-            # 格式：ASSISTANT(ToolCall) → TOOL_RESULT → ASSISTANT(text) → ...
-            payloads.append(LLMPayload(ROLE.ASSISTANT, list(tool_calls)))  # type: ignore[arg-type]
-            payloads.append(
-                LLMPayload(
-                    ROLE.TOOL_RESULT,
-                    [
-                        ToolResult(value="ok", call_id=tc.id, name=tc.name)
-                        for tc in tool_calls
-                    ],  # type: ignore[arg-type]
-                )
-            )
-            payloads.append(LLMPayload(ROLE.ASSISTANT, Text(entry.text)))
-        else:
-            payloads.append(LLMPayload(ROLE.ASSISTANT, Text(entry.text)))
+        payloads.append(LLMPayload(ROLE.ASSISTANT, Text(entry.text)))
 
     while payloads and payloads[0].role == ROLE.ASSISTANT:
         payloads.pop(0)
@@ -141,6 +123,8 @@ def build_fused_narrative(
     mental_cutoff = chat_timestamps[-_MENTAL_LOG_LOOKBACK] if len(chat_timestamps) >= _MENTAL_LOG_LOOKBACK else 0.0
 
     for entry in (mental_log.entries if mental_log else []):
+        if not isinstance(entry.timestamp, (int, float)):
+            continue
         if entry.timestamp < mental_cutoff:
             continue
         ts = entry.timestamp

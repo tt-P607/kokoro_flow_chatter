@@ -30,10 +30,11 @@ class ChainEntry:
     Attributes:
         role: 仅允许 ``"user"`` 或 ``"assistant"``。
         text: 显式文本；``user`` 不得为空，``assistant`` 在含 ``tool_calls``
-            时若为空会自动用 ``"好的。"`` 占位（避免还原后 USER 紧贴
-            TOOL_RESULT 触发 ``LLMContextError``）。
+            时若为空会自动用 ``"好的。"`` 占位，避免存档里出现无法
+            还原为可读历史的空 assistant。
         tool_calls: 仅 assistant 使用，每条形如
             ``{"id": str | None, "name": str, "args": dict | str}``。
+            该字段只用于审计/调试，不在历史读取时重新注入模型上下文。
         ts: 仅 user 使用；assistant 可省略。
     """
 
@@ -58,7 +59,7 @@ class ChainEntry:
         """构造 ASSISTANT 条目。
 
         当 ``tool_calls`` 非空但 ``text`` 为空时，自动填占位 ``"好的。"``，
-        以保证 :func:`restore_chain_payloads` 还原时一定有 ASSISTANT 桥接。
+        确保存档仍能还原出可读的 assistant 历史消息。
         """
         calls = list(tool_calls or [])
         if calls and not text:

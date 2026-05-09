@@ -78,7 +78,7 @@ class KFCPromptBuilder:
         media_items: list[Any] | None = None,
         stream_id: str = "",
         chat_stream: ChatStream | None = None,
-    ) -> tuple[LLMPayload, LLMPayload | None]:
+    ) -> tuple[LLMPayload, LLMPayload | None, str]:
         """构建用户消息 Payload。
 
         将格式化的未读消息构建为一个 USER 角色的 Payload。
