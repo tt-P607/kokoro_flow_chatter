@@ -52,41 +52,75 @@ class ContextRenderer:
         | None = None,
         build_fused_narrative_fn: Callable[[ChatStream, Any, float | None], str]
         | None = None,
-    ) -> tuple[list[LLMPayload], bool]:
-        """渲染 execute 启动时需要的初始 payload 列表。"""
-        payloads: list[LLMPayload] = []
+    ) -> tuple[list[LLMPayload], list[LLMPayload], bool]:
+        """渲染 execute 启动时需要的初始 payload 列表。
+
+        Returns:
+            tuple: (system_payloads, chain_payloads, has_history)
+                - system_payloads: 系统 Payload 列表（通过 add_payload 注入，触发 reminder）
+                - chain_payloads: 历史链 Payload 列表（直接追加，绕过 context manager 避免
+                  对历史 USER 重复注入 system_reminder）
+                - has_history: 是否存在历史内容
+        """
+        system_payloads: list[LLMPayload] = []
 
         system_prompt_builder = build_system_prompt_fn or self.build_system_prompt
         fused_narrative_builder = (
             build_fused_narrative_fn or self.build_fused_narrative
         )
 
+        # 1. 构建各部分文本
         system_prompt = await system_prompt_builder(
             chat_stream,
             plan.system_extra_vars,
         )
-        payloads.append(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
+        from .sources.history_source import (
+            build_history_summary_payload,
+            build_current_time_payload,
+        )
+
+        summary_text = ""
         summary_payload = build_history_summary_payload(
             chat_stream,
             plan.history_summary,
         )
         if summary_payload is not None:
-            payloads.append(summary_payload)
+            for item in summary_payload.content:
+                if hasattr(item, "text"):
+                    summary_text += item.text  # type: ignore[attr-defined]
 
-        chain_payloads = restore_history_chain_payloads(serialized_chain_payloads)
         history_text = fused_narrative_builder(
             chat_stream,
             mental_log,
             plan.history_before_ts,
         )
-        if history_text:
-            payloads.append(LLMPayload(ROLE.SYSTEM, Text(history_text)))
-        else:
-            payloads.append(build_current_time_payload())
+        if not history_text:
+            time_payload = build_current_time_payload()
+            for item in time_payload.content:
+                if hasattr(item, "text"):
+                    history_text += item.text  # type: ignore[attr-defined]
 
-        payloads.extend(chain_payloads)
-        return payloads, bool(history_text) or bool(chain_payloads)
+        # 2. 拆分为两个 SYSTEM Payload 以优化缓存命中
+        # Payload 1: 静态部分 (人设/准则/平台信息) - 几乎永远不变，缓存价值最高
+        system_payloads.append(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+
+        # Payload 2: 动态部分 (记忆摘要/融合叙事) - 随对话进度变化
+        dynamic_parts: list[str] = []
+        if summary_text:
+            dynamic_parts.append(summary_text)
+        if history_text:
+            dynamic_parts.append(history_text)
+
+        if dynamic_parts:
+            merged_dynamic_text = "\n\n---\n\n".join(dynamic_parts)
+            system_payloads.append(LLMPayload(ROLE.SYSTEM, Text(merged_dynamic_text)))
+
+        # 3. 恢复工具调用链 — 独立返回，绕过 add_payload 避免
+        #    context manager 对历史 USER 重复注入 system_reminder
+        chain_payloads = restore_history_chain_payloads(serialized_chain_payloads)
+
+        return system_payloads, chain_payloads, bool(history_text) or bool(chain_payloads)
 
     async def build_system_prompt(
         self,
@@ -118,8 +152,13 @@ class ContextRenderer:
         self,
         plan: ContextPlan,
         media_items: list[Any] | None = None,
-    ) -> tuple[LLMPayload, LLMPayload | None]:
-        """将 ContextPlan 渲染为用户 payload。"""
+    ) -> tuple[LLMPayload, LLMPayload | None, str]:
+        """将 ContextPlan 渲染为用户 payload。
+
+        Returns:
+            tuple: (user_payload, extra_payload | None, chain_text)
+                - chain_text: 仅含原始消息内容，不含末尾强调指令，用于链持久化
+        """
         content: Content | list[Content]
         if media_items:
             from ..multimodal import build_multimodal_content
@@ -130,7 +169,7 @@ class ContextRenderer:
 
         user_payload = LLMPayload(ROLE.USER, content)  # type: ignore[arg-type]
         extra_payload = self.render_turn_contributions(plan.contributions)
-        return user_payload, extra_payload
+        return user_payload, extra_payload, plan.chain_text or plan.user_text
 
     def render_turn_contributions(
         self,

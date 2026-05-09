@@ -38,6 +38,7 @@ class TurnControlResult:
     return_after_yield: bool = False
     has_pending_tool_results: bool = False
     is_final_timeout: bool = False
+    chain_assistant_saved: bool = False
 
 
 def build_chain_assistant_entry(
@@ -61,10 +62,10 @@ class TurnInputResult:
     extra_payload: LLMPayload | None = None
     next_signal: Wait | None = None
     continue_loop: bool = False
-    history_images_injected: bool = False
     has_pending_tool_results: bool = False
     is_final_timeout: bool = False
     formatted_unreads: str = ""
+    wrapped_user_text: str = ""
 
 
 async def prepare_turn_input(
@@ -75,9 +76,6 @@ async def prepare_turn_input(
     session: KFCSession,
     prompt_builder: KFCPromptBuilder,
     timeout_service: TimeoutService,
-    image_budget: Any,
-    has_history: bool,
-    history_images_injected: bool,
     has_pending_tool_results: bool,
 ) -> TurnInputResult:
     """准备一轮 LLM 调用前的触发输入。"""
@@ -107,9 +105,9 @@ async def prepare_turn_input(
             unread_msgs=[],
             next_signal=Wait(0),
             continue_loop=True,
-            history_images_injected=history_images_injected,
             has_pending_tool_results=has_pending_tool_results,
             is_final_timeout=is_final_timeout,
+            wrapped_user_text="",
         )
 
     if trigger is TurnTrigger.NEW_MESSAGES:
@@ -133,35 +131,18 @@ async def prepare_turn_input(
             chatter._record_reply_timing(session)
             session.clear_waiting()
 
-        media_items = chatter._extract_media(
-            unread_msgs,
-            config,
-            image_budget,
-        )
+        media_items = None
+        if config.general.native_multimodal:
+            from ..multimodal import extract_images_from_messages
+            images = extract_images_from_messages(unread_msgs)
+            if images:
+                media_items = images
 
-        if (
-            not history_images_injected
-            and has_history
-            and image_budget is not None
-            and not image_budget.is_exhausted()
-        ):
-            history_images_injected = True
-            history_imgs = chatter._extract_history_media(
-                chat_stream,
-                image_budget,
-            )
-            from ..services import MultimodalService
-
-            history_payload = MultimodalService.build_history_reference_payload(
-                history_imgs or []
-            )
-            if history_payload is not None:
-                response.add_payload(history_payload)
-
-        user_payload, extra_payload = await prompt_builder.build_user_payload(
+        user_payload, extra_payload, wrapped_user_text = await prompt_builder.build_user_payload(
             formatted_unreads=formatted_text,
             media_items=media_items,
             stream_id=chatter.stream_id,
+            chat_stream=chat_stream,
         )
 
         ensure_tool_chain_closed(response, reason="新消息到达")
@@ -213,10 +194,10 @@ async def prepare_turn_input(
         response=response,
         unread_msgs=unread_msgs,
         extra_payload=extra_payload,
-        history_images_injected=history_images_injected,
         has_pending_tool_results=has_pending_tool_results,
         is_final_timeout=is_final_timeout,
         formatted_unreads=formatted_text,
+        wrapped_user_text=wrapped_user_text,
     )
 
 
@@ -251,6 +232,7 @@ async def commit_turn_decision(
         for tc in call_list
         if hasattr(tc, "name") and hasattr(tc, "args")
     ]
+    chain_assistant_saved = False
     if pre_send_user_text and (assistant_text or serialized_tool_calls):
         assistant_entry = build_chain_assistant_entry(
             assistant_text, serialized_tool_calls
@@ -269,6 +251,7 @@ async def commit_turn_decision(
                 config.prompt.max_context_payloads,
             )
         await chatter._save_session(session)
+        chain_assistant_saved = True
         session.compress_round_count += 1
         SummaryService.maybe_schedule_compression(
             session,
@@ -305,6 +288,7 @@ async def commit_turn_decision(
             continue_loop=True,
             has_pending_tool_results=True,
             is_final_timeout=is_final_timeout,
+            chain_assistant_saved=chain_assistant_saved,
         )
     if (
         decision.has_third_party_calls
@@ -318,6 +302,7 @@ async def commit_turn_decision(
             continue_loop=True,
             has_pending_tool_results=True,
             is_final_timeout=is_final_timeout,
+            chain_assistant_saved=chain_assistant_saved,
         )
 
     wait_seconds = config.wait.apply_rules(
@@ -342,6 +327,7 @@ async def commit_turn_decision(
             next_signal=Wait(0),
             continue_loop=True,
             is_final_timeout=is_final_timeout,
+            chain_assistant_saved=chain_assistant_saved,
         )
 
     session.clear_waiting()

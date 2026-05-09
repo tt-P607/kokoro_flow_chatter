@@ -35,12 +35,6 @@ from .actions.reply import KFCReplyAction
 from .debug.log_formatter import format_prompt_for_log
 from .mental_log import MentalLogEntry
 from .models import KFC_REPLY, DO_NOTHING, KFCEventType
-from .multimodal import (
-    ImageBudget,
-    MediaItem,
-    extract_media_from_messages,
-    get_media_list,
-)
 from .prompts.builder import KFCPromptBuilder
 from .runtime import (
     accumulate_message_buffer,
@@ -179,11 +173,11 @@ class KokoroFlowChatter(BaseChatter):
         config: KFCConfig,
         session: KFCSession,
         model_set: Any,
-    ) -> tuple[Any, ImageBudget | None, ToolRegistry, KFCPromptBuilder, bool]:
-        """构建初始 LLM 上下文（系统提示 + 工具注册 + 图片预算）。
+    ) -> tuple[Any, ToolRegistry, KFCPromptBuilder, bool]:
+        """构建初始 LLM 上下文（系统提示 + 工具注册）。
 
         组装 LLM 请求所需的全部初始 payload：系统提示词、人物关系、
-        图片预算与历史叙事，并注册可用工具。
+        历史叙事，并注册可用工具。
 
         Args:
             chat_stream: 当前聊天流
@@ -192,11 +186,9 @@ class KokoroFlowChatter(BaseChatter):
             model_set: LLM 模型配置
 
         Returns:
-            tuple: (request, image_budget, usable_map, prompt_builder, has_history)
+            tuple: (request, usable_map, prompt_builder, has_history)
         """
-        context_manager = LLMContextManager(
-            max_payloads=config.prompt.max_context_payloads
-        )
+        context_manager = LLMContextManager()
         request = create_llm_request(
             model_set,
             "kokoro_flow_chatter",
@@ -207,25 +199,27 @@ class KokoroFlowChatter(BaseChatter):
         # 系统提示词
         prompt_builder = KFCPromptBuilder()
 
-        initial_payloads, has_history = await prompt_builder.build_initial_payloads(
-            chat_stream,
-            config,
-            session,
+        system_payloads, chain_payloads, has_history = (
+            await prompt_builder.build_initial_payloads(
+                chat_stream,
+                config,
+                session,
+            )
         )
-        for payload in initial_payloads:
+        # 系统 Payload 通过 add_payload 注入（触发 context manager 的
+        # _apply_reminders 将 system_reminder 注入到末尾 USER）
+        for payload in system_payloads:
             request.add_payload(payload)
 
-        # 图片预算初始化（bot 已发图片 > 用户新消息图片 > 历史补充，共用同一总配额）
-        image_budget: ImageBudget | None = None
-        if config.general.native_multimodal:
-            image_budget = ImageBudget(config.general.max_images_per_payload)
-            # 预扣除 bot 自身近期发送的图片，确保其始终优先占用配额
-            self._deduct_bot_sent_images(chat_stream, image_budget)
+        # 链 Payload 直接追加，绕过 context manager 避免对历史
+        # USER 重复注入 system_reminder（防止缓存命中率下降）
+        if chain_payloads:
+            request.payloads.extend(chain_payloads)
 
         # ── 注册工具（原生 Tool Calling） ──
         usable_map = await self.inject_usables(request)
 
-        return request, image_budget, usable_map, prompt_builder, has_history
+        return request, usable_map, prompt_builder, has_history
 
     # ── 可打断 LLM 调用 ─────────────────────────────────────
 
@@ -282,11 +276,12 @@ class KokoroFlowChatter(BaseChatter):
     # ── 辅助方法 ────────────────────────────────────────────
 
     def _register_vlm_skip(self) -> None:
-        """为当前聊天流注册 VLM 跳过。
+        """为当前聊天流注册 image 类型的 VLM 跳过。
 
         在 native_multimodal 模式下，KFC 直接将原始图片数据打包进
         LLM payload，由主模型理解图片内容。框架的 VLM 管线会将图片
         转述为文本描述，这对 KFC 是冗余操作。
+        表情包仍走 VLM 文字描述，以利用其哈希缓存。
 
         此方法在 execute() 开头调用，确保后续到达的消息不再触发 VLM。
         调用是幂等的——多次注册同一 stream_id 不会产生副作用。
@@ -294,7 +289,7 @@ class KokoroFlowChatter(BaseChatter):
         try:
             from src.core.managers.media_manager import get_media_manager
 
-            get_media_manager().skip_vlm_for_stream(self.stream_id)
+            get_media_manager().skip_vlm_for_stream(self.stream_id, ["image"])
         except Exception as e:
             logger.debug(f"注册 VLM 跳过失败（不影响功能）: {e}")
 
@@ -310,158 +305,6 @@ class KokoroFlowChatter(BaseChatter):
             get_media_manager().unskip_vlm_for_stream(self.stream_id)
         except Exception as e:
             logger.debug(f"注销 VLM 跳过失败: {e}")
-
-    def _deduct_bot_sent_images(
-        self,
-        chat_stream: Any,
-        image_budget: Any,
-    ) -> None:
-        """从预算中预扣除 bot 自身近期发送的图片数量。
-
-        bot 已发图片优先级最高，在图片预算初始化后立即调用，
-        使后续的用户新消息图片和历史图片只能使用剩余配额。
-
-        Args:
-            chat_stream: 当前聊天流
-            image_budget: 图片预算追踪器（刚完成初始化，尚未有任何消耗）
-        """
-        bot_id = chat_stream.bot_id or ""
-        if not bot_id:
-            return
-
-        history_msgs = chat_stream.context.history_messages
-        if not history_msgs:
-            return
-
-        # 逆序取最近 20 条，仅保留 bot 自己发送的消息
-        recent_bot_msgs = [
-            m
-            for m in reversed(history_msgs[-20:])
-            if m.sender_id == bot_id
-        ]
-
-        bot_items = extract_media_from_messages(
-            recent_bot_msgs, max_items=image_budget.remaining
-        )
-        if bot_items:
-            image_budget.consume(len(bot_items))
-            logger.debug(
-                f"多模态: bot 已发图片预扣除 {len(bot_items)} 张"
-                f" (剩余配额 {image_budget.remaining})"
-            )
-
-    def _extract_history_media(
-        self,
-        chat_stream: Any,
-        image_budget: Any,
-    ) -> list[Any] | None:
-        """从聊天历史中提取用户侧图片，用剩余预算填充，最新优先。
-
-        在 bot 已发图片（预扣除）和用户新消息图片（优先消耗）之后调用，
-        仅扫描非 bot 发送的历史消息，避免与预扣除步骤重复计算。
-
-        Args:
-            chat_stream: 当前聊天流
-            image_budget: 图片预算追踪器（已被 bot 图片和用户新消息消耗了对应配额）
-
-        Returns:
-            list | None: 历史图片列表，无可用图片或预算耗尽时返回 None
-        """
-        if image_budget.is_exhausted():
-            return None
-
-        history_msgs = chat_stream.context.history_messages
-        if not history_msgs:
-            return None
-
-        # 过滤掉 bot 自身发送的消息
-        bot_id = chat_stream.bot_id or ""
-        recent_msgs = list(reversed(history_msgs[-20:]))
-        if bot_id:
-            recent_msgs = [
-                m for m in recent_msgs
-                if m.sender_id != bot_id
-            ]
-
-        if not recent_msgs:
-            return None
-
-        items: list[MediaItem] = []
-
-        for msg in recent_msgs:
-            if image_budget.is_exhausted() or len(items) >= image_budget.remaining:
-                break
-            msg_id = msg.message_id or ""
-            media_list = get_media_list(msg)
-            for media in media_list:
-                if len(items) >= image_budget.remaining:
-                    break
-                if media.get("type") not in ("image", "emoji"):
-                    continue
-                data = media.get("data", "")
-                if not data:
-                    continue
-                items.append(
-                    MediaItem(
-                        media_type=media["type"],
-                        base64_data=data,
-                        source_message_id=msg_id,
-                    )
-                )
-
-        if not items:
-            return None
-
-        image_budget.consume(len(items))
-        logger.debug(
-            f"历史多模态: 提取到 {len(items)} 张用户图片/表情包"
-            f" (剩余配额 {image_budget.remaining})"
-        )
-        return items
-
-    def _extract_media(
-        self,
-        unread_msgs: list[Any],
-        config: KFCConfig,
-        image_budget: Any | None = None,
-    ) -> list[Any] | None:
-        """从未读消息中提取多模态图片数据。
-
-        Args:
-            unread_msgs: 未读消息列表
-            config: KFC 配置
-            image_budget: 图片预算追踪器，为 None 时使用 max_images_per_payload
-
-        Returns:
-            list | None: 图片列表，未启用或无图片时返回 None
-        """
-        if not config.general.native_multimodal:
-            return None
-
-        # 确定本次提取的配额
-        if image_budget is not None:
-            if image_budget.is_exhausted():
-                logger.debug(" 原生多模态: 图片配额已用尽，跳过提取")
-                return None
-            max_items = image_budget.remaining
-        else:
-            max_items = config.general.max_images_per_payload
-
-        raw_items = extract_media_from_messages(
-            unread_msgs,
-            max_items=max_items,
-        )
-        if raw_items:
-            if image_budget is not None:
-                image_budget.consume(len(raw_items))
-            logger.debug(
-                f" 原生多模态: 提取到 {len(raw_items)} 张图片"
-                f" (配额剩余 {image_budget.remaining if image_budget else 'N/A'})"
-            )
-            return raw_items
-
-        logger.debug(" 原生多模态: 未读消息中无图片")
-        return None
 
     async def _get_virtual_trigger_message(self) -> Any:
         """构造虚拟触发消息，用于超时主动发言等无真实触发消息的场景。"""

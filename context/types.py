@@ -50,6 +50,8 @@ class ContextPlan:
 
     user_text: str
     contributions: list[ContextContribution] = field(default_factory=list)
+    # 仅含原始消息内容，不含末尾强调指令/平台信息，用于链持久化
+    chain_text: str = ""
 
 
 @dataclass(slots=True)

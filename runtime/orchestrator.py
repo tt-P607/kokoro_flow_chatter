@@ -56,10 +56,8 @@ async def execute_orchestrator(
     session = await self._get_session()
     timeout_service = TimeoutService(config)
 
-    vlm_registered = False
     if config.general.native_multimodal:
         self._register_vlm_skip()
-        vlm_registered = True
 
     try:
         model_set = None
@@ -97,7 +95,6 @@ async def execute_orchestrator(
 
         (
             response,
-            image_budget,
             usable_map,
             prompt_builder,
             has_history,
@@ -108,7 +105,6 @@ async def execute_orchestrator(
             model_set,
         )
 
-        history_images_injected = False
         has_pending_tool_results = False
         is_final_timeout = False
         pre_send_user_text = ""
@@ -126,15 +122,11 @@ async def execute_orchestrator(
                 session,
                 prompt_builder,
                 timeout_service,
-                image_budget,
-                has_history,
-                history_images_injected,
                 has_pending_tool_results,
             )
             response = turn_input.response
             unread_msgs = turn_input.unread_msgs
             extra_payload = turn_input.extra_payload
-            history_images_injected = turn_input.history_images_injected
             has_pending_tool_results = turn_input.has_pending_tool_results
             is_final_timeout = turn_input.is_final_timeout
 
@@ -149,10 +141,10 @@ async def execute_orchestrator(
                     default=time.time(),
                 )
 
-            # 用原始 formatted_unreads 而非从 payloads 反向提取，
-            # 避免 _apply_reminders 把 reminder 前缀混入持久化的 user text
-            if turn_input.formatted_unreads:
-                new_user_text = turn_input.formatted_unreads
+            # wrapped_user_text 是 chain_text（仅含原始消息内容），
+            # 不含末尾强调指令/平台信息/system_reminder，避免这些临时提示词被持久化进链。
+            if turn_input.wrapped_user_text:
+                new_user_text = turn_input.wrapped_user_text
                 if new_user_text != pre_send_user_text:
                     pre_send_user_text = new_user_text
                     chain_user_pre_saved = False
@@ -285,6 +277,11 @@ async def execute_orchestrator(
             if turn_control.has_pending_tool_results:
                 has_pending_tool_results = True
 
+            # assistant entry 已写入链，清空 pre_send_user_text 防止下一轮续轮重复持久化
+            if turn_control.chain_assistant_saved:
+                chain_user_pre_saved = True
+                pre_send_user_text = ""
+
             if turn_control.next_signal is not None:
                 yield turn_control.next_signal
             if turn_control.return_after_yield:
@@ -293,5 +290,5 @@ async def execute_orchestrator(
                 continue
 
     finally:
-        if vlm_registered:
+        if config.general.native_multimodal:
             self._unregister_vlm_skip()

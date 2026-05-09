@@ -52,8 +52,12 @@ class KFCPromptBuilder:
         chat_stream: ChatStream,
         config: Any,
         session: Any,
-    ) -> tuple[list[LLMPayload], bool]:
-        """构建 execute 启动所需的初始 payload 列表。"""
+    ) -> tuple[list[LLMPayload], list[LLMPayload], bool]:
+        """构建 execute 启动所需的初始 payload 列表。
+
+        Returns:
+            tuple: (system_payloads, chain_payloads, has_history)
+        """
         plan = self._planner.plan_initial_context(
             chat_stream=chat_stream,
             config=config,
@@ -73,6 +77,7 @@ class KFCPromptBuilder:
         formatted_unreads: str,
         media_items: list[Any] | None = None,
         stream_id: str = "",
+        chat_stream: ChatStream | None = None,
     ) -> tuple[LLMPayload, LLMPayload | None]:
         """构建用户消息 Payload。
 
@@ -89,15 +94,18 @@ class KFCPromptBuilder:
             formatted_unreads: 格式化后的未读消息文本
             media_items: 多模态图片列表（可选，来自 extract_media_from_messages）
             stream_id: 当前聊天流 ID（供 on_prompt_build 事件处理器读取）
+            chat_stream: 当前聊天流，用于构建末尾的平台身份和强调信息
 
         Returns:
-            tuple: (user_payload, extra_payload | None)
+            tuple: (user_payload, extra_payload | None, chain_text)
                 - user_payload: USER 角色的 Payload（进入持久历史）
                 - extra_payload: 注入内容的独立 USER Payload（临时，不进历史），无注入时为 None
+                - chain_text: 仅含原始消息内容，不含末尾强调指令，用于链持久化
         """
         plan = await self._planner.plan_user_turn(
             formatted_unreads=formatted_unreads,
             stream_id=stream_id,
+            chat_stream=chat_stream,
         )
         return self._renderer.render_user_payload(plan, media_items=media_items)
 
