@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .compat_adapter import is_deepseek_model_set, try_parse_tool_call_compat_response
+from .compat_adapter import try_parse_tool_call_compat_response
 
 
 @dataclass(slots=True)
@@ -46,7 +46,7 @@ def normalize_response(response: Any) -> NormalizedResponse:
         response.message = resolved_text
 
     used_compat_tool_calls = False
-    if not getattr(response, "call_list", None) and is_deepseek_model_set(getattr(response, "model_set", None)):
+    if not getattr(response, "call_list", None):
         used_compat_tool_calls = try_parse_tool_call_compat_response(response)
 
     normalized_text, _ = resolve_response_text(response)

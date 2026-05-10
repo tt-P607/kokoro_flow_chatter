@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 from src.app.plugin_system.api.log_api import get_logger
 from src.kernel.concurrency import get_task_manager
 
+from .unread_policy import filter_interrupt_messages
+
 if TYPE_CHECKING:
     from ..chatter import KokoroFlowChatter
     from ..config import KFCConfig
@@ -22,7 +24,11 @@ async def send_interruptable_response(
     config: KFCConfig,
     known_unread_ids: frozenset[str],
 ) -> tuple[Any | None, list[Any]]:
-    """以可打断方式发送 LLM 请求。"""
+    """以可打断方式发送 LLM 请求。
+
+    只有真实用户消息可以打断正在生成的 LLM 响应；KFC 内部主动触发消息
+    不应取消当前输出，否则定时任务与正常回复撞车时会“卡掉”模型返回。
+    """
 
     async def _llm_work() -> Any:
         from src.kernel.concurrency import get_watchdog
@@ -56,11 +62,10 @@ async def send_interruptable_response(
             _, current_msgs = await chatter.fetch_unreads(
                 time_format="%Y-%m-%d %H:%M:%S"
             )
-            interrupt_msgs = [
-                message
-                for message in current_msgs
-                if message.message_id not in known_unread_ids
-            ]
+            interrupt_msgs = filter_interrupt_messages(
+                current_msgs,
+                known_unread_ids,
+            )
             if interrupt_msgs:
                 llm_task.cancel()
                 try:

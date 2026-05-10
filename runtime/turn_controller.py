@@ -15,6 +15,7 @@ from ..domain.turn_trigger import TurnTrigger, classify_turn_trigger
 from ..models import WaitingConfig
 from ..services import SummaryService
 from ..services.context_bridge import ensure_tool_chain_closed
+from .unread_policy import format_unread_messages, prefer_real_unreads
 
 if TYPE_CHECKING:
     from ..config import KFCConfig
@@ -68,6 +69,7 @@ class TurnInputResult:
     wrapped_user_text: str = ""
 
 
+
 async def prepare_turn_input(
     chatter: KokoroFlowChatter,
     response: Any,
@@ -82,8 +84,11 @@ async def prepare_turn_input(
     formatted_text, unread_msgs = await chatter.fetch_unreads(
         time_format="%Y-%m-%d %H:%M:%S"
     )
+    unread_msgs = await prefer_real_unreads(chatter, unread_msgs)
+    formatted_text = format_unread_messages(chatter, unread_msgs)
     extra_payload: LLMPayload | None = None
     is_final_timeout = False
+    wrapped_user_text = ""
 
     has_unread = bool(formatted_text and unread_msgs)
     is_timeout = (
@@ -112,6 +117,10 @@ async def prepare_turn_input(
 
     if trigger is TurnTrigger.NEW_MESSAGES:
         formatted_text, unread_msgs = await chatter._accumulate_messages(config)
+        unread_msgs = await prefer_real_unreads(chatter, unread_msgs)
+        formatted_text = format_unread_messages(chatter, unread_msgs)
+        if not unread_msgs:
+            return _idle_result()
         has_pending_tool_results = False
         for msg in unread_msgs:
             sender_id = msg.sender_id or ""

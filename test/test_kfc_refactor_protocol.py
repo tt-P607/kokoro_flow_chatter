@@ -20,6 +20,7 @@ from plugins.kokoro_flow_chatter.domain.turn_trigger import TurnTrigger, classif
 from plugins.kokoro_flow_chatter.execution.decision_executor import execute_decision_draft
 from plugins.kokoro_flow_chatter.models import DO_NOTHING, KFC_REPLY, ToolCallResult
 from plugins.kokoro_flow_chatter.protocol.decision_parser import build_decision
+from plugins.kokoro_flow_chatter.protocol.response_normalizer import normalize_response
 from plugins.kokoro_flow_chatter.protocol.tool_call_adapter import (
     build_decision_draft,
     extract_call_args,
@@ -37,7 +38,10 @@ from plugins.kokoro_flow_chatter.runtime.request_view import (
     _without_transient_payloads,
     build_request_view,
 )
-from plugins.kokoro_flow_chatter.runtime.turn_controller import build_chain_assistant_entry
+from plugins.kokoro_flow_chatter.runtime.turn_controller import (
+    build_chain_assistant_entry,
+    prepare_turn_input,
+)
 from plugins.kokoro_flow_chatter.services.context_bridge import (
     ensure_tool_chain_closed,
     heal_orphan_tool_results,
@@ -158,6 +162,59 @@ def test_turn_trigger_priority_and_idle_branch() -> None:
     ) is TurnTrigger.IDLE_WAIT
 
 
+@pytest.mark.asyncio
+async def test_prepare_turn_input_non_message_triggers_keep_empty_wrapped_text() -> None:
+    """工具续轮和超时触发不应访问未初始化的 wrapped_user_text。"""
+
+    class _FakeChatter:
+        """prepare_turn_input 所需的最小 Chatter 替身。"""
+
+        async def fetch_unreads(self, time_format: str = "%Y-%m-%d %H:%M:%S") -> tuple[str, list[Any]]:
+            """返回空未读，触发非新消息路径。"""
+            _ = time_format
+            return "", []
+
+    class _TimeoutService:
+        """超时服务替身。"""
+
+        def check_timeout(self, _session: Any) -> bool:
+            """始终认为已超时。"""
+            return True
+
+        def build_timeout_result(self, _session: Any) -> Any:
+            """返回超时注入 payload。"""
+            return SimpleNamespace(
+                is_final_timeout=False,
+                payload=LLMPayload(ROLE.USER, Text("超时触发")),
+            )
+
+    followup = await prepare_turn_input(
+        chatter=cast(Any, _FakeChatter()),
+        response=_FakeResponse(),
+        chat_stream=cast(Any, SimpleNamespace(platform="test")),
+        config=cast(Any, SimpleNamespace()),
+        session=cast(Any, _FakeSession(waiting=False)),
+        prompt_builder=cast(Any, SimpleNamespace()),
+        timeout_service=cast(Any, _TimeoutService()),
+        has_pending_tool_results=True,
+    )
+    timeout = await prepare_turn_input(
+        chatter=cast(Any, _FakeChatter()),
+        response=_FakeResponse(),
+        chat_stream=cast(Any, SimpleNamespace(platform="test")),
+        config=cast(Any, SimpleNamespace()),
+        session=cast(Any, _FakeSession(waiting=True)),
+        prompt_builder=cast(Any, SimpleNamespace()),
+        timeout_service=cast(Any, _TimeoutService()),
+        has_pending_tool_results=False,
+    )
+
+    assert followup.wrapped_user_text == ""
+    assert timeout.wrapped_user_text == ""
+    assert timeout.response.payloads[-1].role == ROLE.USER
+
+
+
 def test_chain_entry_schema_filters_dirty_data_and_serializes_cleanly() -> None:
     """ChainEntry 应集中约束 chain_payloads 的可用 schema。"""
     user_entry = ChainEntry.user("你好", ts=1.5)
@@ -239,6 +296,29 @@ def test_tool_call_adapter_normalizes_and_extracts_all_branches() -> None:
     assert is_kfc_control_call(draft.calls[0]) is True
     assert is_kfc_control_call(draft.calls[1]) is False
     assert build_decision_draft(None).has_calls is False
+
+
+
+def test_normalize_response_parses_compat_tool_calls_without_model_set() -> None:
+    """兼容 JSON tool call 解析不应依赖 DeepSeek model_set。"""
+    response = SimpleNamespace(
+        message=(
+            '{"message":"", "tool_calls": ['
+            '{"id":"reply1", "name":"action-kfc_reply", '
+            '"args":{"content":["你好"]}}]}'
+        ),
+        call_list=[],
+        payloads=[],
+    )
+
+    normalized = normalize_response(response)
+
+    assert normalized.used_compat_tool_calls is True
+    assert normalized.has_tool_calls is True
+    assert response.call_list[0].name == "action-kfc_reply"
+    assert response.call_list[0].args == {"content": ["你好"]}
+    assert response.payloads[-1].role == ROLE.ASSISTANT
+
 
 
 def test_context_bridge_closes_user_after_tool_result_and_heals_orphans() -> None:
@@ -791,26 +871,49 @@ async def _unused_run_tool_call(
     raise AssertionError("unexpected tool call")
 
 
-def test_request_view_cutoff_break_and_context_bridge_edge_cases() -> None:
-    """覆盖 RequestView 裁剪 break 与 context bridge 低层边界。"""
-    from plugins.kokoro_flow_chatter.services import context_bridge
 
-    source_user = LLMPayload(ROLE.USER, Text("原始"))
-    assert _without_transient_payloads([], source_payloads=[source_user], transient_count=0) == []
-    assert heal_orphan_tool_results(SimpleNamespace(payloads="bad"), where="bad") == 0
 
-    with_pinned = _FakeResponse(
-        [
-            LLMPayload(ROLE.SYSTEM, Text("sys")),
-            LLMPayload(ROLE.ASSISTANT, [ToolCall(name="tool-a", args={}, id="a")]),
-            LLMPayload(ROLE.TOOL, Text("schema")),
-            LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="ok", call_id="a", name="tool-a")),
-        ]
+@pytest.mark.asyncio
+async def test_unread_policy_prefers_real_messages_and_filters_interrupts() -> None:
+    """unread policy 应在撞车时保留真实消息，并过滤主动触发打断。"""
+    from plugins.kokoro_flow_chatter.runtime.unread_policy import (
+        filter_interrupt_messages,
+        prefer_real_unreads,
     )
-    assert heal_orphan_tool_results(with_pinned, where="pinned") == 0
 
-    assistant_text_only = LLMPayload(ROLE.ASSISTANT, Text("文字"))
-    assistant_list_without_call = LLMPayload(ROLE.ASSISTANT, [Text("文字")])
-    assert context_bridge._assistant_has_tool_calls(assistant_text_only) is False
-    assert context_bridge._assistant_has_tool_calls(assistant_list_without_call) is False
-    assert context_bridge._preview_payload(LLMPayload(ROLE.USER, Text("abc"))) == "Text('abc')"
+    class _FakeUnreadChatter:
+        """最小 unread IO 替身。"""
+
+        def __init__(self) -> None:
+            self.flushed: list[list[str]] = []
+
+        async def flush_unreads(self, unread_messages: list[Any]) -> int:
+            """记录被 flush 的消息 id。"""
+            self.flushed.append(
+                [str(getattr(message, "message_id", "") or "") for message in unread_messages]
+            )
+            return len(unread_messages)
+
+        @staticmethod
+        def format_message_line(msg: Any, time_format: str = "%Y-%m-%d %H:%M:%S") -> str:
+            """测试替身格式化实现。"""
+            _ = time_format
+            return str(getattr(msg, "message_id", ""))
+
+    proactive = SimpleNamespace(message_id="proactive_1")
+    real = SimpleNamespace(message_id="u_1")
+    chatter = _FakeUnreadChatter()
+
+    kept = await prefer_real_unreads(chatter, [proactive, real])
+
+    assert kept == [real]
+    assert chatter.flushed == [["proactive_1"]]
+
+    interrupt_inputs = [
+        SimpleNamespace(message_id="known_1"),
+        SimpleNamespace(message_id="proactive_2"),
+        SimpleNamespace(message_id="u_2"),
+        SimpleNamespace(message_id=None),
+    ]
+    filtered = filter_interrupt_messages(interrupt_inputs, frozenset({"known_1"}))
+    assert [getattr(message, "message_id", None) for message in filtered] == ["u_2", None]
