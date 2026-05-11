@@ -9,6 +9,7 @@ from src.app.plugin_system.api.prompt_api import get_template as _get_prompt_tem
 from src.app.plugin_system.types import Content, LLMPayload, ROLE, Text
 
 from .sources.history_source import (
+    build_channel_payload,
     build_current_time_payload,
     build_fused_narrative as build_history_narrative,
     build_history_summary_payload,
@@ -57,9 +58,9 @@ class ContextRenderer:
 
         Returns:
             tuple: (system_payloads, chain_payloads, has_history)
-                - system_payloads: 系统 Payload 列表（通过 add_payload 注入，触发 reminder）
-                - chain_payloads: 历史链 Payload 列表（直接追加，绕过 context manager 避免
-                  对历史 USER 重复注入 system_reminder）
+                - system_payloads: 仅包含稳定系统提示词，保证前缀缓存命中率
+                - chain_payloads: 动态历史/摘要与历史链 Payload 列表（直接追加，绕过
+                  context manager 避免对历史 USER 重复注入 system_reminder）
                 - has_history: 是否存在历史内容
         """
         system_payloads: list[LLMPayload] = []
@@ -73,11 +74,6 @@ class ContextRenderer:
         system_prompt = await system_prompt_builder(
             chat_stream,
             plan.system_extra_vars,
-        )
-
-        from .sources.history_source import (
-            build_history_summary_payload,
-            build_current_time_payload,
         )
 
         summary_text = ""
@@ -101,24 +97,32 @@ class ContextRenderer:
                 if hasattr(item, "text"):
                     history_text += item.text  # type: ignore[attr-defined]
 
-        # 2. 拆分为两个 SYSTEM Payload 以优化缓存命中
-        # Payload 1: 静态部分 (人设/准则/平台信息) - 几乎永远不变，缓存价值最高
+        # 2. 只把稳定部分放入 SYSTEM，保证自动前缀缓存稳定。
+        #    动态部分（记忆摘要/融合叙事/当前时间）作为 USER 历史上下文进入链，
+        #    避免每轮变化的 SYSTEM payload 破坏系统前缀缓存。
         system_payloads.append(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
-        # Payload 2: 动态部分 (记忆摘要/融合叙事) - 随对话进度变化
         dynamic_parts: list[str] = []
+        channel_payload = build_channel_payload(chat_stream)
+        for item in channel_payload.content:
+            if hasattr(item, "text"):
+                dynamic_parts.append(item.text)  # type: ignore[attr-defined]
         if summary_text:
             dynamic_parts.append(summary_text)
         if history_text:
             dynamic_parts.append(history_text)
 
+        chain_payloads: list[LLMPayload] = []
         if dynamic_parts:
             merged_dynamic_text = "\n\n---\n\n".join(dynamic_parts)
-            system_payloads.append(LLMPayload(ROLE.SYSTEM, Text(merged_dynamic_text)))
+            chain_payloads.append(LLMPayload(ROLE.USER, Text(merged_dynamic_text)))
 
         # 3. 恢复工具调用链 — 独立返回，绕过 add_payload 避免
-        #    context manager 对历史 USER 重复注入 system_reminder
-        chain_payloads = restore_history_chain_payloads(serialized_chain_payloads)
+        #    context manager 对历史 USER 重复注入 system_reminder。
+        #    当前通道/记忆/叙事上下文放在历史链之前，保持语义顺序自然：
+        #    先说明当前背景，再展开过去发生的对话。
+        restored_payloads = restore_history_chain_payloads(serialized_chain_payloads)
+        chain_payloads = [*chain_payloads, *restored_payloads]
 
         return system_payloads, chain_payloads, bool(history_text) or bool(chain_payloads)
 
@@ -127,7 +131,12 @@ class ContextRenderer:
         chat_stream: ChatStream,
         extra_vars: dict[str, Any] | None = None,
     ) -> str:
-        """构建系统提示词。"""
+        """构建稳定系统提示词。
+
+        KFC 的系统提示词是自动前缀缓存的核心锚点，不能发布
+        ``on_prompt_build`` 事件给第三方动态注入器修改。动态上下文统一
+        通过 ``kfc_user_prompt`` 的 ``context_contributions`` 注入。
+        """
         from ..prompts.modules import build_mental_log_hint
 
         tmpl_base = _get_prompt_template("kfc_system_prompt")
@@ -146,7 +155,12 @@ class ContextRenderer:
             for key, value in extra_vars.items():
                 tmpl.set(key, value)
 
-        return await tmpl.build()
+        return tmpl._render(  # noqa: SLF001 - KFC 系统提示词必须跳过 on_prompt_build 事件
+            tmpl.template,
+            dict(tmpl.values),
+            dict(tmpl.policies),
+            strict=False,
+        )
 
     def render_user_payload(
         self,

@@ -82,20 +82,13 @@ KFC_SYSTEM_PROMPT = """<existence_logic>
 {reply_mode_instruction}
 </tool_usage>
 
-<extra_context>
-聊天平台：{platform}，聊天类型：{chat_type}
-你的信息：昵称 {nickname}，ID {bot_id}
-当前时间：{current_time}
-
-- 上述”平台 / 聊天类型 / ID”只是通道参数。除非有明确证据，否则不要自行脑补”手机、屏幕、房间”等物理场景细节。
-- 进行角色扮演时，应优先依据双方关系、语境和时间来组织描写。
-
+<stable_context>
 {mental_log_hint}
 {scene_state_info}
 {scheduled_proactive_info}
 {theme_guide}
 {custom_decision_prompt}
-</extra_context>
+</stable_context>
 """
 
 

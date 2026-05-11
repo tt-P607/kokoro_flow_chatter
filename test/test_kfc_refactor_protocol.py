@@ -13,7 +13,11 @@ _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from plugins.kokoro_flow_chatter.chatter import KokoroFlowChatter
+from plugins.kokoro_flow_chatter.context.renderer import ContextRenderer
 from plugins.kokoro_flow_chatter.context.sources.history_source import restore_chain_payloads
+from plugins.kokoro_flow_chatter.context.types import InitialContextPlan
+from plugins.kokoro_flow_chatter.prompts.modules import register_kfc_prompts
 from plugins.kokoro_flow_chatter.domain.chain_entry import ChainEntry
 from plugins.kokoro_flow_chatter.domain.decision import Decision
 from plugins.kokoro_flow_chatter.domain.turn_trigger import TurnTrigger, classify_turn_trigger
@@ -271,6 +275,102 @@ def test_restore_chain_payloads_keeps_only_readable_history() -> None:
     assert _text_of(payloads[1]) == "你好呀~"
 
 
+@pytest.mark.asyncio
+async def test_initial_context_keeps_dynamic_history_out_of_system_payloads() -> None:
+    """初始上下文应只保留稳定 SYSTEM，把动态历史放入 USER 链。"""
+    renderer = ContextRenderer()
+    chat_stream = SimpleNamespace(partner_name="言柒", context=SimpleNamespace(history_messages=[]))
+    plan = InitialContextPlan()
+    plan.history_summary = "近期摘要"
+
+    async def _build_system_prompt(
+        _chat_stream: Any,
+        _extra_vars: dict[str, Any] | None,
+    ) -> str:
+        """返回稳定系统提示词。"""
+        return "稳定系统提示词"
+
+    system_payloads, chain_payloads, has_history = await renderer.render_initial_context(
+        chat_stream=cast(Any, chat_stream),
+        plan=plan,
+        mental_log=None,
+        serialized_chain_payloads=[
+            {"role": "user", "text": "旧用户输入", "ts": 1.0},
+            {"role": "assistant", "text": "旧回复"},
+        ],
+        build_system_prompt_fn=_build_system_prompt,
+        build_fused_narrative_fn=lambda _stream, _log, _before_ts: "融合叙事",
+    )
+
+    assert [payload.role for payload in system_payloads] == [ROLE.SYSTEM]
+    assert _text_of(system_payloads[0]) == "稳定系统提示词"
+    assert [payload.role for payload in chain_payloads] == [ROLE.USER, ROLE.USER, ROLE.ASSISTANT]
+    assert "近期摘要" in _text_of(chain_payloads[0])
+    assert "融合叙事" in _text_of(chain_payloads[0])
+    assert _text_of(chain_payloads[1]) == "旧用户输入"
+    assert _text_of(chain_payloads[2]) == "旧回复"
+    assert has_history is True
+
+
+@pytest.mark.asyncio
+async def test_kfc_system_prompt_does_not_publish_prompt_build_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KFC 系统提示词构建不应暴露 on_prompt_build 动态注入点或通道动态字段。"""
+    from src.core.config import get_core_config, init_core_config
+    from src.kernel.event import EventDecision, get_event_bus
+
+    try:
+        from src.core.config import get_core_config
+        get_core_config()
+    except RuntimeError:
+        from src.core.config import init_core_config
+        init_core_config(config_path="config/core.toml")
+
+    register_kfc_prompts()
+    renderer = ContextRenderer()
+    chat_stream = SimpleNamespace(
+        platform="test",
+        chat_type="private",
+        bot_id="bot",
+        stream_id="stream-1",
+    )
+    bus = get_event_bus()
+    original_subscribers = list(bus.get_subscribers("on_prompt_build"))
+    seen_names: list[str] = []
+
+    async def _inject_system(params: dict[str, Any]) -> tuple[EventDecision, dict[str, Any]]:
+        """若被调用则尝试污染 KFC 系统提示词。"""
+        seen_names.append(str(params.get("name", "")))
+        params["template"] = str(params.get("template", "")) + "\n动态污染"
+        return EventDecision.SUCCESS, params
+
+    async def _noop_handler(event_name: str, params: dict[str, Any]) -> tuple[EventDecision, dict[str, Any]]:
+        """适配事件总线回调签名。"""
+        _ = event_name
+        return await _inject_system(params)
+
+    bus.subscribe("on_prompt_build", _noop_handler)
+    try:
+        prompt = await renderer.build_system_prompt(
+            cast(Any, chat_stream),
+            {
+                "reply_mode_instruction": "工具说明",
+                "current_time": "2026-05-10 00:00:00",
+            },
+        )
+    finally:
+        monkeypatch.setattr(bus, "_subscribers", {"on_prompt_build": original_subscribers})
+
+    assert get_core_config().personality.nickname in prompt
+    assert "工具说明" in prompt
+    assert "动态污染" not in prompt
+    assert "当前时间" not in prompt
+    assert "聊天平台" not in prompt
+    assert "stream-1" not in prompt
+    assert seen_names == []
+
+
 def test_tool_call_adapter_normalizes_and_extracts_all_branches() -> None:
     """tool call adapter 应只做无副作用规范化。"""
     calls = [
@@ -296,6 +396,77 @@ def test_tool_call_adapter_normalizes_and_extracts_all_branches() -> None:
     assert is_kfc_control_call(draft.calls[0]) is True
     assert is_kfc_control_call(draft.calls[1]) is False
     assert build_decision_draft(None).has_calls is False
+
+
+
+@pytest.mark.asyncio
+async def test_kfc_modify_llm_usables_reuses_base_filter_then_blocks_and_sorts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KFC 工具列表应先复用 BaseChatter 过滤，再做专属屏蔽和稳定排序。"""
+
+    class _AlphaTool:
+        """测试工具 A。"""
+
+        @classmethod
+        def get_signature(cls) -> str:
+            """返回组件签名。"""
+            return "z_plugin:tool:alpha"
+
+        @staticmethod
+        def to_schema() -> dict[str, Any]:
+            """返回工具 schema。"""
+            return {"name": "tool-alpha"}
+
+    class _BlockedTool:
+        """应被 KFC blocked_tools 屏蔽的工具。"""
+
+        @classmethod
+        def get_signature(cls) -> str:
+            """返回组件签名。"""
+            return "a_plugin:tool:blocked"
+
+        @staticmethod
+        def to_schema() -> dict[str, Any]:
+            """返回工具 schema。"""
+            return {"name": "tool-blocked"}
+
+    class _BetaTool:
+        """测试工具 B。"""
+
+        @classmethod
+        def get_signature(cls) -> str:
+            """返回组件签名。"""
+            return "m_plugin:tool:beta"
+
+        @staticmethod
+        def to_schema() -> dict[str, Any]:
+            """返回工具 schema。"""
+            return {"name": "tool-beta"}
+
+    async def _fake_base_modify(self: Any, llm_usables: list[Any]) -> list[Any]:
+        """模拟 BaseChatter 已过滤掉 chatter_allow/go_activate 不通过的工具。"""
+        _ = self
+        assert llm_usables == [_AlphaTool, _BlockedTool, _BetaTool]
+        return [_BetaTool, _BlockedTool, _AlphaTool]
+
+    monkeypatch.setattr(
+        "src.core.components.base.chatter.BaseChatter.modify_llm_usables",
+        _fake_base_modify,
+    )
+    chatter = KokoroFlowChatter(
+        stream_id="stream-1",
+        plugin=cast(Any, SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        chatter,
+        "_get_config",
+        lambda: SimpleNamespace(general=SimpleNamespace(blocked_tools=["blocked"])),
+    )
+
+    result = await chatter.modify_llm_usables([_AlphaTool, _BlockedTool, _BetaTool])
+
+    assert result == [_BetaTool, _AlphaTool]
 
 
 
@@ -691,6 +862,7 @@ def test_history_source_payload_builders_and_fused_narrative() -> None:
     """history source 的摘要、时间和融合叙事分支应可预测。"""
     import datetime
     from plugins.kokoro_flow_chatter.context.sources.history_source import (
+        build_channel_payload,
         build_current_time_payload,
         build_fused_narrative,
         build_history_summary_payload,
@@ -705,7 +877,13 @@ def test_history_source_payload_builders_and_fused_narrative() -> None:
     assert _text_of(build_history_summary_payload(named_stream, "记忆") or cast(Any, None)) == "【你对言柒的近期记忆】\n记忆"
     assert _text_of(build_history_summary_payload(group_stream, "记忆") or cast(Any, None)) == "【你对群聊的近期记忆】\n记忆"
     assert _text_of(build_history_summary_payload(unknown_stream, "记忆") or cast(Any, None)) == "【你对对方的近期记忆】\n记忆"
-    assert _text_of(build_current_time_payload(datetime.datetime(2026, 5, 9, 22, 0))) == "当前时间：2026-05-09 22:00"
+    time_payload = build_current_time_payload(datetime.datetime(2026, 5, 9, 22, 0))
+    assert time_payload.role == ROLE.USER
+    assert _text_of(time_payload) == "当前时间：2026-05-09 22:00"
+    channel_payload = build_channel_payload(SimpleNamespace(platform="qq", chat_type="group", bot_id="42", bot_nickname="狐狐"))
+    assert channel_payload.role == ROLE.USER
+    assert "聊天平台：qq" in _text_of(channel_payload)
+    assert "ID 42" in _text_of(channel_payload)
 
     messages = [
         SimpleNamespace(time="bad", sender_name="A", sender_id="u", message_id="m0", processed_plain_text="忽略"),

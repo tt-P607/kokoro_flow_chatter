@@ -134,29 +134,40 @@ class KokoroFlowChatter(BaseChatter):
         return await accumulate_message_buffer(self, config)
 
     async def modify_llm_usables(self, llm_usables: list[Any]) -> list[Any]:  # type: ignore[override]
-        """过滤掉不需要的工具，保留 KFC 的正式 tool-calling 主链。"""
+        """按框架通用规则过滤工具后，再应用 KFC 专属屏蔽与稳定排序。"""
+        base_available = await super().modify_llm_usables(llm_usables)
         config = self._get_config()
-        _blocked = frozenset(
+        blocked_names = frozenset(
             name
             for name in config.general.blocked_tools
             if name not in {KFC_REPLY, DO_NOTHING}
         )
 
-        def _is_reply_tool(u: Any) -> bool:
+        def _normalize_usable_name(usable: Any) -> str:
+            """从 schema/signature 中提取工具末段名。"""
             try:
-                schema = u.to_schema()
-                name: str = schema.get("function", schema).get("name", "") or ""
+                schema = usable.to_schema()
+                raw_name: str = schema.get("function", schema).get("name", "") or ""
             except Exception:
-                name = str(getattr(u, "name", "") or "")
-            # 归一化：兼容 "action-kfc_reply" / "action:kfc_reply" / "kfc_reply" 等格式
-            n = name.rsplit(":", 1)[-1]
+                raw_name = str(getattr(usable, "name", "") or "")
+            normalized = raw_name.rsplit(":", 1)[-1]
             for prefix in ("action-", "tool-", "agent-"):
-                if n.startswith(prefix):
-                    n = n[len(prefix):]
-                    break
-            return n in _blocked
+                if normalized.startswith(prefix):
+                    return normalized[len(prefix):]
+            return normalized
 
-        return [u for u in llm_usables if not _is_reply_tool(u)]
+        available = [
+            usable
+            for usable in base_available
+            if _normalize_usable_name(usable) not in blocked_names
+        ]
+        return sorted(
+            available,
+            key=lambda usable: str(
+                getattr(usable, "get_signature", lambda: "")()
+                or getattr(usable, "__name__", "")
+            ),
+        )
 
     # ── 核心对话循环 ──────────────────────────────────────────
 

@@ -38,12 +38,34 @@ def build_history_summary_payload(
 def build_current_time_payload(
     now: datetime.datetime | None = None,
 ) -> LLMPayload:
-    """在无可用历史时渲染当前时间 payload。"""
+    """在动态 USER 上下文中渲染当前时间 payload。"""
     current = now or datetime.datetime.now()
     return LLMPayload(
-        ROLE.SYSTEM,
+        ROLE.USER,
         Text(f"当前时间：{current.strftime('%Y-%m-%d %H:%M')}")
     )
+
+
+def build_channel_payload(chat_stream: Any) -> LLMPayload:
+    """在动态 USER 上下文中渲染平台与通道参数。"""
+    platform = str(getattr(chat_stream, "platform", "") or "unknown")
+    chat_type = str(getattr(chat_stream, "chat_type", "") or "unknown")
+    bot_id = str(getattr(chat_stream, "bot_id", "") or "")
+    nickname = str(getattr(chat_stream, "bot_nickname", "") or "")
+    lines = [
+        "[当前通道参数]",
+        f"聊天平台：{platform}",
+        f"聊天类型：{chat_type}",
+    ]
+    if nickname or bot_id:
+        lines.append(f"你的通道身份：昵称 {nickname or '未知'}，ID {bot_id or '未知'}")
+    lines.extend(
+        [
+            "- 上述平台/聊天类型/ID 只是通道参数。除非有明确证据，否则不要自行脑补手机、屏幕、房间等物理场景细节。",
+            "- 进行角色扮演时，应优先依据双方关系、语境和时间来组织描写。",
+        ]
+    )
+    return LLMPayload(ROLE.USER, Text("\n".join(lines)))
 
 
 def restore_chain_payloads(
