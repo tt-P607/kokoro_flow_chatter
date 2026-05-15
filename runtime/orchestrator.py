@@ -12,7 +12,7 @@ from src.app.plugin_system.api.llm_api import (
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import Failure, Stop, Success, Wait
 from src.kernel.concurrency import get_watchdog
-from src.app.plugin_system.types import LLMPayload
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 from ..debug.log_formatter import log_kfc_result
 from ..domain.chain_entry import ChainEntry
@@ -37,6 +37,15 @@ if TYPE_CHECKING:
 
 
 logger = get_logger("kfc_chatter")
+
+# LLM 返回纯文本（无 tool call）时的最大重试次数
+_MAX_PLAIN_TEXT_RETRIES = 1
+
+# 重试时注入的提醒文本
+_PLAIN_TEXT_RETRY_REMINDER = (
+    "（系统提示：你刚才返回了纯文本而非工具调用。"
+    "请务必通过 kfc_reply 或 do_nothing 工具调用来完成响应，不要直接输出文字。）"
+)
 
 
 async def execute_orchestrator(
@@ -118,6 +127,7 @@ async def execute_orchestrator(
         chain_user_pre_saved = False
         extra_payload: LLMPayload | None = None
         phase = ConversationPhase.WAIT_INPUT
+        plain_text_retry_count = 0
 
         while True:
             heal_orphan_tool_results(response, where="loop-top")
@@ -230,10 +240,30 @@ async def execute_orchestrator(
             heal_orphan_tool_results(response, where="post-send")
 
             call_list = response.call_list or []
+
+            # ── 纯文本重试机制 ──
+            # 当 LLM 返回纯文本（无 tool call）时，注入提醒并重试一次
+            if not call_list and plain_text_retry_count < _MAX_PLAIN_TEXT_RETRIES:
+                raw_message = (response.message or "").strip()
+                if raw_message:
+                    plain_text_retry_count += 1
+                    logger.info(
+                        f"[KFC] LLM 返回纯文本（第 {plain_text_retry_count} 次），"
+                        f"注入提醒后重试: {raw_message[:80]}"
+                    )
+                    ensure_tool_chain_closed(response, reason="纯文本重试")
+                    response.add_payload(
+                        LLMPayload(ROLE.USER, Text(_PLAIN_TEXT_RETRY_REMINDER))
+                    )
+                    has_pending_tool_results = True
+                    continue
+
+            # 成功获得 tool call 时重置重试计数
             if call_list:
+                plain_text_retry_count = 0
                 logger.info(f"本轮调用列表：{[call.name for call in call_list]}")
             elif response.message:
-                logger.debug("[KFC] 本轮无 tool call，等待标准化器判定是否需要重试")
+                logger.debug("[KFC] 本轮无 tool call，进入决策判定")
 
             trigger_msg = unread_msgs[-1] if unread_msgs else None
             if trigger_msg is None:

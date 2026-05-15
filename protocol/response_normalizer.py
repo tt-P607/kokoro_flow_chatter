@@ -40,10 +40,12 @@ def resolve_response_text(response: Any) -> tuple[str, bool]:
 
 
 def normalize_response(response: Any) -> NormalizedResponse:
-    """将 provider 原始响应标准化为 KFC 统一视图。"""
+    """将 provider 原始响应标准化为 KFC 统一视图。
+
+    注意：不将 reasoning_content 回填到 message。思考内容仅用于日志/调试，
+    不参与决策判定。如果 message 为空且 call_list 为空，视为"无有效输出"。
+    """
     resolved_text, used_reasoning = resolve_response_text(response)
-    if used_reasoning and not (response.message or "").strip() and not getattr(response, "call_list", None):
-        response.message = resolved_text
 
     used_compat_tool_calls = False
     if not getattr(response, "call_list", None):
