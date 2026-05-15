@@ -2,7 +2,10 @@
     "name": "kokoro_flow_chatter",
     "version": "2.0.0",
     "description": "KokoroFlow 对话引擎 — 基于心理活动流的私聊特化聊天器",
-    "author": "MoFox Studio",
+    "author": "言柒",
+    "license": "AGPL-v3.0",
+    "categories": ["chat"],
+    "tags": ["chat", "chatter", "kokoro", "flow"],
     "dependencies": {
         "plugins": [],
         "components": []
