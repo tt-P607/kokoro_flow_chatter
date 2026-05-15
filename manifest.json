@@ -1,5 +1,6 @@
 {
     "name": "kokoro_flow_chatter",
+    "display_name": "KokoroFlow 对话引擎",
     "version": "2.0.1",
     "description": "KokoroFlow 对话引擎 — 基于心理活动流的私聊特化聊天器",
     "author": "言柒",
