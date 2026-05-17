@@ -17,6 +17,7 @@ from .actions.schedule_proactive import ScheduleProactiveAction
 from .chatter import KokoroFlowChatter
 from .config import KFCConfig
 from .handlers.proactive_handler import ProactiveHandler
+from .handlers.voice_call_history_handler import VoiceCallHistoryHandler
 from .session import KFCSessionStore
 
 if TYPE_CHECKING:
@@ -175,4 +176,5 @@ class KFCPlugin(BasePlugin):
             DoNothingAction,
             ScheduleProactiveAction,
             ProactiveHandler,
+            VoiceCallHistoryHandler,
         ]

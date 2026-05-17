@@ -38,6 +38,11 @@
             "dependencies": []
         },
         {
+            "component_type": "event_handler",
+            "component_name": "kfc_voice_call_history_handler",
+            "dependencies": []
+        },
+        {
             "component_type": "config",
             "component_name": "config",
             "dependencies": []
