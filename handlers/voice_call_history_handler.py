@@ -1,13 +1,13 @@
 """voice_call.ended 事件处理器：把通话整段打包成一对摘要补到 chain_payloads。
 
-设计背景（详见 ``docs/voice_chatter_vtb_dev_log.md`` 第十一节）：
+设计背景（详见 ``docs/anima_chatter_vtb_dev_log.md`` 第十一节）：
 
 - 用户在 KFC 私聊（通常是 QQ）里和 bot 聊天 → 模型调 ``start_voice_call`` →
-  voice_chatter 接管该 stream，进入语音通话。
-- 通话期间所有 user / assistant 对话由 voice_chatter 处理；它会写入
+  anima_chatter 接管该 stream，进入语音通话。
+- 通话期间所有 user / assistant 对话由 anima_chatter 处理；它会写入
   ``chat_stream.context.history_messages``，但**不会**写入 KFC 的
   ``session.chain_payloads``。
-- 通话结束时 voice_chatter 广播 ``voice_call.ended`` 事件，payload 含通话
+- 通话结束时 anima_chatter 广播 ``voice_call.ended`` 事件，payload 含通话
   期间发生的所有消息。
 
 关键设计权衡（**不**逐条入 chain）：
@@ -52,7 +52,7 @@ class VoiceCallHistoryHandler(BaseEventHandler):
 
     handler_name: str = "kfc_voice_call_history_handler"
     handler_description: str = (
-        "通话结束后把 voice_chatter 在 KFC 流上记录的整段对话打包成一对 "
+        "通话结束后把 anima_chatter 在 KFC 流上记录的整段对话打包成一对 "
         "user/assistant 摘要补回 session.chain_payloads，保证挂断后上下文连贯，"
         "且不会用一通通话挤占多个 chain 槽位。"
     )
@@ -114,7 +114,7 @@ class VoiceCallHistoryHandler(BaseEventHandler):
           token 浪费。
 
         Args:
-            messages_in_call: voice_chatter 传过来的消息列表，每条形如
+            messages_in_call: anima_chatter 传过来的消息列表，每条形如
                 ``{"role": "user"|"assistant"|"system", "text": str, "ts": float}``。
 
         Returns:

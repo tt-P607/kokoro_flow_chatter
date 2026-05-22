@@ -204,7 +204,6 @@ class KokoroFlowChatter(BaseChatter):
             model_set,
             "kokoro_flow_chatter",
             context_manager=context_manager,
-            with_reminder="actor",
         )
 
         # 系统提示词
