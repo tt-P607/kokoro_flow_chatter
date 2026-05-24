@@ -30,8 +30,7 @@ class TimeoutService:
     """封装等待超时处理与 payload 构建。
 
     本服务保持纯函数：不会对 ``response.payloads`` 做任何写入，
-    调用方负责使用 ``safe_add_payload`` / ``ensure_tool_chain_closed``
-    将返回的 payload 安全合并到上下文。
+    调用方负责将返回的 payload 追加到上下文。
     """
 
     def __init__(self, config: KFCConfig) -> None:

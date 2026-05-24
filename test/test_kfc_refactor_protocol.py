@@ -46,11 +46,7 @@ from plugins.kokoro_flow_chatter.runtime.turn_controller import (
     build_chain_assistant_entry,
     prepare_turn_input,
 )
-from plugins.kokoro_flow_chatter.services.context_bridge import (
-    ensure_tool_chain_closed,
-    heal_orphan_tool_results,
-    safe_add_payload,
-)
+from plugins.kokoro_flow_chatter.runtime.orchestrator import _heal_orphan_tool_results as heal_orphan_tool_results
 from src.app.plugin_system.types import LLMPayload, ROLE, Text, ToolCall, ToolResult
 
 
@@ -492,26 +488,8 @@ def test_normalize_response_parses_compat_tool_calls_without_model_set() -> None
 
 
 
-def test_context_bridge_closes_user_after_tool_result_and_heals_orphans() -> None:
-    """上下文桥接应闭合合法 tool 链，并移除孤立 TOOL_RESULT。"""
-    call = ToolCall(name="action-kfc_reply", args={}, id="c1")
-    response = _FakeResponse(
-        [
-            LLMPayload(ROLE.SYSTEM, Text("sys")),
-            LLMPayload(ROLE.ASSISTANT, [call]),
-            LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="ok", call_id="c1", name="action-kfc_reply")),
-        ]
-    )
-
-    assert ensure_tool_chain_closed(response, reason="unit") is True
-    assert response.payloads[-1].role == ROLE.ASSISTANT
-    assert _text_of(response.payloads[-1]) == "好的。"
-
-    safe_add_payload(response, LLMPayload(ROLE.USER, Text("新输入")), reason="unit")
-    assert response.payloads[-1].role == ROLE.USER
-    assert ensure_tool_chain_closed(_FakeResponse(), reason="empty") is False
-    assert ensure_tool_chain_closed(_FakeResponse([LLMPayload(ROLE.USER, Text("x"))]), reason="user") is False
-
+def test_heal_orphan_tool_results_removes_orphans_and_keeps_valid_chain() -> None:
+    """heal_orphan_tool_results 应移除孤立 TOOL_RESULT，保留合法链路。"""
     orphan_response = _FakeResponse(
         [
             LLMPayload(ROLE.USER, Text("u")),
@@ -522,9 +500,10 @@ def test_context_bridge_closes_user_after_tool_result_and_heals_orphans() -> Non
     assert heal_orphan_tool_results(orphan_response, where="unit") == 2
     assert [payload.role for payload in orphan_response.payloads] == [ROLE.USER]
 
+    valid_call = ToolCall(name="action-kfc_reply", args={}, id="c1")
     valid_response = _FakeResponse(
         [
-            LLMPayload(ROLE.ASSISTANT, [call]),
+            LLMPayload(ROLE.ASSISTANT, [valid_call]),
             LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="ok", call_id="c1", name="action-kfc_reply")),
         ]
     )

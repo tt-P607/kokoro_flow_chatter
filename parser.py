@@ -48,6 +48,30 @@ def _extract_args(raw_args: Any) -> dict[str, Any]:
     return {}
 
 
+def _parse_content_segments(content_raw: Any) -> list[str]:
+    """将 kfc_reply 的 content 参数解析为文本段列表。
+
+    兼容三种 LLM 输出形式：
+    - list：直接使用
+    - str（JSON 数组）：尝试解析为 list
+    - str（普通文本）：作为单段
+    """
+    if isinstance(content_raw, list):
+        return [str(s).strip() for s in content_raw if str(s).strip()]
+    if isinstance(content_raw, str):
+        stripped = content_raw.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                return [str(s).strip() for s in parsed if str(s).strip()]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return [stripped]
+    return []
+
+
 def _ensure_call_id(call: ToolCall) -> str:
     """确保工具调用具备稳定的 call_id。
 
@@ -138,13 +162,7 @@ async def parse_tool_calls(
             result.has_reply = True
             extract_metadata(result, args)
             content_raw = args.get("content", "")
-            if isinstance(content_raw, list):
-                segments = [str(s).strip() for s in content_raw if str(s).strip()]
-            elif isinstance(content_raw, str):
-                stripped = content_raw.strip()
-                segments = [stripped] if stripped else []
-            else:
-                segments = []
+            segments = _parse_content_segments(content_raw)
 
             send_ok = True
             for segment in segments:

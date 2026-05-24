@@ -15,7 +15,7 @@ from src.app.plugin_system.types import LLMPayload, ROLE, ToolRegistry, ToolResu
 
 from ..config import KFCConfig
 from ..models import DO_NOTHING, KFC_REPLY, ToolCallResult
-from ..parser import _calculate_typing_delay, extract_metadata
+from ..parser import _calculate_typing_delay, _parse_content_segments, extract_metadata
 from ..protocol.tool_call_adapter import DecisionDraft, DecisionDraftCall
 
 logger = get_logger("kfc_decision_executor")
@@ -70,13 +70,7 @@ async def execute_decision_draft(
             result.has_reply = True
             extract_metadata(result, args)
             content_raw = args.get("content", "")
-            if isinstance(content_raw, list):
-                segments = [str(s).strip() for s in content_raw if str(s).strip()]
-            elif isinstance(content_raw, str):
-                stripped = content_raw.strip()
-                segments = [stripped] if stripped else []
-            else:
-                segments = []
+            segments = _parse_content_segments(content_raw)
 
             send_ok = True
             for segment in segments:

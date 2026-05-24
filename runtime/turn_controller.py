@@ -14,7 +14,6 @@ from ..domain.chain_entry import ChainEntry
 from ..domain.turn_trigger import TurnTrigger, classify_turn_trigger
 from ..models import WaitingConfig
 from ..services import SummaryService
-from ..services.context_bridge import ensure_tool_chain_closed
 from .unread_policy import format_unread_messages, prefer_real_unreads
 
 if TYPE_CHECKING:
@@ -154,8 +153,7 @@ async def prepare_turn_input(
             chat_stream=chat_stream,
         )
 
-        ensure_tool_chain_closed(response, reason="新消息到达")
-
+        # 框架已允许 TOOL_RESULT → USER，无需在追加 USER 前强制插入 ASSISTANT 桥接。
         upserted = False
         if (
             not media_items
@@ -193,7 +191,7 @@ async def prepare_turn_input(
                 )
                 timeout_upserted = True
         if not timeout_upserted:
-            ensure_tool_chain_closed(response, reason="超时追加")
+            # 框架已允许 TOOL_RESULT → USER，无需插入 ASSISTANT 桥接。
             response.add_payload(timeout_result.payload)
     else:
         # TurnTrigger.IDLE_WAIT: 既无新消息也未到超时，让出本 tick

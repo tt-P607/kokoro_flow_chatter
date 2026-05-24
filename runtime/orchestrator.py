@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, AsyncGenerator
+from typing import TYPE_CHECKING, Any, AsyncGenerator
 
 from src.app.plugin_system.api.llm_api import (
     get_model_set_by_name,
@@ -29,11 +29,94 @@ from ..services import (
     ProactiveService,
     TimeoutService,
 )
-from ..services.context_bridge import ensure_tool_chain_closed, heal_orphan_tool_results
 from .turn_controller import commit_turn_decision, prepare_turn_input
 
 if TYPE_CHECKING:
     from ..chatter import KokoroFlowChatter
+
+
+def _heal_orphan_tool_results(response: Any, *, where: str) -> int:
+    """扫描 response.payloads，丢弃孤立的 TOOL_RESULT。
+
+    "孤立" 的判定：一个 TOOL_RESULT 之前必须紧跟 ASSISTANT(含 tool_calls)
+    或另一个连续的 TOOL_RESULT；否则视为非法链路状态，就地移除并打 ERROR 日志。
+
+    Args:
+        response: 拥有 payloads 列表的响应对象。
+        where: 调用位置标识（用于日志），例如 "loop-top"。
+
+    Returns:
+        int: 被丢弃的孤立 TOOL_RESULT 数量。
+    """
+    payloads = getattr(response, "payloads", None)
+    if not isinstance(payloads, list) or not payloads:
+        return 0
+
+    pinned_roles = {ROLE.SYSTEM, ROLE.TOOL}
+    healed = 0
+    idx = 0
+    while idx < len(payloads):
+        payload = payloads[idx]
+        if payload.role != ROLE.TOOL_RESULT or payload.role in pinned_roles:
+            idx += 1
+            continue
+
+        prev_idx = idx - 1
+        while prev_idx >= 0 and payloads[prev_idx].role in pinned_roles:
+            prev_idx -= 1
+
+        prev_payload = payloads[prev_idx] if prev_idx >= 0 else None
+        prev_role = prev_payload.role if prev_payload is not None else None
+
+        valid_prev = prev_role == ROLE.TOOL_RESULT or (
+            prev_role == ROLE.ASSISTANT
+            and prev_payload is not None
+            and _assistant_has_tool_calls(prev_payload)
+        )
+        if valid_prev:
+            idx += 1
+            continue
+
+        snapshot_start = max(0, idx - 5)
+        snapshot_end = min(len(payloads), idx + 6)
+        snapshot = [
+            f"[{s_idx}] {payloads[s_idx].role.value}: {_preview_payload(payloads[s_idx])}"
+            for s_idx in range(snapshot_start, snapshot_end)
+        ]
+        logger.error(
+            f"孤立 TOOL_RESULT 自愈（{where}）：丢弃 idx={idx}，"
+            f"prev_role={prev_role.value if prev_role else None}\n"
+            + "\n".join(snapshot)
+        )
+        payloads.pop(idx)
+        healed += 1
+
+    return healed
+
+
+def _assistant_has_tool_calls(payload: LLMPayload) -> bool:
+    """判断 ASSISTANT payload 是否包含 tool_calls。"""
+    content = payload.content
+    if not isinstance(content, list):
+        return False
+    return any(type(item).__name__ == "ToolCall" for item in content)
+
+
+def _preview_payload(payload: LLMPayload) -> str:
+    """将 payload 内容压成短预览字符串（最多 80 字符）。"""
+    content = payload.content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            type_name = type(item).__name__
+            text_attr = getattr(item, "text", None)
+            if isinstance(text_attr, str):
+                parts.append(f"{type_name}({text_attr[:30]!r})")
+            else:
+                parts.append(f"{type_name}(name={getattr(item, 'name', None)!r})")
+        return " | ".join(parts)[:80]
+    text_attr = getattr(content, "text", None)
+    return (repr(text_attr)[:80] if isinstance(text_attr, str) else repr(content)[:80])
 
 
 logger = get_logger("kfc_chatter")
@@ -130,7 +213,7 @@ async def execute_orchestrator(
         plain_text_retry_count = 0
 
         while True:
-            heal_orphan_tool_results(response, where="loop-top")
+            _heal_orphan_tool_results(response, where="loop-top")
             phase = phase_for_turn_start(
                 response,
                 has_pending_tool_results=has_pending_tool_results,
@@ -182,7 +265,7 @@ async def execute_orchestrator(
 
             transient_payloads: list[LLMPayload] = []
             if extra_payload is not None:
-                ensure_tool_chain_closed(response, reason="extra_payload 注入")
+                # 框架已允许 TOOL_RESULT → USER，extra_payload（USER 类型）可直接追加。
                 transient_payloads.append(extra_payload)
             send_target = build_request_view(response, transient_payloads)
             if config.debug.show_prompt:
@@ -237,7 +320,7 @@ async def execute_orchestrator(
             extra_payload = None
             phase = phase_for_model_result(response)
 
-            heal_orphan_tool_results(response, where="post-send")
+            _heal_orphan_tool_results(response, where="post-send")
 
             call_list = response.call_list or []
 
@@ -251,7 +334,7 @@ async def execute_orchestrator(
                         f"[KFC] LLM 返回纯文本（第 {plain_text_retry_count} 次），"
                         f"注入提醒后重试: {raw_message[:80]}"
                     )
-                    ensure_tool_chain_closed(response, reason="纯文本重试")
+                    # 框架已允许 TOOL_RESULT → USER，纯文本重试时直接追加 USER 提醒。
                     response.add_payload(
                         LLMPayload(ROLE.USER, Text(_PLAIN_TEXT_RETRY_REMINDER))
                     )
