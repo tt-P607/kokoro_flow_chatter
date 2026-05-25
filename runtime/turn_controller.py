@@ -289,7 +289,7 @@ async def commit_turn_decision(
                 is_final_timeout=is_final_timeout,
             )
 
-    if decision.has_info_tool_calls and not decision.should_reply:
+    if decision.has_info_tool_calls:
         logger.debug("信息工具调用完成，tool_result 已积累到 response 链，立即续轮")
         return TurnControlResult(
             continue_loop=True,
@@ -297,11 +297,7 @@ async def commit_turn_decision(
             is_final_timeout=is_final_timeout,
             chain_assistant_saved=chain_assistant_saved,
         )
-    if (
-        decision.has_third_party_calls
-        and not decision.should_reply
-        and not decision.chose_silence
-    ):
+    if decision.has_third_party_calls and not decision.chose_silence:
         logger.debug(
             "第三方工具调用完成，tool_result 已积累到 response 链，下轮循环继续"
         )

@@ -211,6 +211,7 @@ async def execute_orchestrator(
         extra_payload: LLMPayload | None = None
         phase = ConversationPhase.WAIT_INPUT
         plain_text_retry_count = 0
+        follow_up_count = 0
 
         while True:
             _heal_orphan_tool_results(response, where="loop-top")
@@ -233,6 +234,9 @@ async def execute_orchestrator(
             response = turn_input.response
             unread_msgs = turn_input.unread_msgs
             extra_payload = turn_input.extra_payload
+            # 新消息到来时（has_pending_tool_results 由 True 变 False），重置续轮计数
+            if has_pending_tool_results and not turn_input.has_pending_tool_results:
+                follow_up_count = 0
             has_pending_tool_results = turn_input.has_pending_tool_results
             is_final_timeout = turn_input.is_final_timeout
 
@@ -388,6 +392,17 @@ async def execute_orchestrator(
             is_final_timeout = turn_control.is_final_timeout
 
             if turn_control.has_pending_tool_results:
+                follow_up_count += 1
+                max_retries = config.general.max_follow_up_retries
+                if max_retries > 0 and follow_up_count > max_retries:
+                    logger.warning(
+                        f"[KFC] FOLLOW_UP 续轮次数已达上限 {max_retries}，"
+                        "强制停止续轮，进入等待（防止工具调用格式错误导致无限重试）"
+                    )
+                    follow_up_count = 0
+                    has_pending_tool_results = False
+                    yield Stop(0)
+                    return
                 has_pending_tool_results = True
 
             # assistant entry 已写入链，清空 pre_send_user_text 防止下一轮续轮重复持久化

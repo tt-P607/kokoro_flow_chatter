@@ -69,6 +69,15 @@ class KFCConfig(BaseConfig):
                 "列表中的工具不会暴露给 LLM。"
             ),
         )
+        max_follow_up_retries: int = Field(
+            default=3,
+            description=(
+                "工具调用失败后 FOLLOW_UP 续轮的最大次数。"
+                "当 LLM 因工具参数格式错误等原因持续失败时，"
+                "超过此次数后将强制停止续轮并进入等待，防止无限重试。"
+                "设为 0 表示不限制续轮次数（不推荐）。"
+            ),
+        )
         segment_instruction: str = Field(
             default=(
                 "## 消息分段发送\n"
