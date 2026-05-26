@@ -14,7 +14,7 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import LLMPayload, ROLE, ToolRegistry, ToolResult
 
 from ..config import KFCConfig
-from ..models import DO_NOTHING, KFC_REPLY, ToolCallResult
+from ..models import DO_NOTHING, KFC_REPLY, PASS_AND_WAIT, ToolCallResult
 from ..parser import _calculate_typing_delay, _parse_content_segments, extract_metadata
 from ..protocol.tool_call_adapter import DecisionDraft, DecisionDraftCall
 
@@ -23,7 +23,7 @@ logger = get_logger("kfc_decision_executor")
 
 def _is_kfc_control_call(draft_call: DecisionDraftCall) -> bool:
     """判断是否为 KFC 自身需要特殊解释的控制动作。"""
-    return draft_call.normalized_name in {KFC_REPLY, DO_NOTHING}
+    return draft_call.normalized_name in {KFC_REPLY, DO_NOTHING, PASS_AND_WAIT}
 
 
 async def execute_decision_draft(
@@ -52,6 +52,7 @@ async def execute_decision_draft(
         call_results = await run_tool_call_fn(current_pending, response, usable_map, trigger_msg)
         for call, (_appended, success) in zip(current_pending, call_results, strict=False):
             if not success:
+                result.has_failed_tool = True
                 logger.warning(f"[KFC] 工具/action/agent {call.name} 执行失败或被跳过")
 
     for draft_call in draft.calls:
@@ -112,6 +113,24 @@ async def execute_decision_draft(
                     ROLE.TOOL_RESULT,
                     ToolResult(
                         value="已选择不回复",
+                        call_id=draft_call.call_id,
+                        name=draft_call.raw_name,
+                    ),
+                )
+            )
+            continue
+
+        if normalized_name == PASS_AND_WAIT:
+            result.has_pass_and_wait = True
+            extract_metadata(result, args)
+            action_dict = {"type": normalized_name}
+            action_dict.update(args)
+            result.actions.append(action_dict)
+            response.add_payload(
+                LLMPayload(
+                    ROLE.TOOL_RESULT,
+                    ToolResult(
+                        value="已登记等待",
                         call_id=draft_call.call_id,
                         name=draft_call.raw_name,
                     ),

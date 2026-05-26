@@ -290,6 +290,7 @@ async def commit_turn_decision(
             )
 
     if decision.has_info_tool_calls:
+        # tool-/agent- 类工具有实际返回值，不管是否同时有回复，都需要续轮让 LLM 看到结果
         logger.debug("信息工具调用完成，tool_result 已积累到 response 链，立即续轮")
         return TurnControlResult(
             continue_loop=True,
@@ -297,7 +298,12 @@ async def commit_turn_decision(
             is_final_timeout=is_final_timeout,
             chain_assistant_saved=chain_assistant_saved,
         )
-    if decision.has_third_party_calls and not decision.chose_silence:
+    if (
+        decision.has_third_party_calls
+        and not decision.should_reply
+        and not decision.chose_silence
+    ):
+        # action- 类第三方工具无返回值，只在没有回复时才续轮
         logger.debug(
             "第三方工具调用完成，tool_result 已积累到 response 链，下轮循环继续"
         )

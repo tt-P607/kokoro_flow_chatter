@@ -392,17 +392,19 @@ async def execute_orchestrator(
             is_final_timeout = turn_control.is_final_timeout
 
             if turn_control.has_pending_tool_results:
-                follow_up_count += 1
-                max_retries = config.general.max_follow_up_retries
-                if max_retries > 0 and follow_up_count > max_retries:
-                    logger.warning(
-                        f"[KFC] FOLLOW_UP 续轮次数已达上限 {max_retries}，"
-                        "强制停止续轮，进入等待（防止工具调用格式错误导致无限重试）"
-                    )
-                    follow_up_count = 0
-                    has_pending_tool_results = False
-                    yield Stop(0)
-                    return
+                # 只有工具失败时才计入重试次数，正常的工具链不受影响
+                if decision.has_failed_tool:
+                    follow_up_count += 1
+                    max_retries = config.general.max_follow_up_retries
+                    if max_retries > 0 and follow_up_count > max_retries:
+                        logger.warning(
+                            f"[KFC] 工具失败重试次数已达上限 {max_retries}，"
+                            "强制停止续轮（防止工具调用格式错误导致无限重试）"
+                        )
+                        follow_up_count = 0
+                        has_pending_tool_results = False
+                        yield Stop(0)
+                        return
                 has_pending_tool_results = True
 
             # assistant entry 已写入链，清空 pre_send_user_text 防止下一轮续轮重复持久化

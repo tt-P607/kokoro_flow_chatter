@@ -14,6 +14,7 @@ from typing import Any
 # 控制流常量
 KFC_REPLY: str = "kfc_reply"
 DO_NOTHING: str = "do_nothing"
+PASS_AND_WAIT: str = "pass_and_wait"
 
 
 @dataclass
@@ -51,10 +52,16 @@ class ToolCallResult:
     has_info_tool: bool = False
     """是否包含 agent-* / tool-* 类工具调用（有实际返回值，需立即续轮让 LLM 看到结果）"""
 
+    has_pass_and_wait: bool = False
+    """是否包含 pass_and_wait 调用（完成当前动作后等待）"""
+
+    has_failed_tool: bool = False
+    """是否有工具执行失败（用于重试计数）"""
+
     @property
     def has_meaningful_action(self) -> bool:
-        """是否包含任何有效动作（回复、do_nothing 或第三方工具）。"""
-        return self.has_reply or self.has_do_nothing or self.has_third_party
+        """是否包含任何有效动作（回复、do_nothing、pass_and_wait 或第三方工具）。"""
+        return self.has_reply or self.has_do_nothing or self.has_third_party or self.has_pass_and_wait
 
 
 def extract_visible_reply_text(result: ToolCallResult) -> str:

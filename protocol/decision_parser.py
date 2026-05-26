@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..domain.decision import Decision, ProactiveSchedule, ToolCallSpec
-from ..models import DO_NOTHING, KFC_REPLY, ToolCallResult
+from ..models import DO_NOTHING, KFC_REPLY, PASS_AND_WAIT, ToolCallResult
 from .tool_call_adapter import build_decision_draft
 
 
@@ -64,7 +64,7 @@ def build_decision(result: ToolCallResult, response: Any) -> Decision:
 
     for call in getattr(response, "call_list", None) or []:
         normalized_name = _normalize_call_name(getattr(call, "name", ""))
-        if normalized_name in (KFC_REPLY, DO_NOTHING):
+        if normalized_name in (KFC_REPLY, DO_NOTHING, PASS_AND_WAIT):
             continue
 
         args = _extract_args(getattr(call, "args", {}))
@@ -98,6 +98,8 @@ def build_decision(result: ToolCallResult, response: Any) -> Decision:
         chose_silence=result.has_do_nothing and not result.has_reply,
         has_meaningful_action=result.has_meaningful_action,
         has_info_tool_calls=result.has_info_tool,
+        has_pass_and_wait=result.has_pass_and_wait,
+        has_failed_tool=result.has_failed_tool,
         third_party_calls=third_party_calls,
         proactive_schedule=proactive_schedule,
     )

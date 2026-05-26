@@ -15,7 +15,7 @@ from typing import Any, TYPE_CHECKING
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import LLMPayload, ROLE, ToolCall, ToolRegistry, ToolResult
 
-from .models import KFC_REPLY, DO_NOTHING, ToolCallResult
+from .models import KFC_REPLY, DO_NOTHING, PASS_AND_WAIT, ToolCallResult
 
 if TYPE_CHECKING:
     from .config import KFCConfig
@@ -145,7 +145,7 @@ async def parse_tool_calls(
     if response.call_list:
         for call in response.call_list:
             args = _extract_args(call.args)
-            if _normalize_call_name(call.name) in (KFC_REPLY, DO_NOTHING):
+            if _normalize_call_name(call.name) in (KFC_REPLY, DO_NOTHING, PASS_AND_WAIT):
                 extract_metadata(result, args)
                 break
 
@@ -207,6 +207,25 @@ async def parse_tool_calls(
                     ROLE.TOOL_RESULT,
                     ToolResult(  # type: ignore[arg-type]
                         value="已选择不回复",
+                        call_id=call_id,
+                        name=call.name,
+                    ),
+                )
+            )
+            continue
+
+        if normalized_name == PASS_AND_WAIT:
+            result.has_pass_and_wait = True
+            extract_metadata(result, args)
+            action_dict = {"type": normalized_name}
+            action_dict.update(args)
+            result.actions.append(action_dict)
+
+            response.add_payload(
+                LLMPayload(
+                    ROLE.TOOL_RESULT,
+                    ToolResult(  # type: ignore[arg-type]
+                        value="已登记等待",
                         call_id=call_id,
                         name=call.name,
                     ),

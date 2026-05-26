@@ -37,6 +37,8 @@ class Decision:
     chose_silence: bool = False
     has_meaningful_action: bool = False
     has_info_tool_calls: bool = False
+    has_pass_and_wait: bool = False
+    has_failed_tool: bool = False
     third_party_calls: list[ToolCallSpec] = field(default_factory=list)
     proactive_schedule: ProactiveSchedule | None = None
 
