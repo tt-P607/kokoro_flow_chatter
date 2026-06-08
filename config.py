@@ -205,6 +205,14 @@ class KFCConfig(BaseConfig):
             default=120.0,
             description="两次压缩之间的最短间隔（分钟），防止频繁触发",
         )
+        compress_min_chars: int = Field(
+            default=800,
+            description="近期记忆摘要的最小字数（写入压缩指令，引导 LLM 控制摘要长度下限）",
+        )
+        compress_max_chars: int = Field(
+            default=1200,
+            description="近期记忆摘要的最大字数（写入压缩指令，引导 LLM 控制摘要长度上限）",
+        )
 
 
     @config_section("buffer")

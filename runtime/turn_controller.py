@@ -12,7 +12,7 @@ from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 from ..domain.chain_entry import ChainEntry
 from ..domain.turn_trigger import TurnTrigger, classify_turn_trigger
-from ..models import WaitingConfig
+from ..models import KFCEventType, WaitingConfig
 from ..services import SummaryService
 from .unread_policy import format_unread_messages, prefer_real_unreads
 
@@ -80,6 +80,12 @@ async def prepare_turn_input(
     has_pending_tool_results: bool,
 ) -> TurnInputResult:
     """准备一轮 LLM 调用前的触发输入。"""
+    # 备忘录懒清理：每轮 LLM 请求前清掉已过期的备忘并补 mental_log 事件，
+    # 让模型在心理活动流里能看到"我之前记的某事到时间了"。
+    expired_memos = session.prune_expired_memos()
+    for expired in expired_memos:
+        session.add_memo_event(KFCEventType.MEMO_EXPIRED, expired)
+
     formatted_text, unread_msgs = await chatter.fetch_unreads(
         time_format="%Y-%m-%d %H:%M:%S"
     )
@@ -151,6 +157,7 @@ async def prepare_turn_input(
             media_items=media_items,
             stream_id=chatter.stream_id,
             chat_stream=chat_stream,
+            session=session,
         )
 
         # 框架已允许 TOOL_RESULT → USER，无需在追加 USER 前强制插入 ASSISTANT 桥接。

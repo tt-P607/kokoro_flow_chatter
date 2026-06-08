@@ -30,6 +30,7 @@ class ScheduleProactiveAction(BaseAction):
     """预约下一次主动思考时间。"""
 
     action_name: str = "schedule_proactive"
+    associated_types: list[str] = ["text"]
     action_description: str = _BASE_DESCRIPTION
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 

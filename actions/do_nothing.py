@@ -2,6 +2,9 @@
 
 当 LLM 决定不回复时调用此动作。
 通过原生 Tool Calling 的参数传递内心活动等元数据。
+
+注：本 Action 在 KFC 主流程中不会被实际调用（parser 层直接消费
+其参数），execute() 仅作为 schema 生成的形式入口存在。
 """
 
 from __future__ import annotations
@@ -10,24 +13,44 @@ from typing import Annotated
 
 from src.app.plugin_system.base import BaseAction
 
+from .reply import _force_kfc_metadata_required
+
 
 class DoNothingAction(BaseAction):
     """不回复，不做任何操作。"""
 
     action_name: str = "do_nothing"
+    associated_types: list[str] = ["text"]
     action_description: str = (
         "决定不做任何回复。当对方的消息不需要回应、纯表情、或者你选择已读不回时使用。"
+        "**调用时必须明确给出 thought / expected_reaction / max_wait_seconds / mood "
+        "这四个字段，承载你这次决策的内心活动、对对方反应的预期、等待时长和当前情绪。**"
     )
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 
+    @classmethod
+    def to_schema(cls) -> dict:  # type: ignore[override]
+        """把 KFC 元数据字段在 schema 里标记为 required。"""
+        return _force_kfc_metadata_required(super().to_schema())
+
     async def execute(
         self,
-        thought: Annotated[str, "你此刻的内心想法，描述你为什么选择不回复"] = "",
-        expected_reaction: Annotated[str, "你预期的对方反应"] = "",
+        thought: Annotated[
+            str,
+            "**必填**。你此刻的内心想法，描述你为什么选择不回复。",
+        ] = "",
+        expected_reaction: Annotated[
+            str,
+            "**必填**。你预期的对方反应。",
+        ] = "",
         max_wait_seconds: Annotated[
-            float, "是否继续等待对方（秒），0表示不等待"
+            float,
+            "**必填**。是否继续等待对方（秒），0 表示不等待。",
         ] = 0.0,
-        mood: Annotated[str, "你当前的心情"] = "",
+        mood: Annotated[
+            str,
+            "**必填**。你当前的心情。",
+        ] = "",
     ) -> tuple[bool, str]:
         """执行不回复的逻辑。
 

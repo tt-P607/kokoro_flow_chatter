@@ -12,6 +12,7 @@ from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.kernel.concurrency import get_task_manager
 
 from .actions.do_nothing import DoNothingAction
+from .actions.memo import KFCMemoAction, KFCMemoDeleteAction
 from .actions.pass_and_wait import PassAndWaitAction
 from .actions.reply import KFCReplyAction
 from .actions.schedule_proactive import ScheduleProactiveAction
@@ -177,6 +178,8 @@ class KFCPlugin(BasePlugin):
             DoNothingAction,
             PassAndWaitAction,
             ScheduleProactiveAction,
+            KFCMemoAction,
+            KFCMemoDeleteAction,
             ProactiveHandler,
             VoiceCallHistoryHandler,
         ]

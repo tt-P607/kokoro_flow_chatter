@@ -111,7 +111,27 @@ class MentalLog:
         return len(self._entries)
 
     def add(self, entry: MentalLogEntry) -> None:
-        """添加条目，超出上限时自动裁剪最旧的。"""
+        """添加条目，超出上限时自动裁剪最旧的。
+
+        对 ``USER_MESSAGE`` 类型按 ``message_id`` 做幂等去重：
+        若该 ``message_id`` 已存在于现有条目中，则跳过本次追加。
+        防止 LLM 失败 → 下一 Tick 重新消费同一批 unread 时，
+        同一条用户消息被反复写入心理活动流，导致缓存膨胀。
+
+        注：仅对带有非空 ``message_id`` 的 ``USER_MESSAGE`` 启用去重；
+        其它事件类型（如 ``BOT_PLANNING``、``WAITING_UPDATE``）允许重复，
+        因为它们记录的是时间序列上的不同决策瞬间。
+        """
+        if (
+            entry.event_type == KFCEventType.USER_MESSAGE
+            and entry.message_id
+            and any(
+                existing.event_type == KFCEventType.USER_MESSAGE
+                and existing.message_id == entry.message_id
+                for existing in self._entries
+            )
+        ):
+            return
         self._entries.append(entry)
         if len(self._entries) > self._max_entries:
             self._entries = self._entries[-self._max_entries :]
@@ -255,5 +275,14 @@ class MentalLog:
 
         if event == KFCEventType.PROACTIVE_TRIGGER:
             return entry.content[:60] if entry.content else "主动发起"
+
+        if event == KFCEventType.MEMO_WRITTEN:
+            return f"记下备忘: {entry.content[:40]}"
+
+        if event == KFCEventType.MEMO_DELETED:
+            return f"删除备忘: {entry.content[:40]}"
+
+        if event == KFCEventType.MEMO_EXPIRED:
+            return f"备忘到期: {entry.content[:40]}"
 
         return entry.content[:60] if entry.content else str(event)

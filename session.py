@@ -17,7 +17,12 @@ from src.app.plugin_system.api.log_api import get_logger
 
 from .domain.scene_state import SceneState
 from .mental_log import MentalLog, MentalLogEntry
-from .models import KFCEventType, WaitingConfig
+from .models import (
+    MEMO_MAX_ENTRIES,
+    KFCEventType,
+    Memo,
+    WaitingConfig,
+)
 
 logger = get_logger("kfc_session")
 
@@ -64,6 +69,11 @@ class KFCSession:
     # TODO: scene_state 目前始终为 unknown，业务层尚未接入更新逻辑。
     #       等待后续功能迭代（如场景感知工具、场景推断模块）接入后再实现。
     scene_state: SceneState = field(default_factory=SceneState)
+
+    # 私人备忘录：LLM 显式记录的、带过期时间的中短期关键事项。
+    # 与 mental_log（自动事件流）和 history_summary（叙事压缩）互补，
+    # 渲染时作为 turn 级 ContextContribution 注入用户提示词末尾，不进 chain。
+    memos: list[Memo] = field(default_factory=list)
 
     # 统计
     total_interactions: int = 0
@@ -159,6 +169,13 @@ class KFCSession:
     ) -> None:
         """追加新的对话条目到持久化链，并裁剪至 max_payloads 条目。
 
+        对 user 条目按 ``(text, ts)`` 做幂等去重：若链中已存在与新 user 条目
+        ``text`` 与 ``ts`` 完全相同的记录，则跳过该条。防止 LLM 失败后
+        下一 Tick 重新消费同一批 unread 时，同一条用户消息被反复 append。
+
+        ASSISTANT 条目不参与去重——正常路径下每次 commit 都对应一次新的
+        LLM 输出，即便文本恰好相同也应保留时序结构。
+
         Args:
             new_entries: 要追加的条目列表，每条格式为
                 ``{"role": "user"|"assistant", "text": "...", "ts": float}``。
@@ -166,7 +183,25 @@ class KFCSession:
                 ASSISTANT 条目无需携带 ``ts``。
             max_payloads: 链最大条目数，超出时删除最老的条目。
         """
-        self.chain_payloads.extend(new_entries)
+        filtered: list[dict[str, Any]] = []
+        for entry in new_entries:
+            if entry.get("role") == "user":
+                new_text = entry.get("text", "")
+                new_ts = entry.get("ts", 0.0)
+                duplicated = any(
+                    existing.get("role") == "user"
+                    and existing.get("text", "") == new_text
+                    and existing.get("ts", 0.0) == new_ts
+                    for existing in self.chain_payloads
+                )
+                if duplicated:
+                    continue
+            filtered.append(entry)
+
+        if not filtered:
+            return
+
+        self.chain_payloads.extend(filtered)
         if len(self.chain_payloads) > max_payloads:
             self.chain_payloads = self.chain_payloads[-max_payloads:]
             # 确保裁剪后首条是 user，避免孤立的 assistant 导致上下文非法
@@ -215,6 +250,103 @@ class KFCSession:
         self.mental_log.add(entry)
         return entry
 
+    # ── 备忘录管理 ────────────────────────────────────────
+
+    def prune_expired_memos(self) -> list[Memo]:
+        """删除已过期的备忘并返回被删除的列表（懒清理入口）。
+
+        返回值供调用方决定是否往 mental_log 写 MEMO_EXPIRED 事件。
+        """
+        if not self.memos:
+            return []
+        now = time.time()
+        expired = [memo for memo in self.memos if memo.is_expired(now)]
+        if not expired:
+            return []
+        self.memos = [memo for memo in self.memos if not memo.is_expired(now)]
+        return expired
+
+    def upsert_memo(self, memo: Memo) -> tuple[Memo, bool]:
+        """写入或刷新一条备忘。
+
+        若存在 ``content`` 完全相同的有效备忘，则只刷新它的过期时间和
+        intent（保留 created_at），返回 ``(刷新后的备忘, False)``；
+        否则按 ``created_at`` 升序在到达上限时淘汰最早的，再追加新备忘，
+        返回 ``(新备忘, True)``。
+
+        Args:
+            memo: 待写入的备忘。
+
+        Returns:
+            tuple: ``(最终落盘的备忘对象, is_new_created)``
+        """
+        # 先做懒清理
+        self.prune_expired_memos()
+
+        normalized_content = memo.content.strip()
+        if normalized_content:
+            for existing in self.memos:
+                if existing.content.strip() == normalized_content:
+                    existing.expires_at = memo.expires_at
+                    if memo.intent.strip():
+                        existing.intent = memo.intent
+                    return existing, False
+
+        # 数量上限：超过则按 created_at 升序淘汰最早的
+        while len(self.memos) >= MEMO_MAX_ENTRIES:
+            oldest_idx = min(
+                range(len(self.memos)),
+                key=lambda i: self.memos[i].created_at,
+            )
+            self.memos.pop(oldest_idx)
+
+        self.memos.append(memo)
+        return memo, True
+
+    def delete_memos(self, memo_ids: list[str]) -> list[Memo]:
+        """按 id 删除备忘并返回被删除的列表。
+
+        Args:
+            memo_ids: 待删除的备忘 id 列表。
+
+        Returns:
+            list[Memo]: 实际被删除的备忘列表（用于落盘 mental_log 事件）。
+        """
+        if not memo_ids or not self.memos:
+            return []
+        target_ids = set(memo_ids)
+        deleted = [memo for memo in self.memos if memo.memo_id in target_ids]
+        if not deleted:
+            return []
+        self.memos = [memo for memo in self.memos if memo.memo_id not in target_ids]
+        return deleted
+
+    def add_memo_event(
+        self,
+        event_type: KFCEventType,
+        memo: Memo,
+    ) -> MentalLogEntry:
+        """把备忘相关事件写入心理活动流。
+
+        Args:
+            event_type: 必须是 MEMO_WRITTEN / MEMO_DELETED / MEMO_EXPIRED 之一。
+            memo: 关联的备忘对象（用于在叙事中展示内容）。
+        """
+        entry = MentalLogEntry(
+            event_type=event_type,
+            timestamp=time.time(),
+            content=memo.content,
+            metadata={
+                "memo_id": memo.memo_id,
+                "intent": memo.intent,
+                "expires_at": memo.expires_at,
+            },
+        )
+        self.mental_log.add(entry)
+        return entry
+
+    # ── 序列化 ────────────────────────────────────────────
+
     def to_dict(self) -> dict[str, Any]:
         """序列化为字典。"""
         return {
@@ -237,6 +369,7 @@ class KFCSession:
             "last_compress_at": self.last_compress_at,
             "compress_round_count": self.compress_round_count,
             "scene_state": self.scene_state.to_dict(),
+            "memos": [memo.to_dict() for memo in self.memos],
         }
 
     @classmethod
@@ -277,6 +410,12 @@ class KFCSession:
         session.last_compress_at = float(data.get("last_compress_at", 0.0))
         session.compress_round_count = int(data.get("compress_round_count", 0))
         session.scene_state = SceneState.from_dict(data.get("scene_state", {}))
+        # 备忘录列表（每条都是独立 Memo 对象）
+        session.memos = [
+            Memo.from_dict(item)
+            for item in data.get("memos", []) or []
+            if isinstance(item, dict)
+        ]
         return session
 
 

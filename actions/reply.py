@@ -25,18 +25,67 @@ _METADATA_KEYWORDS = [
 _METADATA_PATTERNS = [re.compile(kw, re.IGNORECASE) for kw in _METADATA_KEYWORDS]
 
 
+# KFC 元数据字段：通过 schema 强制 LLM 每次调用都明确给出，
+# 但 execute() 签名保留默认值以兼容运行时只传 content/reply_to 的调用路径。
+# parser 层会在 LLM 返回的 args 中把这些字段提取走（extract_metadata），
+# 不会真的把这些值传到 execute()。
+_KFC_METADATA_REQUIRED_FIELDS: tuple[str, ...] = (
+    "thought",
+    "expected_reaction",
+    "max_wait_seconds",
+    "mood",
+)
+
+
+def _force_kfc_metadata_required(schema: dict) -> dict:
+    """把 KFC 元数据字段在 schema 里标成 required。
+
+    通用工具：从 schema 的 properties 里取出元数据字段对应的描述，
+    并把它们追加到 required 列表（去重保序）。
+    """
+    func = schema.get("function", {})
+    params = func.get("parameters", {})
+    properties = params.get("properties", {}) or {}
+    existing_required = list(params.get("required", []) or [])
+
+    # 元数据字段如果没在 properties（理论不会），跳过，避免 schema 不一致
+    for field_name in _KFC_METADATA_REQUIRED_FIELDS:
+        if field_name not in properties:
+            continue
+        # 同时把字段的 default 字段去掉（required 字段不应该有 default 元信息）
+        properties[field_name].pop("default", None)
+        if field_name not in existing_required:
+            existing_required.append(field_name)
+
+    params["required"] = existing_required
+    return schema
+
+
 class KFCReplyAction(BaseAction):
     """发送文本消息给对方。"""
 
     action_name = "kfc_reply"
+    associated_types: list[str] = ["text"]
     action_description = (
         "发送文本消息给对方。"
         "content 为消息段落列表，每个元素是一条独立消息，系统会依次发出。"
         "可选的 reply_to 参数允许你引用消息（虽然私聊中较少用到，但引用旧消息时可能有用）。"
         "注意：本工具无法发送表情包等非文本内容。"
+        "**调用时必须明确给出 thought / expected_reaction / max_wait_seconds / mood 这四个字段，"
+        "它们承载你这次决策的内心活动、对对方反应的预期、等待时长和当前情绪。**"
     )
 
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
+
+    @classmethod
+    def to_schema(cls) -> dict:  # type: ignore[override]
+        """把 KFC 元数据字段在 schema 里标记为 required。
+
+        execute() 签名保留默认值是为了兼容运行时由 chatter 直接调用
+        （只传 content/reply_to）的场景，避免 TypeError；但暴露给 LLM
+        的 schema 里这些字段必须必填，防止模型遗漏关键决策上下文。
+        """
+        return _force_kfc_metadata_required(super().to_schema())
 
     async def execute(
         self,
@@ -44,10 +93,22 @@ class KFCReplyAction(BaseAction):
             list[str],
             "要发送的消息段落列表，每个元素是一条独立消息，系统会依次发出。",
         ],
-        thought: Annotated[str, "你此刻的内心想法和感受，描述你为什么要这样回复"] = "",
-        expected_reaction: Annotated[str, "你期望对方看到你这条消息后的反应"] = "",
-        max_wait_seconds: Annotated[float, "你愿意等待对方回复的最长时间(秒)，0表示不等待"] = 0.0,
-        mood: Annotated[str, "你当前的心情，用一两个词描述"] = "",
+        thought: Annotated[
+            str,
+            "**必填**。你此刻的内心想法和感受，描述你为什么要这样回复。",
+        ] = "",
+        expected_reaction: Annotated[
+            str,
+            "**必填**。你期望对方看到你这条消息后的反应。",
+        ] = "",
+        max_wait_seconds: Annotated[
+            float,
+            "**必填**。你愿意等待对方回复的最长时间（秒），0 表示不等待。",
+        ] = 0.0,
+        mood: Annotated[
+            str,
+            "**必填**。你当前的心情，用一两个词描述。",
+        ] = "",
         reply_to: Annotated[str, "可选，要引用回复的消息 ID"] = "",
     ) -> tuple[bool, str]:
         """执行发送文本消息的逻辑。

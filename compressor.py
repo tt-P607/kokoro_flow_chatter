@@ -69,14 +69,17 @@ async def compress_history(
         logger.debug(f"[KFC] 压缩：流 {stream_id} 最近 {days} 天无消息，跳过")
         return
 
-    # ── 2. 格式化消息文本（同 fused_narrative 格式）──
+    # ── 2. 收集 (时间戳, 单行文本) 元组 ──
+    # 同时容纳消息与内心活动，按时间戳统一排序，再按天分组渲染
     bot_id = chat_stream.bot_id or ""
-    formatted_lines: list[str] = []
+    collected: list[tuple[float, str]] = []
 
     for msg in window_msgs:
         ts = _msg_time(msg)
+        if ts <= 0:
+            continue
         try:
-            time_str = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
         except (OSError, ValueError, OverflowError):
             continue
 
@@ -93,19 +96,19 @@ async def compress_history(
             or message_id.startswith("action_kfc_reply")
         )
         if is_bot:
-            formatted_lines.append(f"[{time_str}] 你回复：{text}")
+            collected.append((ts, f"[{time_str}] 你回复：{text}"))
         else:
-            formatted_lines.append(f"[{time_str}] {sender}说：{text}")
+            collected.append((ts, f"[{time_str}] {sender}说：{text}"))
 
-    if not formatted_lines:
+    # 同时从 mental_log 中加入内心活动（BOT_PLANNING 的 thought）
+    _merge_mental_log(collected, session, since_ts)
+
+    if not collected:
         logger.debug(f"[KFC] 压缩：流 {stream_id} 格式化后无有效内容，跳过")
         return
 
-    # 同时从 mental_log 中加入内心活动（BOT_PLANNING 的 thought）
-    _merge_mental_log(formatted_lines, session, since_ts)
-    formatted_lines.sort()  # 按 "[时间戳]" 字符串排序（格式一致时等价于按时间排序）
-
-    history_text = "\n".join(formatted_lines)
+    collected.sort(key=lambda item: item[0])
+    history_text = _render_by_day(collected)
 
     # ── 3. 构建 LLM 请求 ──
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -121,16 +124,26 @@ async def compress_history(
         logger.warning(f"[KFC] 压缩：构建 system_prompt 失败：{exc}")
         return
 
+    min_chars = config.prompt.compress_min_chars
+    max_chars = config.prompt.compress_max_chars
+    # 防御式校正：保证 max >= min 且二者均为正数
+    if min_chars < 0:
+        min_chars = 0
+    if max_chars < min_chars:
+        max_chars = min_chars
+
     compress_instruction = (
         f"当前时间：{now_str}\n\n"
-        f"以下是你与{user_name}之间最近 {days:.0f} 天的对话记录。\n\n"
+        f"以下是你与{user_name}之间最近 {days:.0f} 天的对话记录，"
+        "已按自然天分组：每个 `=== 日期（星期，相对时间）===` 标题之下，"
+        "都是当天的消息与你当时的内心活动，行首 `[HH:MM:SS]` 是当天的时间。\n\n"
         f"【近期对话记录】\n{history_text}\n\n"
-        "请你以第一人称（'我'）写一段简洁的近期记忆摘要，要求：\n"
-        "1. 覆盖上述对话中你认为值得记住的内容\n"
-        "2. 保留时间感：无需精确到秒，但重要节点要有相对时间描述（如'昨天深夜'、'今天下午'、'前天'）\n"
-        "3. 保留关键情感节点、对方的重要信息、承诺与期待\n"
-        "4. 字数控制在 800-1200 字，用感性而真实的自然语言\n"
-        "5. 不要包含任何 JSON 或结构化标记，直接输出摘要正文"
+        "请你以第一人称（'我'）写一段近期记忆摘要（Memory Stream），要求：\n"
+        "1. 【按重要性分配篇幅】：不要把笔墨平均分配给每天。对于关键情感节点、重要的约定、影响关系的事件、对方吐露的心声，应分配较大篇幅详细记录（甚至保留核心原话）；对于日常寒暄、琐碎水文、流水账，一笔带过或直接忽略。\n"
+        "2. 【保留时间感】：直接使用'今天下午'、'昨天深夜'、'前天'、'三天前'这类相对描述（对应分组标题里的相对时间），不要写出具体数字日期。\n"
+        "3. 【主观真实感】：这是你脑海中流淌的真实记忆，用感性且符合你人设的自然语言叙述，体现你对这些事的感受与想法。\n"
+        f"4. 【字数限制】：总字数控制在 {min_chars}-{max_chars} 字。\n"
+        "5. 【纯文本输出】：不要包含任何 JSON 或结构化标记，直接输出记忆正文。"
     )
 
     # 注入 actor_reminder（如有）
@@ -163,7 +176,7 @@ async def compress_history(
     session.compress_round_count = 0
     logger.info(
         f"[KFC] 近期记忆压缩完成：流 {stream_id}，"
-        f"覆盖 {len(formatted_lines)} 条消息，"
+        f"覆盖 {len(collected)} 条消息，"
         f"摘要 {len(summary)} 字"
     )
 
@@ -203,11 +216,11 @@ def _msg_time(msg: Any) -> float:
 
 
 def _merge_mental_log(
-    lines: list[str],
+    collected: list[tuple[float, str]],
     session: "KFCSession",
     since_ts: float,
 ) -> None:
-    """将 mental_log 中的 BOT_PLANNING thought 合并入 lines。"""
+    """将 mental_log 中的 BOT_PLANNING thought 以 (ts, line) 元组合并入列表。"""
     mental_log = session.mental_log
     if not mental_log:
         return
@@ -219,8 +232,60 @@ def _merge_mental_log(
             continue
         try:
             time_str = datetime.datetime.fromtimestamp(entry.timestamp).strftime(
-                "%Y-%m-%d %H:%M:%S"
+                "%H:%M:%S"
             )
         except (OSError, ValueError, OverflowError):
             continue
-        lines.append(f"[{time_str}] （你的内心：{entry.thought}）")
+        collected.append(
+            (entry.timestamp, f"[{time_str}] （你的内心：{entry.thought}）")
+        )
+
+
+# 中文星期，下标从 weekday() 直接取
+_WEEKDAY_ZH: tuple[str, ...] = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _render_by_day(collected: list[tuple[float, str]]) -> str:
+    """将 (时间戳, 行) 序列按"自然天"分组渲染。
+
+    每天一个小标题：``=== YYYY-MM-DD（周X，N 天前 / 今天 / 昨天）===``，
+    段内每行只保留 ``[HH:MM:SS]``。
+    LLM 据此即可分辨同一天内与跨天的时间关系。
+    """
+    if not collected:
+        return ""
+
+    today = datetime.date.today()
+    grouped: dict[datetime.date, list[str]] = {}
+    order: list[datetime.date] = []
+
+    for ts, line in collected:
+        try:
+            day = datetime.datetime.fromtimestamp(ts).date()
+        except (OSError, ValueError, OverflowError):
+            continue
+        if day not in grouped:
+            grouped[day] = []
+            order.append(day)
+        grouped[day].append(line)
+
+    sections: list[str] = []
+    for day in sorted(order):
+        delta_days = (today - day).days
+        if delta_days == 0:
+            relative = "今天"
+        elif delta_days == 1:
+            relative = "昨天"
+        elif delta_days == 2:
+            relative = "前天"
+        elif delta_days > 0:
+            relative = f"{delta_days} 天前"
+        else:
+            # 极端情况：消息时间晚于今天（系统时钟漂移），降级为日期描述
+            relative = f"{-delta_days} 天后"
+        weekday = _WEEKDAY_ZH[day.weekday()]
+        header = f"=== {day.isoformat()}（{weekday}，{relative}）==="
+        body = "\n".join(grouped[day])
+        sections.append(f"{header}\n{body}")
+
+    return "\n\n".join(sections)

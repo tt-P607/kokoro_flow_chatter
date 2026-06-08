@@ -1,11 +1,12 @@
 """KokoroFlowChatter 数据模型。
 
-定义所有共享数据类型：事件类型枚举、等待配置、工具调用解析结果等。
+定义所有共享数据类型：事件类型枚举、等待配置、工具调用解析结果、备忘录等。
 """
 
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -107,9 +108,97 @@ class KFCEventType(Enum):
     WAIT_TIMEOUT = "wait_timeout"
     PROACTIVE_TRIGGER = "proactive_trigger"
     USER_INTERRUPTED = "user_interrupted"
+    # 备忘录事件
+    MEMO_WRITTEN = "memo_written"
+    MEMO_DELETED = "memo_deleted"
+    MEMO_EXPIRED = "memo_expired"
 
     def __str__(self) -> str:
         return self.value
+
+
+# ── 备忘录 ────────────────────────────────────────────────
+
+
+# 备忘录配置常量（不暴露为配置项，全部写死）
+MEMO_MAX_ENTRIES: int = 10
+"""单流最大有效备忘条目数；超出按 created_at 升序淘汰。"""
+
+MEMO_DEFAULT_EXPIRE_HOURS: float = 24.0
+"""LLM 不指定 expire_hours 时的默认过期时长。"""
+
+MEMO_MIN_EXPIRE_HOURS: float = 1.0
+"""允许的最小过期时长（小于此值会夹到此值）。"""
+
+MEMO_MAX_EXPIRE_HOURS: float = 14 * 24.0
+"""允许的最大过期时长（14 天）。超出会夹到此值。"""
+
+MEMO_ID_LENGTH: int = 6
+"""备忘 id 的短 hex 长度，便于 LLM 输出。"""
+
+
+@dataclass
+class Memo:
+    """单条备忘录。
+
+    设计定位：LLM 显式标记的、带过期时间的关键事项。
+    与 mental_log（自动事件流）和 history_summary（叙事压缩）互补，
+    覆盖"接下来一段时间需要明确意识到的事"这一语义层。
+    """
+
+    memo_id: str = ""
+    content: str = ""
+    intent: str = ""
+    created_at: float = 0.0
+    expires_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not self.memo_id:
+            self.memo_id = uuid.uuid4().hex[:MEMO_ID_LENGTH]
+        if self.created_at <= 0:
+            self.created_at = time.time()
+
+    def is_expired(self, now: float | None = None) -> bool:
+        """判断该备忘是否已过期。"""
+        current = now if now is not None else time.time()
+        return self.expires_at > 0 and current >= self.expires_at
+
+    def remaining_seconds(self, now: float | None = None) -> float:
+        """剩余秒数（已过期返回 0）。"""
+        current = now if now is not None else time.time()
+        return max(0.0, self.expires_at - current)
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为字典。"""
+        return {
+            "memo_id": self.memo_id,
+            "content": self.content,
+            "intent": self.intent,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Memo:
+        """从字典反序列化。"""
+        return cls(
+            memo_id=str(data.get("memo_id", "") or ""),
+            content=str(data.get("content", "") or ""),
+            intent=str(data.get("intent", "") or ""),
+            created_at=float(data.get("created_at", 0.0) or 0.0),
+            expires_at=float(data.get("expires_at", 0.0) or 0.0),
+        )
+
+
+def clamp_expire_hours(raw: float) -> float:
+    """把 LLM 给的 expire_hours 夹到 [MEMO_MIN, MEMO_MAX] 范围。"""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return MEMO_DEFAULT_EXPIRE_HOURS
+    if value <= 0:
+        return MEMO_DEFAULT_EXPIRE_HOURS
+    return max(MEMO_MIN_EXPIRE_HOURS, min(value, MEMO_MAX_EXPIRE_HOURS))
 
 
 @dataclass

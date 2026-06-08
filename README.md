@@ -46,8 +46,38 @@ tool calling -> response_normalizer -> Decision
 | `kfc_reply` | 发送消息，携带 `content`、`thought`、`expected_reaction`、`max_wait_seconds`、`mood` |
 | `do_nothing` | 选择不回复，携带 `thought`、`max_wait_seconds` |
 | `schedule_proactive` | 预约下一次主动思考时间，携带 `delay_minutes`、`reason` |
+| `kfc_memo` | 写入或刷新一条带过期时间的私人备忘录，携带 `content`、`intent`、`expire_hours`、`reason` |
+| `kfc_memo_delete` | 按 id 删除一条或多条已不再需要的备忘录，携带 `memo_ids`、`reason` |
 
 同时自动注册框架中所有第三方工具（Action / Tool），如 `send_emoji`、`update_impression` 等。
+
+### 私人备忘录
+
+KFC 内嵌了一套轻量备忘录系统，覆盖 `mental_log`（自动事件流）和 `history_summary`（叙事压缩）之间的语义空白：**LLM 显式标记的、带过期时间的中短期关键事项**。
+
+- **写入**：通过 `kfc_memo` 工具，由 LLM 自主决定何时记录。
+- **过期时长**：LLM 自行设定，范围 1 小时 ~ 14 天，默认 24 小时。
+- **数量上限**：单流最多保留 10 条；超过会自动淘汰创建最早的。
+- **自动刷新**：`content` 完全相同的备忘会刷新过期时间，不会重复创建。
+- **删除**：模型应在事情已做/已兑现/不再相关时主动调用 `kfc_memo_delete`，过期时间只是兜底。
+- **渲染位置**：每次发请求时作为 turn 级临时块注入到用户提示词末尾，**不进入持久化对话链**，不破坏 LLM provider 的前缀缓存。
+- **存储**：直接序列化到 `data/kokoro_flow_chatter/sessions/<stream_id>.json` 的 `memos` 字段，可手动编辑。
+- **审计**：备忘的写入、删除、过期都会写入 `mental_log`，模型在心理活动流中能看到这些事件。
+
+注入文本结构示意：
+
+```
+## 我的备忘录
+（关于这些备忘的使用心法）
+
+### 当前条目
+#1
+- id: a3f2b1
+- 内容: 他今天牙疼，少提甜食
+- 动机: 他刚提到这事，避开甜食话题
+- 创建时间: 2026-06-08 12:34
+- 过期时间: 2026-06-08 18:34（剩余约 6 小时）
+```
 
 ### 消息积累窗口
 
@@ -139,6 +169,8 @@ kokoro_flow_chatter/
 ├── actions/
 │   ├── reply.py             # kfc_reply 动作
 │   ├── do_nothing.py        # do_nothing 动作
+│   ├── pass_and_wait.py     # pass_and_wait 动作
+│   ├── memo.py              # kfc_memo / kfc_memo_delete 动作（私人备忘录）
 │   └── schedule_proactive.py # schedule_proactive 动作（预约主动思考）
 ├── handlers/
 │   └── proactive_handler.py # 主动发起事件处理
@@ -211,6 +243,8 @@ kokoro_flow_chatter/
 | `compress_every_n_rounds` | `50` | 每 N 轮对话触发一次近期记忆压缩 |
 | `compress_days_window` | `3.0` | 压缩时覆盖的历史时间窗口（天） |
 | `min_compress_interval_minutes` | `120.0` | 两次压缩之间的最短间隔（分钟） |
+| `compress_min_chars` | `800` | 近期记忆摘要最小字数（用于写入压缩指令） |
+| `compress_max_chars` | `1200` | 近期记忆摘要最大字数（用于写入压缩指令） |
 
 ### 消息缓冲与打断 `[buffer]`
 

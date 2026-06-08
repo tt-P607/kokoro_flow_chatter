@@ -78,6 +78,7 @@ class KFCPromptBuilder:
         media_items: list[Any] | None = None,
         stream_id: str = "",
         chat_stream: ChatStream | None = None,
+        session: Any = None,
     ) -> tuple[LLMPayload, LLMPayload | None, str]:
         """构建用户消息 Payload。
 
@@ -95,6 +96,8 @@ class KFCPromptBuilder:
             media_items: 多模态图片列表（可选，来自 extract_media_from_messages）
             stream_id: 当前聊天流 ID（供 on_prompt_build 事件处理器读取）
             chat_stream: 当前聊天流，用于构建末尾的平台身份和强调信息
+            session: KFCSession，传入后备忘录会作为 turn 级 contribution 注入到
+                extra_payload 中；为 None 时不注入备忘录
 
         Returns:
             tuple: (user_payload, extra_payload | None, chain_text)
@@ -106,6 +109,7 @@ class KFCPromptBuilder:
             formatted_unreads=formatted_unreads,
             stream_id=stream_id,
             chat_stream=chat_stream,
+            session=session,
         )
         return self._renderer.render_user_payload(plan, media_items=media_items)
 

@@ -317,6 +317,22 @@ async def execute_orchestrator(
             except Exception as exc:
                 logger.error(f"LLM 请求失败: {exc}", exc_info=True)
                 extra_payload = None
+                # 失败路径必须与成功路径保持同样的 unread 消费契约：
+                # 框架 LLM 层已在内部跑完 policy 重试与多模型 fallback，
+                # 异常穿透到这里说明这批消息当下确实无法处理。若不消费 unread，
+                # 框架下一 Tick 仍会拿同一批未读再次拉起 execute()，叠加
+                # KFC 的"先持久化、后发送"时序，sessions/xxx.json 会被
+                # 同一条触发消息反复 append 到 mental_log / chain_payloads。
+                # 这里把 user 条目对应的 unread 搬入 history（已通过
+                # update_chain 写入持久化链，仍可在下次上下文中被还原），
+                # 把决定权交还给框架的正常 Tick 调度。
+                if unread_msgs:
+                    try:
+                        await self.flush_unreads(unread_msgs)
+                    except Exception as flush_exc:
+                        logger.warning(
+                            f"LLM 失败后 flush_unreads 失败（不影响主流程）: {flush_exc}"
+                        )
                 await self._save_session(session)
                 yield Failure("LLM 请求失败", exc)
                 break

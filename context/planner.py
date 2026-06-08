@@ -7,6 +7,7 @@ from typing import Any
 from src.app.plugin_system.api.log_api import get_logger
 
 from .sources.initial_source import build_initial_context_plan
+from .sources.memo_source import build_memo_contribution
 from .sources.plugin_source import collect_plugin_turn_contributions
 from .types import ContextPlan, InitialContextPlan
 
@@ -46,8 +47,17 @@ class ContextPlanner:
         formatted_unreads: str,
         stream_id: str = "",
         chat_stream: Any = None,
+        session: Any = None,
     ) -> ContextPlan:
-        """规划本轮用户输入和第三方 turn 级上下文贡献。"""
+        """规划本轮用户输入和 turn 级上下文贡献。
+
+        Args:
+            formatted_unreads: 格式化后的未读消息文本
+            stream_id: 当前聊天流 ID（供 on_prompt_build 事件读取）
+            chat_stream: 当前聊天流（保留接口）
+            session: KFCSession，用于注入备忘录块；为 None 时跳过备忘录注入
+        """
+        _ = chat_stream
         last_mile = self._build_last_mile_instructions()
         chain_text = f"[新消息]\n{formatted_unreads}"
         user_text = f"{chain_text}\n\n---\n{last_mile}"
@@ -57,4 +67,11 @@ class ContextPlanner:
             content=user_text,
             stream_id=stream_id,
         )
+
+        # 备忘录注入（懒清理：先清掉过期再渲染；过期事件由调用方负责追加）
+        if session is not None and getattr(session, "memos", None):
+            memo_contribution = build_memo_contribution(session.memos)
+            if memo_contribution is not None:
+                contributions.append(memo_contribution)
+
         return ContextPlan(user_text=user_text, contributions=contributions, chain_text=chain_text)
