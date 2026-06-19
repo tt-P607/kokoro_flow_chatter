@@ -12,7 +12,7 @@ from src.app.plugin_system.api.llm_api import (
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import Failure, Stop, Success, Wait
 from src.kernel.concurrency import get_watchdog
-from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import ChatStream, LLMPayload, ROLE, Text
 
 from ..debug.log_formatter import log_kfc_result
 from ..domain.chain_entry import ChainEntry
@@ -131,6 +131,90 @@ _PLAIN_TEXT_RETRY_REMINDER = (
 )
 
 
+# 摘要标记前缀（用于在动态 USER payload 中定位摘要段落）
+_SUMMARY_MARKER_PREFIX = "【你对"
+_SUMMARY_MARKER_SUFFIX = "的近期记忆】"
+_SECTION_SEPARATOR = "\n\n---\n\n"
+
+
+def _hot_update_summary(
+    response: Any,
+    chat_stream: ChatStream,
+    session: Any,
+    prompt_builder: Any,
+) -> None:
+    """在 response 的动态 USER payload 中热替换摘要段落。
+
+    动态 USER payload 的结构为 channel_info + summary + history，
+    各部分以 ``\\n\\n---\\n\\n`` 分隔。本函数通过定位摘要标记前缀
+    ``【你对...的近期记忆】`` 来找到并替换摘要段落。
+    如果原始 payload 中不存在摘要（首次生成），则在适当位置插入。
+    """
+    from ..context.sources.history_source import build_history_summary_payload
+
+    new_summary = session.history_summary or ""
+    if not new_summary:
+        return
+
+    # 构建新的摘要文本
+    summary_payload = build_history_summary_payload(chat_stream, new_summary)
+    if summary_payload is None:
+        return
+    new_summary_text = ""
+    for item in summary_payload.content:
+        if hasattr(item, "text"):
+            new_summary_text += item.text  # type: ignore[attr-defined]
+    if not new_summary_text:
+        return
+
+    # 定位第一个 USER payload（动态上下文 payload）
+    payloads = getattr(response, "payloads", [])
+    dynamic_idx = -1
+    for idx, payload in enumerate(payloads):
+        if payload.role == ROLE.USER:
+            dynamic_idx = idx
+            break
+
+    if dynamic_idx < 0:
+        return
+
+    dynamic_payload = payloads[dynamic_idx]
+    # 提取当前文本
+    if isinstance(dynamic_payload.content, list):
+        old_text = ""
+        for item in dynamic_payload.content:
+            if hasattr(item, "text"):
+                old_text += item.text  # type: ignore[attr-defined]
+    elif hasattr(dynamic_payload.content, "text"):
+        old_text = dynamic_payload.content.text  # type: ignore[attr-defined]
+    else:
+        return
+
+    # 按段落分割并替换/插入摘要
+    sections = old_text.split(_SECTION_SEPARATOR)
+    summary_found = False
+    for i, section in enumerate(sections):
+        if _SUMMARY_MARKER_PREFIX in section and _SUMMARY_MARKER_SUFFIX in section:
+            sections[i] = new_summary_text
+            summary_found = True
+            break
+
+    if not summary_found:
+        # 摘要不存在（首次生成），在第一个段落（通道信息）之后插入
+        if len(sections) >= 2:
+            sections.insert(1, new_summary_text)
+        else:
+            sections.append(new_summary_text)
+
+    new_text = _SECTION_SEPARATOR.join(sections)
+
+    # 替换 payload 内容
+    if isinstance(dynamic_payload.content, list):
+        dynamic_payload.content[:] = [Text(new_text)]
+    else:
+        dynamic_payload.content = Text(new_text)
+
+
 async def execute_orchestrator(
     chatter: KokoroFlowChatter,
 ) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
@@ -212,8 +296,21 @@ async def execute_orchestrator(
         phase = ConversationPhase.WAIT_INPUT
         plain_text_retry_count = 0
         follow_up_count = 0
+        # 记录当前"烧入"初始上下文的摘要，用于检测后台压缩任务的更新
+        _baked_summary = session.history_summary or ""
 
         while True:
+            # ── 摘要热更新 ──
+            # 后台压缩任务可能已更新 session.history_summary，
+            # 如果发生变化，立即替换 response 中的动态上下文 payload。
+            current_summary = session.history_summary or ""
+            if current_summary != _baked_summary:
+                _hot_update_summary(
+                    response, chat_stream, session, prompt_builder,
+                )
+                _baked_summary = current_summary
+                logger.info("[KFC] 近期记忆摘要已热更新到 LLM 上下文")
+
             _heal_orphan_tool_results(response, where="loop-top")
             phase = phase_for_turn_start(
                 response,

@@ -213,6 +213,13 @@ class KFCConfig(BaseConfig):
             default=1200,
             description="近期记忆摘要的最大字数（写入压缩指令，引导 LLM 控制摘要长度上限）",
         )
+        compress_model_task: str = Field(
+            default="actor",
+            description=(
+                "近期记忆压缩使用的 LLM 模型任务（对应 model.toml 中的 task）。"
+                "独立于主对话模型配置，可选择更高性价比的模型用于摘要生成。"
+            ),
+        )
 
 
     @config_section("buffer")

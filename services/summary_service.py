@@ -27,6 +27,7 @@ class SummaryService:
         prompt_builder: KFCPromptBuilder,
         config: KFCConfig,
         chat_stream: Any,
+        session_store: Any = None,
     ) -> bool:
         """按当前 session 状态决定是否调度近期摘要压缩。"""
         trigger_empty = not session.history_summary
@@ -41,7 +42,10 @@ class SummaryService:
         )
         logger.info(f"[KFC] 触发近期记忆压缩：流 {session.stream_id}，原因：{reason}")
         get_task_manager().create_task(
-            compress_history(session, prompt_builder, config, chat_stream),
+            compress_history(
+                session, prompt_builder, config, chat_stream,
+                session_store=session_store,
+            ),
             name=f"kfc_compress_{session.stream_id}",
         )
         return True

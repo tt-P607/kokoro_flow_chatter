@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +34,7 @@ async def compress_history(
     prompt_builder: "KFCPromptBuilder",
     config: "KFCConfig",
     chat_stream: Any,
+    session_store: Any = None,
 ) -> None:
     """对最近 N 天的对话生成近期记忆摘要，更新 session.history_summary。
 
@@ -47,6 +47,7 @@ async def compress_history(
         prompt_builder: KFC prompt 构建器（用于获取 system_prompt）
         config: KFC 配置
         chat_stream: 当前聊天流（用于 system_prompt 构建）
+        session_store: 可选的 KFCSessionStore，传入时会在摘要更新后立即持久化
     """
     # 立即标记压缩时间，防止异步并发重复触发
     session.last_compress_at = time.time()
@@ -145,37 +146,67 @@ async def compress_history(
         "2. 【保留时间感】：直接使用'今天下午'、'昨天深夜'、'前天'、'三天前'这类相对描述（对应分组标题里的相对时间），不要写出具体数字日期。\n"
         "3. 【主观真实感】：这是你脑海中流淌的真实记忆，用感性且符合你人设的自然语言叙述，体现你对这些事的感受与想法。\n"
         f"4. 【字数限制】：总字数控制在 {min_chars}-{max_chars} 字。\n"
-        "5. 【纯文本输出】：直接输出记忆正文。不要使用工具调用格式、JSON 或任何结构化标记。"
+        '5. 【输出格式】：以 JSON 格式输出，只包含一个 `content` 字段，值为记忆正文字符串。示例：\n'
+        '```json\n{"content": "你的记忆正文..."}\n```'
     )
 
     # 注入 actor_reminder（如有）
     from src.app.plugin_system.api.prompt_api import get_system_reminder
     actor_reminder = get_system_reminder("actor")
 
-    # 直接使用 actor 模型任务，避免继承对话 model_set 的 max_tokens 限制
-    model_set = get_model_set_by_task(config.general.model_task)
+    # 使用独立的压缩模型任务，避免继承对话 model_set 的 max_tokens 限制
+    model_set = get_model_set_by_task(config.prompt.compress_model_task)
     llm_request = create_llm_request(model_set, f"kfc_compress_{stream_id}")
     llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
     if actor_reminder:
         llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(actor_reminder)))
     llm_request.add_payload(LLMPayload(ROLE.USER, Text(compress_instruction)))
 
-    # ── 4. 调用 LLM（非流式收集全文）──
-    try:
-        llm_response = await llm_request.send()
-        raw_summary = (await llm_response or "").strip()
-    except Exception as exc:
-        logger.warning(f"[KFC] 压缩：LLM 调用失败：{exc}")
+    # ── 4. 调用 LLM（非流式收集全文）带重试 ──
+    max_retries = 3
+    summary = ""
+    for attempt in range(1, max_retries + 1):
+        try:
+            llm_response = await llm_request.send()
+            raw_summary = (await llm_response or "").strip()
+        except Exception as exc:
+            logger.warning(f"[KFC] 压缩：LLM 调用失败（尝试 {attempt}/{max_retries}）：{exc}")
+            if attempt >= max_retries:
+                return
+            continue
+
+        if not raw_summary:
+            logger.warning(f"[KFC] 压缩：LLM 返回空（尝试 {attempt}/{max_retries}），重试")
+            if attempt >= max_retries:
+                return
+            continue
+
+        # 从 JSON 输出中提取 content 字段
+        summary, is_valid_json = _extract_summary_content(raw_summary)
+        
+        # 验证 JSON 完整性
+        if is_valid_json and summary:
+            # JSON 完整且有内容，成功
+            break
+        
+        if not is_valid_json:
+            logger.warning(
+                f"[KFC] 压缩：JSON 格式不完整（尝试 {attempt}/{max_retries}），重试"
+            )
+        else:
+            logger.warning(
+                f"[KFC] 压缩：摘要为空（尝试 {attempt}/{max_retries}），重试"
+            )
+        
+        if attempt >= max_retries:
+            logger.warning("[KFC] 压缩：达到最大重试次数，跳过")
+            return
+
+    if not summary:
+        logger.warning("[KFC] 压缩：所有尝试均失败，跳过")
         return
 
-    if not raw_summary:
-        logger.warning("[KFC] 压缩：LLM 返回空摘要，跳过")
-        return
-
-    # 容错解析：如果模型以 kfc_reply(...) 格式输出，从中提取 content
-    summary = _extract_summary_from_tool_call(raw_summary)
-
-    # ── 5. 更新 session（直接替换）──
+    # ── 5. 更新 session（直接替换）并持久化 ──
     session.history_summary = summary
     session.last_compress_at = time.time()
     session.compress_round_count = 0
@@ -184,6 +215,15 @@ async def compress_history(
         f"覆盖 {len(collected)} 条消息，"
         f"摘要 {len(summary)} 字"
     )
+
+    # 立即持久化，避免进程重启前摘要丢失
+    if session_store is not None:
+        try:
+            async with session_store.lock(stream_id):
+                await session_store.save(session)
+            logger.debug(f"[KFC] 近期记忆摘要已持久化：流 {stream_id}")
+        except Exception as exc:
+            logger.warning(f"[KFC] 近期记忆摘要持久化失败：{exc}")
 
 
 def should_compress(session: "KFCSession", config: "KFCConfig") -> bool:
@@ -211,87 +251,51 @@ def should_compress(session: "KFCSession", config: "KFCConfig") -> bool:
     return True
 
 
-# ── 容错解析 ──────────────────────────────────────────────
-
-# 匹配形如 kfc_reply(...) 的函数调用格式
-_TOOL_CALL_PATTERN = re.compile(
-    r"^\s*(?:kfc_reply|tool_call|ToolCall)\s*\(",
-    re.IGNORECASE,
-)
+# ── JSON 解析 ─────────────────────────────────────────────
 
 
-def _extract_summary_from_tool_call(raw: str) -> str:
-    """从 LLM 返回的原始文本中提取摘要内容。
+def _extract_summary_content(raw: str) -> tuple[str, bool]:
+    """从 LLM 返回的 JSON 输出中提取 content 字段。
 
-    如果模型错误地以 kfc_reply(...) 等工具调用格式输出了摘要，
-    尝试从中提取 ``content`` 字段的值；否则原样返回。
+    期望格式为 ``{"content": "..."}``。如果 JSON 解析失败，
+    回退使用原始文本（去除可能的 markdown 代码围栏）。
 
     Args:
         raw: LLM 返回的原始文本
 
     Returns:
-        str: 提取出的纯文本摘要
+        tuple[str, bool]: (提取出的摘要正文, JSON 是否完整有效)
     """
-    if not _TOOL_CALL_PATTERN.search(raw):
-        return raw
+    # 去除 markdown 代码围栏（```json ... ```）
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # 去掉首行 ```json 和末尾 ```
+        lines = cleaned.split("\n")
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
 
-    logger.debug("[KFC] 压缩：检测到工具调用格式输出，尝试提取 content 字段")
+    # 尝试找到 JSON 对象
+    brace_start = cleaned.find("{")
+    brace_end = cleaned.rfind("}")
+    if brace_start >= 0 and brace_end > brace_start:
+        json_str = cleaned[brace_start : brace_end + 1]
+        try:
+            data = json.loads(json_str)
+            content = data.get("content", "")
+            if isinstance(content, list):
+                extracted = "\n".join(str(item) for item in content if str(item).strip())
+            else:
+                extracted = str(content).strip()
+            # 返回提取的内容和 JSON 有效标志
+            return extracted, True
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            logger.debug("[KFC] 压缩：JSON 解析失败，回退使用原始文本")
 
-    # 策略 1：尝试从类 JSON 的 args 中提取 content
-    content = _try_extract_json_content(raw)
-    if content:
-        return content
-
-    # 策略 2：用正则提取 content=[...] 或 content="..." 格式
-    content = _try_extract_regex_content(raw)
-    if content:
-        return content
-
-    # 都失败了，返回原始文本
-    logger.debug("[KFC] 压缩：工具调用格式解析失败，使用原始文本")
-    return raw
-
-
-def _try_extract_json_content(raw: str) -> str:
-    """尝试从工具调用的 JSON args 中提取 content 字段。"""
-    # 尝试找到最外层的 { ... }
-    brace_start = raw.find("{")
-    brace_end = raw.rfind("}")
-    if brace_start < 0 or brace_end <= brace_start:
-        return ""
-
-    json_str = raw[brace_start : brace_end + 1]
-    try:
-        data = json.loads(json_str)
-        content = data.get("content", "")
-        if isinstance(content, list):
-            return "\n".join(str(item) for item in content if str(item).strip())
-        return str(content).strip()
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        return ""
-
-
-def _try_extract_regex_content(raw: str) -> str:
-    """用正则从 kfc_reply(content=...) 格式中提取 content。"""
-    # 匹配 content=["..."] 或 content="..."
-    match = re.search(
-        r'content\s*=\s*\[([^\]]*)\]',
-        raw,
-        re.DOTALL,
-    )
-    if match:
-        inner = match.group(1).strip()
-        # 去掉引号包裹，合并多段
-        segments = re.findall(r'"((?:[^"\\]|\\.)*)"', inner)
-        if segments:
-            return "\n".join(s.replace('\\"', '"').replace("\\n", "\n") for s in segments)
-
-    # 尝试匹配 content="..."
-    match = re.search(r'content\s*=\s*"((?:[^"\\]|\\.)*)"', raw, re.DOTALL)
-    if match:
-        return match.group(1).replace('\\"', '"').replace("\\n", "\n")
-
-    return ""
+    # JSON 解析失败，回退使用原始文本
+    return cleaned, False
 
 
 # ── 私有辅助函数 ──────────────────────────────────────────
