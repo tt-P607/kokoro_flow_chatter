@@ -10,6 +10,8 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import Stop, Wait
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
+from ..context.renderer import ContextRenderer
+from ..context.sources.plugin_source import collect_plugin_turn_contributions
 from ..domain.chain_entry import ChainEntry
 from ..domain.turn_trigger import TurnTrigger, classify_turn_trigger
 from ..models import KFCEventType, WaitingConfig
@@ -200,6 +202,17 @@ async def prepare_turn_input(
         if not timeout_upserted:
             # 框架已允许 TOOL_RESULT → USER，无需插入 ASSISTANT 桥接。
             response.add_payload(timeout_result.payload)
+
+        # 超时路径也需要收集第三方插件贡献，否则 extra_payload 始终为 None，
+        # 导致 prompt_injector 等插件注入的内容在超时轮中丢失。
+        timeout_contributions = await collect_plugin_turn_contributions(
+            prompt_name="kfc_user_prompt",
+            content="",
+            stream_id=chatter.stream_id,
+        )
+        if timeout_contributions:
+            renderer = ContextRenderer()
+            extra_payload = renderer.render_turn_contributions(timeout_contributions)
     else:
         # TurnTrigger.IDLE_WAIT: 既无新消息也未到超时，让出本 tick
         return _idle_result()

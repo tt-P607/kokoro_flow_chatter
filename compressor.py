@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import datetime
+import json
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -143,7 +145,7 @@ async def compress_history(
         "2. 【保留时间感】：直接使用'今天下午'、'昨天深夜'、'前天'、'三天前'这类相对描述（对应分组标题里的相对时间），不要写出具体数字日期。\n"
         "3. 【主观真实感】：这是你脑海中流淌的真实记忆，用感性且符合你人设的自然语言叙述，体现你对这些事的感受与想法。\n"
         f"4. 【字数限制】：总字数控制在 {min_chars}-{max_chars} 字。\n"
-        "5. 【纯文本输出】：不要包含任何 JSON 或结构化标记，直接输出记忆正文。"
+        "5. 【纯文本输出】：直接输出记忆正文。不要使用工具调用格式、JSON 或任何结构化标记。"
     )
 
     # 注入 actor_reminder（如有）
@@ -161,14 +163,17 @@ async def compress_history(
     # ── 4. 调用 LLM（非流式收集全文）──
     try:
         llm_response = await llm_request.send()
-        summary = (await llm_response or "").strip()
+        raw_summary = (await llm_response or "").strip()
     except Exception as exc:
         logger.warning(f"[KFC] 压缩：LLM 调用失败：{exc}")
         return
 
-    if not summary:
+    if not raw_summary:
         logger.warning("[KFC] 压缩：LLM 返回空摘要，跳过")
         return
+
+    # 容错解析：如果模型以 kfc_reply(...) 格式输出，从中提取 content
+    summary = _extract_summary_from_tool_call(raw_summary)
 
     # ── 5. 更新 session（直接替换）──
     session.history_summary = summary
@@ -204,6 +209,89 @@ def should_compress(session: "KFCSession", config: "KFCConfig") -> bool:
         return False
 
     return True
+
+
+# ── 容错解析 ──────────────────────────────────────────────
+
+# 匹配形如 kfc_reply(...) 的函数调用格式
+_TOOL_CALL_PATTERN = re.compile(
+    r"^\s*(?:kfc_reply|tool_call|ToolCall)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _extract_summary_from_tool_call(raw: str) -> str:
+    """从 LLM 返回的原始文本中提取摘要内容。
+
+    如果模型错误地以 kfc_reply(...) 等工具调用格式输出了摘要，
+    尝试从中提取 ``content`` 字段的值；否则原样返回。
+
+    Args:
+        raw: LLM 返回的原始文本
+
+    Returns:
+        str: 提取出的纯文本摘要
+    """
+    if not _TOOL_CALL_PATTERN.search(raw):
+        return raw
+
+    logger.debug("[KFC] 压缩：检测到工具调用格式输出，尝试提取 content 字段")
+
+    # 策略 1：尝试从类 JSON 的 args 中提取 content
+    content = _try_extract_json_content(raw)
+    if content:
+        return content
+
+    # 策略 2：用正则提取 content=[...] 或 content="..." 格式
+    content = _try_extract_regex_content(raw)
+    if content:
+        return content
+
+    # 都失败了，返回原始文本
+    logger.debug("[KFC] 压缩：工具调用格式解析失败，使用原始文本")
+    return raw
+
+
+def _try_extract_json_content(raw: str) -> str:
+    """尝试从工具调用的 JSON args 中提取 content 字段。"""
+    # 尝试找到最外层的 { ... }
+    brace_start = raw.find("{")
+    brace_end = raw.rfind("}")
+    if brace_start < 0 or brace_end <= brace_start:
+        return ""
+
+    json_str = raw[brace_start : brace_end + 1]
+    try:
+        data = json.loads(json_str)
+        content = data.get("content", "")
+        if isinstance(content, list):
+            return "\n".join(str(item) for item in content if str(item).strip())
+        return str(content).strip()
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return ""
+
+
+def _try_extract_regex_content(raw: str) -> str:
+    """用正则从 kfc_reply(content=...) 格式中提取 content。"""
+    # 匹配 content=["..."] 或 content="..."
+    match = re.search(
+        r'content\s*=\s*\[([^\]]*)\]',
+        raw,
+        re.DOTALL,
+    )
+    if match:
+        inner = match.group(1).strip()
+        # 去掉引号包裹，合并多段
+        segments = re.findall(r'"((?:[^"\\]|\\.)*)"', inner)
+        if segments:
+            return "\n".join(s.replace('\\"', '"').replace("\\n", "\n") for s in segments)
+
+    # 尝试匹配 content="..."
+    match = re.search(r'content\s*=\s*"((?:[^"\\]|\\.)*)"', raw, re.DOTALL)
+    if match:
+        return match.group(1).replace('\\"', '"').replace("\\n", "\n")
+
+    return ""
 
 
 # ── 私有辅助函数 ──────────────────────────────────────────
