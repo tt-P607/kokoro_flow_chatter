@@ -183,6 +183,17 @@ async def prepare_turn_input(
             response.add_payload(user_payload)
     elif trigger is TurnTrigger.FOLLOWUP_TOOL_RESULT:
         has_pending_tool_results = False
+        # 续轮路径也需要收集第三方插件贡献。
+        # 纯文本重试后下一轮走的就是这里，extra_payload 若为 None
+        # 会导致 prompt_injector 等插件注入的内容在续轮中丢失。
+        followup_contributions = await collect_plugin_turn_contributions(
+            prompt_name="kfc_user_prompt",
+            content="",
+            stream_id=chatter.stream_id,
+        )
+        if followup_contributions:
+            renderer = ContextRenderer()
+            extra_payload = renderer.render_turn_contributions(followup_contributions)
     elif trigger is TurnTrigger.TIMEOUT_EXPIRED:
         timeout_result = timeout_service.build_timeout_result(session)
         is_final_timeout = timeout_result.is_final_timeout

@@ -441,22 +441,30 @@ async def execute_orchestrator(
 
             call_list = response.call_list or []
 
-            # ── 纯文本重试机制 ──
-            # 当 LLM 返回纯文本（无 tool call）时，注入提醒并重试一次
+            # ── 纯文本/空响应重试机制 ──
+            # 当 LLM 没有返回工具调用时，注入提醒并重试
+            # 框架层只在异常时重试；API 返回 HTTP 200 但内容为空时不会触发，
+            # 因此 KFC 需要兜底处理空响应，避免直接进入 Stop 状态。
             if not call_list and plain_text_retry_count < _MAX_PLAIN_TEXT_RETRIES:
                 raw_message = (response.message or "").strip()
+                plain_text_retry_count += 1
+
                 if raw_message:
-                    plain_text_retry_count += 1
                     logger.info(
                         f"[KFC] LLM 返回纯文本（第 {plain_text_retry_count} 次），"
                         f"注入提醒后重试: {raw_message[:80]}"
                     )
-                    # 框架已允许 TOOL_RESULT → USER，纯文本重试时直接追加 USER 提醒。
-                    response.add_payload(
-                        LLMPayload(ROLE.USER, Text(_PLAIN_TEXT_RETRY_REMINDER))
+                else:
+                    logger.warning(
+                        f"[KFC] LLM 返回空响应（第 {plain_text_retry_count} 次），"
+                        "注入提醒后重试"
                     )
-                    has_pending_tool_results = True
-                    continue
+
+                response.add_payload(
+                    LLMPayload(ROLE.USER, Text(_PLAIN_TEXT_RETRY_REMINDER))
+                )
+                has_pending_tool_results = True
+                continue
 
             # 成功获得 tool call 时重置重试计数
             if call_list:

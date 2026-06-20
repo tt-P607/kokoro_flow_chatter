@@ -20,10 +20,13 @@ def build_initial_context_plan(
     """从配置与 session 提取初始上下文规划结果。"""
     from ...prompts.templates import KFC_REPLY_MODE_TOOL_CALLING
 
+    wait_instruction = str(config.general.wait_instruction).replace(
+        "{max_wait_seconds}", str(int(config.wait.max_seconds))
+    )
     extra_vars: dict[str, str] = {}
     extra_vars["reply_mode_instruction"] = KFC_REPLY_MODE_TOOL_CALLING.format(
         segment_instruction=config.general.segment_instruction,
-        wait_instruction=config.general.wait_instruction,
+        wait_instruction=wait_instruction,
     )
 
     custom_prompt = str(config.general.custom_decision_prompt or "").strip()
