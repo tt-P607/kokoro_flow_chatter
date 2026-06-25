@@ -72,7 +72,7 @@ def build_channel_payload(chat_stream: Any) -> LLMPayload:
         [
             "- 上述平台/聊天类型/ID 只是通道参数。除非有明确证据，否则不要自行脑补手机、屏幕、房间等物理场景细节。",
             "- 进行角色扮演时，应优先依据双方关系、语境和时间来组织描写。",
-            f"- 当前是一对一私聊，正在与你对话的是「{target_name}」。",
+            f"- 当前是一对一私聊，正在与你对话的是你与{target_name}。",
         ]
     )
     return LLMPayload(ROLE.USER, Text("\n".join(lines)))
