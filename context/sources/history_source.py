@@ -26,7 +26,7 @@ def build_history_summary_payload(
 
     user_name = (
         getattr(chat_stream, "partner_name", None)
-        or getattr(chat_stream, "group_name", None)
+        or getattr(chat_stream, "stream_name", None)
         or "对方"
     )
     return LLMPayload(
@@ -51,18 +51,28 @@ def build_channel_payload(chat_stream: Any) -> LLMPayload:
     platform = str(getattr(chat_stream, "platform", "") or "unknown")
     chat_type = str(getattr(chat_stream, "chat_type", "") or "unknown")
     bot_id = str(getattr(chat_stream, "bot_id", "") or "")
-    nickname = str(getattr(chat_stream, "bot_nickname", "") or "")
+    bot_nickname = str(getattr(chat_stream, "bot_nickname", "") or "")
+    
+    stream_name = str(getattr(chat_stream, "stream_name", "") or "")
+    partner_name = str(getattr(chat_stream, "partner_name", "") or "")
+    
+    target_name = partner_name or stream_name or "对方"
+    
     lines = [
         "[当前通道参数]",
         f"聊天平台：{platform}",
         f"聊天类型：{chat_type}",
     ]
-    if nickname or bot_id:
-        lines.append(f"你的通道身份：昵称 {nickname or '未知'}，ID {bot_id or '未知'}")
+    if bot_nickname or bot_id:
+        lines.append(f"你的通道身份：昵称 {bot_nickname or '未知'}，ID {bot_id or '未知'}")
+        
+    lines.append(f"当前私聊对象：{target_name}")
+        
     lines.extend(
         [
             "- 上述平台/聊天类型/ID 只是通道参数。除非有明确证据，否则不要自行脑补手机、屏幕、房间等物理场景细节。",
             "- 进行角色扮演时，应优先依据双方关系、语境和时间来组织描写。",
+            f"- 当前是一对一私聊，正在与你对话的是「{target_name}」。",
         ]
     )
     return LLMPayload(ROLE.USER, Text("\n".join(lines)))

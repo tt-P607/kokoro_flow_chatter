@@ -56,6 +56,9 @@ class _FakeSession:
     def __init__(self, waiting: bool = False) -> None:
         self._waiting = waiting
 
+    def prune_expired_memos(self) -> list[Any]:
+        return []
+
     def is_waiting(self) -> bool:
         """返回等待状态。"""
         return self._waiting
@@ -188,12 +191,52 @@ async def test_prepare_turn_input_non_message_triggers_keep_empty_wrapped_text()
                 payload=LLMPayload(ROLE.USER, Text("超时触发")),
             )
 
+    class _FakeSessionWithMethods:
+        def __init__(self, waiting: bool = False):
+            self.waiting = waiting
+            self.mental_log: list[Any] = []
+            self.consecutive_timeouts = 0
+            self.wait_start_time = 0.0
+            self.history_summary = ""
+            self.chain_payloads: list[Any] = []
+            self.memos: list[Any] = []
+        def prune_expired_memos(self) -> list[Any]:
+            return []
+        def add_memo_event(self, type_: Any, memo: Any) -> None:
+            pass
+        def is_waiting(self) -> bool:
+            return self.waiting
+        def is_proactive_schedule_pending(self) -> bool:
+            return False
+        def get_proactive_schedule(self) -> Any:
+            return None
+        def add_interrupt_event(self, msgs: Any) -> None:
+            pass
+        def is_proactive_pending(self) -> bool:
+            return False
+        def get_last_memo_event(self, type_: Any) -> Any:
+            return None
+        def get_last_active_time(self) -> float:
+            return 0.0
+        def update_chain(self, entries: list[Any], max_context_payloads: int) -> None:
+            pass
+        def clear_consecutive_timeouts(self) -> None:
+            pass
+        def set_waiting(self, value: bool) -> None:
+            self.waiting = value
+        def record_wait_start(self) -> None:
+            pass
+        def is_interrupt_event_pending(self) -> bool:
+            return False
+        def fetch_interrupt_events(self) -> list[Any]:
+            return []
+            
     followup = await prepare_turn_input(
         chatter=cast(Any, _FakeChatter()),
         response=_FakeResponse(),
         chat_stream=cast(Any, SimpleNamespace(platform="test")),
         config=cast(Any, SimpleNamespace()),
-        session=cast(Any, _FakeSession(waiting=False)),
+        session=cast(Any, _FakeSessionWithMethods(waiting=False)),
         prompt_builder=cast(Any, SimpleNamespace()),
         timeout_service=cast(Any, _TimeoutService()),
         has_pending_tool_results=True,
@@ -203,7 +246,7 @@ async def test_prepare_turn_input_non_message_triggers_keep_empty_wrapped_text()
         response=_FakeResponse(),
         chat_stream=cast(Any, SimpleNamespace(platform="test")),
         config=cast(Any, SimpleNamespace()),
-        session=cast(Any, _FakeSession(waiting=True)),
+        session=cast(Any, _FakeSessionWithMethods(waiting=True)),
         prompt_builder=cast(Any, SimpleNamespace()),
         timeout_service=cast(Any, _TimeoutService()),
         has_pending_tool_results=False,
@@ -848,18 +891,18 @@ def test_history_source_payload_builders_and_fused_narrative() -> None:
     )
     from plugins.kokoro_flow_chatter.models import KFCEventType
 
-    named_stream = SimpleNamespace(partner_name="言柒", group_name="群", context=SimpleNamespace(history_messages=[]))
-    group_stream = SimpleNamespace(partner_name="", group_name="群聊", context=SimpleNamespace(history_messages=[]))
-    unknown_stream = SimpleNamespace(partner_name="", group_name="", context=SimpleNamespace(history_messages=[]))
+    named_stream = SimpleNamespace(partner_name="言柒", stream_name="", context=SimpleNamespace(history_messages=[]))
+    group_stream = SimpleNamespace(partner_name="", stream_name="某人的私聊", context=SimpleNamespace(history_messages=[]))
+    unknown_stream = SimpleNamespace(partner_name="", stream_name="", context=SimpleNamespace(history_messages=[]))
 
     assert build_history_summary_payload(named_stream, "") is None
     assert _text_of(build_history_summary_payload(named_stream, "记忆") or cast(Any, None)) == "【你对言柒的近期记忆】\n记忆"
-    assert _text_of(build_history_summary_payload(group_stream, "记忆") or cast(Any, None)) == "【你对群聊的近期记忆】\n记忆"
+    assert _text_of(build_history_summary_payload(group_stream, "记忆") or cast(Any, None)) == "【你对某人的私聊的近期记忆】\n记忆"
     assert _text_of(build_history_summary_payload(unknown_stream, "记忆") or cast(Any, None)) == "【你对对方的近期记忆】\n记忆"
     time_payload = build_current_time_payload(datetime.datetime(2026, 5, 9, 22, 0))
     assert time_payload.role == ROLE.USER
     assert _text_of(time_payload) == "当前时间：2026-05-09 22:00"
-    channel_payload = build_channel_payload(SimpleNamespace(platform="qq", chat_type="group", bot_id="42", bot_nickname="狐狐"))
+    channel_payload = build_channel_payload(SimpleNamespace(platform="qq", chat_type="group", bot_id="42", bot_nickname="狐狐", stream_name="某群"))
     assert channel_payload.role == ROLE.USER
     assert "聊天平台：qq" in _text_of(channel_payload)
     assert "ID 42" in _text_of(channel_payload)

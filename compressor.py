@@ -117,7 +117,7 @@ async def compress_history(
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     user_name = (
         getattr(chat_stream, "partner_name", None)
-        or getattr(chat_stream, "group_name", None)
+        or getattr(chat_stream, "stream_name", None)
         or "对方"
     )
 

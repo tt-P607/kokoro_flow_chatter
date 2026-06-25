@@ -73,6 +73,23 @@ async def execute_decision_draft(
             content_raw = args.get("content", "")
             segments = _parse_content_segments(content_raw)
 
+            if not segments:
+                # 兜底：如果模型输出了工具但内容为空，强制判定为失败
+                send_ok = False
+                result.has_failed_tool = True
+                logger.warning(f"[KFC] LLM 返回的 {KFC_REPLY} content 为空或全是非文本内容，视为工具失败")
+                response.add_payload(
+                    LLMPayload(
+                        ROLE.TOOL_RESULT,
+                        ToolResult(
+                            value="发送失败：content 参数为空或解析后无有效内容，请重新思考并提供有效回复。",
+                            call_id=draft_call.call_id,
+                            name=draft_call.raw_name,
+                        ),
+                    )
+                )
+                continue
+
             send_ok = True
             for segment in segments:
                 if not is_first_reply:
@@ -86,6 +103,9 @@ async def execute_decision_draft(
                 if not send_ok:
                     break
 
+            if not send_ok:
+                result.has_failed_tool = True
+
             action_dict: dict[str, Any] = {"type": normalized_name}
             action_dict.update(args)
             action_dict["content"] = segments
@@ -94,7 +114,7 @@ async def execute_decision_draft(
                 LLMPayload(
                     ROLE.TOOL_RESULT,
                     ToolResult(
-                        value="已发送" if send_ok else "发送失败",
+                        value="已发送" if send_ok else "发送失败：内部发送环节异常，请重试或更换回复策略。",
                         call_id=draft_call.call_id,
                         name=draft_call.raw_name,
                     ),
