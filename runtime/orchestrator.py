@@ -121,9 +121,6 @@ def _preview_payload(payload: LLMPayload) -> str:
 
 logger = get_logger("kfc_chatter")
 
-# LLM 返回纯文本（无 tool call）时的最大重试次数
-_MAX_PLAIN_TEXT_RETRIES = 1
-
 # 重试时注入的提醒文本
 _PLAIN_TEXT_RETRY_REMINDER = (
     "（系统提示：你刚才返回了纯文本而非工具调用。"
@@ -445,7 +442,7 @@ async def execute_orchestrator(
             # 当 LLM 没有返回工具调用时，注入提醒并重试
             # 框架层只在异常时重试；API 返回 HTTP 200 但内容为空时不会触发，
             # 因此 KFC 需要兜底处理空响应，避免直接进入 Stop 状态。
-            if not call_list and plain_text_retry_count < _MAX_PLAIN_TEXT_RETRIES:
+            if not call_list and plain_text_retry_count < config.general.max_follow_up_retries:
                 raw_message = (response.message or "").strip()
                 plain_text_retry_count += 1
 
@@ -472,6 +469,10 @@ async def execute_orchestrator(
                 logger.info(f"本轮调用列表：{[call.name for call in call_list]}")
             elif response.message:
                 logger.debug("[KFC] 本轮无 tool call，进入决策判定")
+            else:
+                logger.warning(
+                    f"[KFC] LLM 经过 {plain_text_retry_count} 次重试仍未返回有效工具调用或有效文本，本轮响应将被强制收口"
+                )
 
             trigger_msg = unread_msgs[-1] if unread_msgs else None
             if trigger_msg is None:

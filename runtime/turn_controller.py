@@ -304,6 +304,10 @@ async def commit_turn_decision(
             logger.warning(
                 f"LLM 返回未形成有效决策: {response.message[:100]}"
             )
+        else:
+            logger.warning(
+                "[KFC] LLM 未返回有效动作且消息为空，强制终止本次对话循环"
+            )
         await chatter._save_session(session)
         return TurnControlResult(
             next_signal=Stop(0),
