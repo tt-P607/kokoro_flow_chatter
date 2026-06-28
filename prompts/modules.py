@@ -52,6 +52,9 @@ def register_kfc_prompts() -> None:
             "safety_guidelines": optional(
                 "\n".join(personality.safety_guidelines)
             ),
+            "negative_behaviors": optional(
+                "\n".join(personality.negative_behaviors)
+            ),
             "custom_decision_prompt": optional(""),
             "scene_state_info": optional(""),
             # reply_mode_instruction 由 _build_initial_context 动态注入，此处提供 tool calling 兜底
