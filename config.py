@@ -168,7 +168,7 @@ class KFCConfig(BaseConfig):
                 "跟着你们当下的状态走，热络时短一些，需要空间时长一些。\n\n"
                 "系统的沉默触发只是兜底，预约才是主力。"
             ),
-            description="schedule_proactive 工具的使用场景指导（会展示在工具描述中，可按需自定义）",
+            description="action-schedule_proactive 工具的使用场景指导（会展示在工具描述中，可按需自定义）",
         )
 
     @config_section("reply")

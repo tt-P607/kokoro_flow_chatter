@@ -124,7 +124,7 @@ logger = get_logger("kfc_chatter")
 # 重试时注入的提醒文本
 _PLAIN_TEXT_RETRY_REMINDER = (
     "（系统提示：你刚才返回了纯文本而非工具调用。"
-    "请务必通过 kfc_reply 或 do_nothing 工具调用来完成响应，不要直接输出文字。）"
+    "请务必通过 action-kfc_reply 或 action-do_nothing 工具调用来完成响应，不要直接输出文字。）"
 )
 
 
@@ -495,7 +495,7 @@ async def execute_orchestrator(
                         decision.proactive_schedule,
                     )
                 except Exception as exc:
-                    logger.warning(f"[KFC] schedule_proactive 参数解析失败: {exc}")
+                    logger.warning(f"[KFC] action-schedule_proactive 参数解析失败: {exc}")
 
             phase = ConversationPhase.COMMIT
             turn_control = await commit_turn_decision(

@@ -25,10 +25,10 @@ class PassAndWaitAction(BaseAction):
     associated_types: list[str] = ["text"]
     action_description: str = (
         "完成本轮所有动作后，登记一个等待点。"
-        "可以在 kfc_reply 之后调用，表示发完消息后继续等待对方回复；"
+        "可以在 action-kfc_reply 之后调用，表示发完消息后继续等待对方回复；"
         "也可以单独调用，表示本轮不回复但保持等待状态。"
-        "与 do_nothing 的区别：do_nothing 用于主动选择不回复，"
-        "pass_and_wait 用于已完成动作后的等待。"
+        "与 action-do_nothing 的区别：action-do_nothing 用于主动选择不回复，"
+        "action-pass_and_wait 用于已完成动作后的等待。"
         "**调用时必须明确给出 thought / expected_reaction / max_wait_seconds / mood "
         "这四个字段，承载你这次决策的内心活动、对对方反应的预期、等待时长和当前情绪。**"
     )

@@ -179,14 +179,14 @@ def build_timeout_context(
         )
     elif is_first:
         decision_instructions = (
-            "可以调用 `kfc_reply(...)` 发送消息，"
-            "或调用 `do_nothing(max_wait_seconds>0)` 继续等待，"
-            "或调用 `do_nothing(max_wait_seconds=0)` 结束等待。"
+            "可以调用 `action-kfc_reply(...)` 发送消息，"
+            "或调用 `action-do_nothing(max_wait_seconds>0)` 继续等待，"
+            "或调用 `action-do_nothing(max_wait_seconds=0)` 结束等待。"
         )
     else:
         decision_instructions = (
-            "如果确实有话说，可以调用 `kfc_reply(...)` 发送消息；"
-            "或调用 `do_nothing(max_wait_seconds=0)` 结束等待。"
+            "如果确实有话说，可以调用 `action-kfc_reply(...)` 发送消息；"
+            "或调用 `action-do_nothing(max_wait_seconds=0)` 结束等待。"
         )
 
     return KFC_TIMEOUT_PROMPT.format(

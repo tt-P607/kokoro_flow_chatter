@@ -49,7 +49,7 @@ def build_initial_context_plan(
         extra_vars["scheduled_proactive_info"] = (
             f"# 当前预约状态\n"
             f"你已预约在 **{sched_time_str}**（约 {remaining_min:.0f} 分钟后）主动发起{reason_text}。\n"
-            "如需修改，可重新调用 `schedule_proactive` 工具（新预约会覆盖旧的；传 delay_minutes=0 可取消预约）。"
+            "如需修改，可重新调用 `action-schedule_proactive` 工具（新预约会覆盖旧的；传 delay_minutes=0 可取消预约）。"
         )
 
     history_summary = session.history_summary or ""
