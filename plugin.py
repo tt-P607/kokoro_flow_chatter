@@ -47,6 +47,9 @@ class KFCPlugin(BasePlugin):
 
     async def on_plugin_loaded(self) -> None:
         """插件加载时注册提示词模板。调度任务延迟到调度器启动后注册。"""
+        config = self.config
+        is_enabled = isinstance(config, KFCConfig) and config.general.enabled
+
         # 注册提示词模板
         from .prompts.modules import register_kfc_prompts
 
@@ -54,9 +57,12 @@ class KFCPlugin(BasePlugin):
         logger.info("KFC 提示词模板已注册")
 
         # 将配置中的 schedule_proactive 指导语写入 Action 类变量
-        config = self.config
         if isinstance(config, KFCConfig) and config.proactive.schedule_guidance:
             ScheduleProactiveAction._guidance = config.proactive.schedule_guidance
+
+        if not is_enabled:
+            logger.info("KFC 插件已禁用，跳过调度器任务注册")
+            return
 
         # 延迟注册调度器任务：等待调度器启动
         # 注意：VLM 跳过预注册也合并进延迟逻辑，因为 get_media_manager() 首次
@@ -171,9 +177,17 @@ class KFCPlugin(BasePlugin):
         logger.info("KFC 调度器任务注册完成")
 
     def get_components(self) -> list[type]:
-        """获取插件内所有组件类。"""
-        return [
-            KokoroFlowChatter,
+        """获取插件内所有组件类。
+
+        当 ``general.enabled`` 为 False 时，不注册 ``KokoroFlowChatter``，
+        使框架的 chatter 选择器看不到 KFC，从而自然由其他 chatter（如
+        default_chatter）接管私聊流。其余 Action / EventHandler 组件
+        不受影响，仍正常注册。
+        """
+        config = self.config
+        is_enabled = isinstance(config, KFCConfig) and config.general.enabled
+
+        components: list[type] = [
             KFCReplyAction,
             DoNothingAction,
             PassAndWaitAction,
@@ -183,3 +197,8 @@ class KFCPlugin(BasePlugin):
             ProactiveHandler,
             VoiceCallHistoryHandler,
         ]
+        if is_enabled:
+            components.append(KokoroFlowChatter)
+        else:
+            logger.info("KFC 插件已禁用，不注册 KokoroFlowChatter 组件")
+        return components

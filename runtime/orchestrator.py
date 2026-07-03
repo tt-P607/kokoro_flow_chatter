@@ -228,11 +228,22 @@ async def execute_orchestrator(
     config = self._get_config()
 
     if not config.general.enabled:
-        logger.debug("KFC 插件已禁用，跳过 execute")
-        yield Stop(0)
+        logger.info("KFC 插件已禁用，解除 chatter 绑定以允许框架重新选择")
+        from src.app.plugin_system.api.chat_api import restore_stream_to_default
+
+        restore_stream_to_default(self.stream_id)
+        yield Success("KFC 插件已禁用")
         return
 
     session = await self._get_session()
+
+    # 校验持久化对话链时效性：仅在用户消息触发时（有未读消息）校验，
+    # 主动发起/预约思考场景跳过（这两种场景不会出现"中间用了别的 chatter"的问题）
+    if chat_stream.context and chat_stream.context.unread_messages:
+        from .chain_validator import validate_chain_freshness
+
+        await validate_chain_freshness(session, chat_stream)
+
     timeout_service = TimeoutService(config)
 
     if config.general.native_multimodal:
