@@ -1,6 +1,5 @@
 """KFC runtime 导出。"""
 
-from .chain_validator import validate_chain_freshness
 from .interrupt_controller import send_interruptable_response
 from .message_buffer import accumulate_message_buffer
 from .orchestrator import execute_orchestrator
@@ -19,5 +18,4 @@ __all__ = [
 	"send_interruptable_response",
 	"TurnControlResult",
 	"TurnInputResult",
-	"validate_chain_freshness",
 ]
