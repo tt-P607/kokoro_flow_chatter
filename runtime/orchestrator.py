@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
@@ -296,6 +297,7 @@ async def execute_orchestrator(
         phase = ConversationPhase.WAIT_INPUT
         plain_text_retry_count = 0
         follow_up_count = 0
+        consecutive_interrupt_count = 0
         # 记录当前"烧入"初始上下文的摘要，用于检测后台压缩任务的更新
         _baked_summary = session.history_summary or ""
 
@@ -390,26 +392,47 @@ async def execute_orchestrator(
 
             try:
                 phase = ConversationPhase.MODEL_TURN
-                if config.buffer.interrupt_enabled and not transient_payloads:
+                max_interrupts = config.buffer.max_consecutive_interrupts
+                if config.buffer.interrupt_enabled and consecutive_interrupt_count < max_interrupts:
                     new_response, interrupt_msgs = await self._send_interruptable(
-                        response,
+                        send_target,
                         config,
                         known_ids,
                     )
                     if interrupt_msgs:
+                        consecutive_interrupt_count += 1
                         extra_payload = None
                         await self.flush_unreads(unread_msgs or [])
                         session.add_interrupt_event(interrupt_msgs)
                         await self._save_session(session)
+                        # 打断冷却窗口：每次打断叠加原值的 1/2，递增等待时间
+                        # 第 1 次: base, 第 2 次: base * 1.5, 第 3 次: base * 2.0, ...
+                        base_cooldown = config.buffer.interrupt_cooldown
+                        cooldown = base_cooldown * (1.0 + (consecutive_interrupt_count - 1) * 0.5)
+                        if cooldown > 0:
+                            logger.debug(
+                                f"[KFC] 打断后冷却 {cooldown:.1f}s "
+                                f"(连续打断 {consecutive_interrupt_count}/{max_interrupts})"
+                            )
+                            await asyncio.sleep(cooldown)
                         continue
+                    # LLM 正常完成，重置打断计数
+                    consecutive_interrupt_count = 0
                     assert new_response is not None
                     response = new_response
                 else:
+                    if consecutive_interrupt_count >= max_interrupts:
+                        logger.warning(
+                            f"[KFC] 连续打断已达上限 {max_interrupts}，"
+                            "本次不再打断，等待 LLM 正常完成后统一处理"
+                        )
                     watchdog = get_watchdog()
                     watchdog.feed_dog(self.stream_id)
                     response = await send_target.send(auto_append_response=True, stream=False)
                     watchdog.feed_dog(self.stream_id)
                     normalize_response(response)
+                    # 不可打断路径正常完成后也重置打断计数
+                    consecutive_interrupt_count = 0
                 await self.flush_unreads(unread_msgs if unread_msgs else [])
             except Exception as exc:
                 logger.error(f"LLM 请求失败: {exc}", exc_info=True)

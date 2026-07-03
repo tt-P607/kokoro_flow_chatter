@@ -123,7 +123,6 @@ async def prepare_turn_input(
         )
 
     if trigger is TurnTrigger.NEW_MESSAGES:
-        formatted_text, unread_msgs = await chatter._accumulate_messages(config)
         unread_msgs = await prefer_real_unreads(chatter, unread_msgs)
         formatted_text = format_unread_messages(chatter, unread_msgs)
         if not unread_msgs:

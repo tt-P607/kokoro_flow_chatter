@@ -37,7 +37,6 @@ from .mental_log import MentalLogEntry
 from .models import KFC_REPLY, DO_NOTHING, KFCEventType
 from .prompts.builder import KFCPromptBuilder
 from .runtime import (
-    accumulate_message_buffer,
     execute_orchestrator,
     send_interruptable_response,
 )
@@ -125,13 +124,6 @@ class KokoroFlowChatter(BaseChatter):
     def _get_session_store(self) -> KFCSessionStore:
         """获取 Session Store（由 plugin.__init__ 初始化）。"""
         return self.plugin._session_store  # type: ignore[attr-defined]
-
-    async def _accumulate_messages(
-        self,
-        config: KFCConfig,
-    ) -> tuple[str, list[Any]]:
-        """在积累窗口内等待并聚合连发消息。"""
-        return await accumulate_message_buffer(self, config)
 
     async def modify_llm_usables(self, llm_usables: list[Any]) -> list[Any]:  # type: ignore[override]
         """按框架通用规则过滤工具后，再应用 KFC 专属屏蔽与稳定排序。"""
@@ -235,14 +227,14 @@ class KokoroFlowChatter(BaseChatter):
 
     async def _send_interruptable(
         self,
-        response: Any,
+        send_target: Any,
         config: KFCConfig,
         known_unread_ids: frozenset[str],
     ) -> tuple[Any | None, list[Any]]:
         """以可打断方式发送 LLM 请求。"""
         return await send_interruptable_response(
             self,
-            response,
+            send_target,
             config,
             known_unread_ids,
         )

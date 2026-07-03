@@ -226,23 +226,8 @@ class KFCConfig(BaseConfig):
 
     @config_section("buffer")
     class BufferSection(SectionBase):
-        """消息积累与打断配置。"""
+        """打断配置。"""
 
-        accumulate_window: float = Field(
-            default=1.5,
-            description=(
-                "消息积累窗口（秒）。检测到第一条消息后等待此时长，"
-                "以收集同一时段连发的多条消息，避免对每条消息单独触发 LLM。"
-                "设为 0 则禁用积累窗口。"
-            ),
-        )
-        accumulate_max_window: float = Field(
-            default=5.0,
-            description=(
-                "积累窗口最大总时长（秒）。即使消息持续到达，"
-                "超过此时长后强制提交，防止积累无限延迟。"
-            ),
-        )
         interrupt_enabled: bool = Field(
             default=True,
             description=(
@@ -255,6 +240,21 @@ class KFCConfig(BaseConfig):
             description=(
                 "打断检测轮询间隔（秒）。LLM 生成期间每隔此时间检查"
                 "一次是否有新消息到达。值越小响应越快，CPU 占用略高。"
+            ),
+        )
+        interrupt_cooldown: float = Field(
+            default=3.0,
+            description=(
+                "打断后冷却窗口基准值（秒）。LLM 被打断后等待此时长再重新发起请求，"
+                "以收集可能连发的后续消息。连续打断时每次叠加原值的 1/2："
+                "第 1 次 3.0s，第 2 次 4.5s，第 3 次 6.0s，以此类推。"
+            ),
+        )
+        max_consecutive_interrupts: int = Field(
+            default=3,
+            description=(
+                "连续打断次数上限。达到后不再打断当前 LLM 请求，"
+                "让其正常完成后统一处理积累的消息，防止恶意刷消息导致无限 LLM 调用。"
             ),
         )
 

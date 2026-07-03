@@ -20,14 +20,17 @@ logger = get_logger("kfc_chatter")
 
 async def send_interruptable_response(
     chatter: KokoroFlowChatter,
-    response: Any,
+    send_target: Any,
     config: KFCConfig,
     known_unread_ids: frozenset[str],
 ) -> tuple[Any | None, list[Any]]:
     """以可打断方式发送 LLM 请求。
 
+    通过 ``send_target``（通常为 :class:`RequestView`）发送，
+    支持 transient payloads 场景下的打断检测。
+
     只有真实用户消息可以打断正在生成的 LLM 响应；KFC 内部主动触发消息
-    不应取消当前输出，否则定时任务与正常回复撞车时会“卡掉”模型返回。
+    不应取消当前输出，否则定时任务与正常回复撞车时会"卡掉"模型返回。
     """
 
     async def _llm_work() -> Any:
@@ -36,8 +39,7 @@ async def send_interruptable_response(
 
         watchdog = get_watchdog()
         watchdog.feed_dog(chatter.stream_id)
-        result = await response.send(auto_append_response=True, stream=False)
-        await result
+        result = await send_target.send(auto_append_response=True, stream=False)
         watchdog.feed_dog(chatter.stream_id)
         normalize_response(result)
         return result

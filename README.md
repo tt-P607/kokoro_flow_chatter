@@ -127,7 +127,6 @@ kokoro_flow_chatter/
 │   ├── phase_machine.py       # 对话阶段状态机
 │   ├── request_view.py        # LLM 请求视图
 │   ├── interrupt_controller.py # 生成打断控制
-│   ├── message_buffer.py      # 消息积累窗口
 │   └── unread_policy.py       # 未读消息过滤
 │
 ├── context/                   # 上下文构建
@@ -243,14 +242,14 @@ kokoro_flow_chatter/
 | `compress_max_chars` | `1200` | 摘要最大字数 |
 | `compress_model_task` | `"actor"` | 压缩使用的模型任务（独立于主对话） |
 
-### `[buffer]` 消息缓冲
+### `[buffer]` 打断
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `accumulate_window` | `1.5` | 消息积累窗口（秒） |
-| `accumulate_max_window` | `5.0` | 最大积累时长（秒） |
 | `interrupt_enabled` | `true` | 启用生成打断 |
 | `interrupt_poll_seconds` | `0.5` | 打断检测间隔（秒） |
+| `interrupt_cooldown` | `3.0` | 打断后冷却窗口基准值（秒），连续打断递增 1/2 |
+| `max_consecutive_interrupts` | `3` | 连续打断次数上限 |
 
 ### `[debug]` 调试
 
