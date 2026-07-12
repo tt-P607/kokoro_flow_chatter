@@ -127,6 +127,7 @@ async def parse_tool_calls(
     """
     result = ToolCallResult()
     is_first_reply = True
+    has_processed_reply = False
     pending_third_party_calls: list[Any] = []
 
     async def flush_pending_third_party() -> None:
@@ -157,7 +158,22 @@ async def parse_tool_calls(
         logger.info(f"LLM 调用 {call.name}，原因: {reason}")
 
         if normalized_name == KFC_REPLY:
+            if has_processed_reply:
+                logger.warning(f"[KFC] 忽略重复的 kfc_reply 调用: {call_id}")
+                response.add_payload(
+                    LLMPayload(
+                        ROLE.TOOL_RESULT,
+                        ToolResult(  # type: ignore[arg-type]
+                            value="忽略重复调用：每轮响应只允许一个 kfc_reply。请合并你的回复。",
+                            call_id=call_id,
+                            name=call.name,
+                        ),
+                    )
+                )
+                continue
+
             await flush_pending_third_party()
+            has_processed_reply = True
 
             result.has_reply = True
             extract_metadata(result, args)

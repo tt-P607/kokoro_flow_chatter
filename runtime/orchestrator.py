@@ -134,6 +134,61 @@ _SUMMARY_MARKER_PREFIX = "【你对"
 _SUMMARY_MARKER_SUFFIX = "的近期记忆】"
 _SECTION_SEPARATOR = "\n\n---\n\n"
 
+# SnowLuma 适配器签名，用于查找 adapter 实例
+_SNOWLUMA_ADAPTER_SIGN = "snowluma_adapter:adapter:snowluma_adapter"
+
+
+async def _set_input_status(user_id: str, event_type: int) -> None:
+    """向 SnowLuma 上报「正在输入」状态（fire-and-forget）。
+
+    通过 adapter_api 获取 SnowLuma 适配器实例，调用其 ``send_snowluma_api``
+    方法发送 ``set_input_status`` API。任何异常都静默吞掉，不影响对话主流程。
+
+    Args:
+        user_id: 目标好友的 QQ 号
+        event_type: 1=正在输入, 0=停止输入
+    """
+    if not user_id or not user_id.isdigit():
+        logger.debug(f"set_input_status 跳过：user_id 无效 '{user_id}'")
+        return
+    try:
+        from src.app.plugin_system.api.adapter_api import get_adapter
+
+        adapter = get_adapter(_SNOWLUMA_ADAPTER_SIGN)
+        if adapter is None:
+            logger.debug("set_input_status 跳过：SnowLuma 适配器未启动")
+            return
+        send_fn = getattr(adapter, "send_snowluma_api", None)
+        if send_fn is None:
+            logger.debug("set_input_status 跳过：适配器无 send_snowluma_api 方法")
+            return
+        resp = await send_fn(
+            "set_input_status",
+            {"user_id": int(user_id), "event_type": event_type},
+            timeout=5.0,
+        )
+        logger.debug(
+            f"set_input_status 已发送: user_id={user_id}, event_type={event_type}, resp={resp}"
+        )
+    except Exception as e:
+        logger.warning(f"set_input_status 调用失败: {e}")
+
+
+def _cancel_input_status_refresh(handle: Any) -> None:
+    """取消「正在输入」刷新后台任务。
+
+    Args:
+        handle: ``task_manager.create_task()`` 返回的句柄，为 None 时跳过
+    """
+    if handle is None:
+        return
+    try:
+        from src.kernel.concurrency import get_task_manager
+
+        get_task_manager().cancel_task(handle.task_id)
+    except Exception:
+        pass
+
 
 def _hot_update_summary(
     response: Any,
@@ -390,6 +445,33 @@ async def execute_orchestrator(
                     if message.message_id
                 )
 
+            # 「正在输入」状态：LLM 请求前上报，请求后撤下
+            # event_type=1 只持续 2-3 秒，需要在 LLM 生成期间每 2 秒刷新
+            _input_status_on = config.general.enable_input_status and bool(session.user_id)
+            _input_refresh_handle: Any = None
+            if _input_status_on:
+                await _set_input_status(session.user_id, 1)
+
+                async def _input_status_loop() -> None:
+                    """以 2.5 秒为基础间隔加随机抖动刷新「正在输入」状态。
+
+                    QQ 的「正在输入」状态持续约 2-3 秒，2.5 秒基础间隔刚好覆盖；
+                    加入 0.5-1.5 秒随机抖动模拟人类打字停顿，避免状态闪烁。
+                    """
+                    import random
+
+                    while True:
+                        await asyncio.sleep(2.5 + random.uniform(0.5, 1.5))
+                        await _set_input_status(session.user_id, 1)
+
+                from src.kernel.concurrency import get_task_manager
+
+                _input_refresh_handle = get_task_manager().create_task(
+                    _input_status_loop(),
+                    name=f"kfc_input_status_{self.stream_id[:8]}",
+                    daemon=True,
+                )
+
             try:
                 phase = ConversationPhase.MODEL_TURN
                 max_interrupts = config.buffer.max_consecutive_interrupts
@@ -405,6 +487,9 @@ async def execute_orchestrator(
                         await self.flush_unreads(unread_msgs or [])
                         session.add_interrupt_event(interrupt_msgs)
                         await self._save_session(session)
+                        if _input_status_on:
+                            _cancel_input_status_refresh(_input_refresh_handle)
+                            await _set_input_status(session.user_id, 0)
                         # 打断冷却窗口：每次打断叠加原值的 1/2，递增等待时间
                         # 第 1 次: base, 第 2 次: base * 1.5, 第 3 次: base * 2.0, ...
                         base_cooldown = config.buffer.interrupt_cooldown
@@ -434,8 +519,14 @@ async def execute_orchestrator(
                     # 不可打断路径正常完成后也重置打断计数
                     consecutive_interrupt_count = 0
                 await self.flush_unreads(unread_msgs if unread_msgs else [])
+                if _input_status_on:
+                    _cancel_input_status_refresh(_input_refresh_handle)
+                    await _set_input_status(session.user_id, 0)
             except Exception as exc:
                 logger.error(f"LLM 请求失败: {exc}", exc_info=True)
+                if _input_status_on:
+                    _cancel_input_status_refresh(_input_refresh_handle)
+                    await _set_input_status(session.user_id, 0)
                 extra_payload = None
                 # 失败路径必须与成功路径保持同样的 unread 消费契约：
                 # 框架 LLM 层已在内部跑完 policy 重试与多模型 fallback，

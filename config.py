@@ -78,6 +78,14 @@ class KFCConfig(BaseConfig):
                 "设为 0 表示不限制续轮次数（不推荐）。"
             ),
         )
+        enable_input_status: bool = Field(
+            default=False,
+            description=(
+                "是否在 LLM 生成期间向 QQ 客户端上报「正在输入」状态。"
+                "启用后，每次 LLM 请求前发送 set_input_status，"
+                "请求结束后撤下。仅对 SnowLuma 适配器生效。"
+            ),
+        )
         segment_instruction: str = Field(
             default=(
                 "## 消息分段发送\n"

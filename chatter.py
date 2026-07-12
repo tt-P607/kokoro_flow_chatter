@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator
 
 from src.app.plugin_system.api.llm_api import (
     LLMContextManager,
+    ReminderSourceSpec,
     create_llm_request,
 )
 from src.app.plugin_system.api.log_api import get_logger
@@ -191,7 +192,24 @@ class KokoroFlowChatter(BaseChatter):
         Returns:
             tuple: (request, usable_map, prompt_builder, has_history)
         """
-        context_manager = LLMContextManager()
+        # 同时订阅全局 actor bucket 和当前流的私有 actor bucket，
+        # 与 ``BaseChatter.create_request`` 的 ``with_reminder`` 行为一致。
+        reminder_sources = [
+            ReminderSourceSpec(
+                bucket="actor",
+                wrap_with_system_tag=True,
+            )
+        ]
+        if self.stream_id:
+            reminder_sources.append(
+                ReminderSourceSpec(
+                    bucket=f"stream:{self.stream_id}:actor",
+                    wrap_with_system_tag=True,
+                )
+            )
+        context_manager = LLMContextManager(
+            reminder_sources=reminder_sources,
+        )
         request = create_llm_request(
             model_set,
             "kokoro_flow_chatter",
