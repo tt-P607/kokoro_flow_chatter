@@ -65,9 +65,7 @@ class KFCSession:
     last_compress_at: float = 0.0     # 上次触发压缩的时间戳
     compress_round_count: int = 0     # 距上次压缩已完成的对话轮次数
 
-    # 显式场景状态：只记录有证据支撑的场景信息，默认 unknown。
-    # TODO: scene_state 目前始终为 unknown，业务层尚未接入更新逻辑。
-    #       等待后续功能迭代（如场景感知工具、场景推断模块）接入后再实现。
+    # 显式场景状态只记录有证据支撑的信息；当前无场景来源时保持 unknown。
     scene_state: SceneState = field(default_factory=SceneState)
 
     # 私人备忘录：LLM 显式记录的、带过期时间的中短期关键事项。

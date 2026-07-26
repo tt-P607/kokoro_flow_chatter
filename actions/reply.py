@@ -64,9 +64,9 @@ def _force_kfc_metadata_required(schema: dict) -> dict:
 class KFCReplyAction(BaseAction):
     """发送文本消息给对方。"""
 
-    action_name = "kfc_reply"
+    name = "kfc_reply"
     associated_types: list[str] = ["text"]
-    action_description = (
+    description = (
         "发送文本消息给对方。"
         "content 为消息段落列表，每个元素是一条独立消息，系统会依次发出。"
         "可选的 reply_to 参数允许你引用消息（虽然私聊中较少用到，但引用旧消息时可能有用）。"

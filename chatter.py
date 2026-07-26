@@ -34,6 +34,10 @@ from src.app.plugin_system.types import ChatType, Message
 
 from .actions.reply import KFCReplyAction
 from .debug.log_formatter import format_prompt_for_log
+from .framework_compat import (
+    clear_stream_recognition_skip,
+    set_stream_recognition_skip,
+)
 from .mental_log import MentalLogEntry
 from .models import KFC_REPLY, DO_NOTHING, KFCEventType
 from .prompts.builder import KFCPromptBuilder
@@ -62,8 +66,8 @@ class KokoroFlowChatter(BaseChatter):
     - 活动流为持久化审计日志，LLM 上下文通过 response 链自动积累
     """
 
-    chatter_name: str = "kokoro_flow_chatter"
-    chatter_description: str = (
+    name: str = "kokoro_flow_chatter"
+    description: str = (
         "心理活动流聊天器，模拟真实人类的连续心理活动和对话节奏"
     )
 
@@ -226,15 +230,13 @@ class KokoroFlowChatter(BaseChatter):
                 session,
             )
         )
-        # 系统 Payload 通过 add_payload 注入（触发 context manager 的
-        # _apply_reminders 将 system_reminder 注入到末尾 USER）
+        # 所有 Payload 统一通过 add_payload 注入，由 context manager 的
+        # _apply_reminders 管理 system_reminder 的注入与剥离，避免 USER payload
+        # 绕过 reminder 管线后在多轮循环中重复堆积系统提醒前缀。
         for payload in system_payloads:
             request.add_payload(payload)
-
-        # 链 Payload 直接追加，绕过 context manager 避免对历史
-        # USER 重复注入 system_reminder（防止缓存命中率下降）
-        if chain_payloads:
-            request.payloads.extend(chain_payloads)
+        for payload in chain_payloads:
+            request.add_payload(payload)
 
         # ── 注册工具（原生 Tool Calling） ──
         usable_map = await self.inject_usables(request)
@@ -307,24 +309,20 @@ class KokoroFlowChatter(BaseChatter):
         调用是幂等的——多次注册同一 stream_id 不会产生副作用。
         """
         try:
-            from src.core.managers.media_manager import get_media_manager
-
-            get_media_manager().skip_vlm_for_stream(self.stream_id, ["image"])
-        except Exception as e:
-            logger.debug(f"注册 VLM 跳过失败（不影响功能）: {e}")
+            set_stream_recognition_skip(self.stream_id, ["image"])
+        except Exception as error:
+            logger.debug(f"注册识别跳过失败（不影响功能）: {error}")
 
     def _unregister_vlm_skip(self) -> None:
-        """注销当前聊天流的 VLM 跳过。
+        """注销当前聊天流的识别跳过。
 
         在 execute() 结束时调用（通过 try/finally），
-        恢复框架对该 stream 的 VLM 识别能力。
+        恢复框架对该 stream 的识别能力。
         """
         try:
-            from src.core.managers.media_manager import get_media_manager
-
-            get_media_manager().unskip_vlm_for_stream(self.stream_id)
-        except Exception as e:
-            logger.debug(f"注销 VLM 跳过失败: {e}")
+            clear_stream_recognition_skip(self.stream_id)
+        except Exception as error:
+            logger.debug(f"注销 VLM 跳过失败: {error}")
 
     async def _get_virtual_trigger_message(self) -> Any:
         """构造虚拟触发消息，用于超时主动发言等无真实触发消息的场景。"""

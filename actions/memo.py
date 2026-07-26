@@ -92,9 +92,9 @@ _KFC_MEMO_DESCRIPTION = (
 class KFCMemoAction(BaseAction):
     """写入或刷新一条私人备忘录。"""
 
-    action_name: str = "kfc_memo"
+    name: str = "kfc_memo"
     associated_types: list[str] = ["text"]
-    action_description: str = _KFC_MEMO_DESCRIPTION
+    description: str = _KFC_MEMO_DESCRIPTION
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 
     async def execute(
@@ -178,9 +178,9 @@ _KFC_MEMO_DELETE_DESCRIPTION = (
 class KFCMemoDeleteAction(BaseAction):
     """按 id 删除一条或多条备忘录。"""
 
-    action_name: str = "kfc_memo_delete"
+    name: str = "kfc_memo_delete"
     associated_types: list[str] = ["text"]
-    action_description: str = _KFC_MEMO_DELETE_DESCRIPTION
+    description: str = _KFC_MEMO_DELETE_DESCRIPTION
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 
     async def execute(

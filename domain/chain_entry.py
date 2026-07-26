@@ -1,17 +1,7 @@
 """KFC 持久化对话链条目模型。
 
-``session.chain_payloads`` 历史上以 ``list[dict]`` 存储，导致：
-
-1. 字段名靠魔法字符串（如 ``"role"``、``"tool_calls"``）；
-2. ``text`` 为空 + ``tool_calls`` 非空 的脏数据可绕过任何静态检查；
-3. 序列化与反序列化分散在 ``session.py`` / ``turn_controller.py`` /
-   ``history_source.py`` 三处，任何字段微调都可能复现 A1 类 bug。
-
-本模块提供单一可信 schema：
-
-- 在内存里强约束（dataclass + 工厂方法）
-- 在磁盘上仍以 ``dict`` 存储（保持 JSON 友好与向后兼容）
-- ``from_dict`` / ``to_dict`` 是序列化的唯一入口
+通过 dataclass 与工厂方法约束角色、文本和工具调用字段，并集中提供 JSON
+序列化与反序列化入口。磁盘数据保持字典格式，以便读取现有会话记录。
 """
 
 from __future__ import annotations

@@ -59,8 +59,8 @@ class ContextRenderer:
         Returns:
             tuple: (system_payloads, chain_payloads, has_history)
                 - system_payloads: 仅包含稳定系统提示词，保证前缀缓存命中率
-                - chain_payloads: 动态历史/摘要与历史链 Payload 列表（直接追加，绕过
-                  context manager 避免对历史 USER 重复注入 system_reminder）
+                - chain_payloads: 动态历史/摘要与历史链 Payload 列表（由调用方
+                  通过 add_payload 逐个注入，由 context manager 统一管理 reminder）
                 - has_history: 是否存在历史内容
         """
         system_payloads: list[LLMPayload] = []
@@ -117,8 +117,8 @@ class ContextRenderer:
             merged_dynamic_text = "\n\n---\n\n".join(dynamic_parts)
             chain_payloads.append(LLMPayload(ROLE.USER, Text(merged_dynamic_text)))
 
-        # 3. 恢复工具调用链 — 独立返回，绕过 add_payload 避免
-        #    context manager 对历史 USER 重复注入 system_reminder。
+        # 3. 恢复工具调用链 — 由调用方通过 add_payload 逐个注入，
+        #    context manager 会统一管理 reminder 注入与剥离。
         #    当前通道/记忆/叙事上下文放在历史链之前，保持语义顺序自然：
         #    先说明当前背景，再展开过去发生的对话。
         restored_payloads = restore_history_chain_payloads(serialized_chain_payloads)

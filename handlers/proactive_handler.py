@@ -11,9 +11,11 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from src.app.plugin_system.api.event_api import EventDecision
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseEventHandler
-from src.app.plugin_system.api.event_api import EventDecision
+
+from ..framework_compat import start_stream_loop
 
 if TYPE_CHECKING:
     from src.app.plugin_system.api.event_api import EventType
@@ -32,8 +34,8 @@ class ProactiveHandler(BaseEventHandler):
     向目标流注入一条系统触发消息并唤醒流循环。
     """
 
-    handler_name: str = "kfc_proactive_handler"
-    handler_description: str = "响应主动发起事件，唤醒目标聊天流"
+    name: str = "kfc_proactive_handler"
+    description: str = "响应主动发起事件，唤醒目标聊天流"
     weight: int = 0
     intercept_message: bool = False
     init_subscribe: list[EventType | str] = [_PROACTIVE_EVENT]
@@ -165,15 +167,10 @@ class ProactiveHandler(BaseEventHandler):
             # 冷启动流（不在内存中）：消息已注入队列，需主动启动该流的循环任务。
             # 使用 StreamLoopManager 的公开方法启动，不访问私有属性。
             try:
-                from src.core.transport.distribution.stream_loop_manager import (
-                    get_stream_loop_manager,
-                )
-
-                loop_mgr = get_stream_loop_manager()
-                await loop_mgr.start_stream_loop(stream_id)
+                await start_stream_loop(stream_id)
                 logger.info(f"冷启动流 {stream_id[:8]} 流循环已启动")
-            except Exception as e:
-                logger.warning(f"冷启动流 {stream_id[:8]} 启动流循环失败: {e}")
+            except Exception as error:
+                logger.warning(f"冷启动流 {stream_id[:8]} 启动流循环失败: {error}")
         else:
             # 热流：消息已注入未读队列，流循环在下一次 tick 时会自然处理。
             logger.debug(f"主动触发消息已注入热流 {stream_id[:8]} 未读队列，等待下一次 tick 处理")

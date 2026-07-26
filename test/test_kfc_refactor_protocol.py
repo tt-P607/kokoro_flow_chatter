@@ -13,41 +13,41 @@ _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from plugins.kokoro_flow_chatter.chatter import KokoroFlowChatter
-from plugins.kokoro_flow_chatter.context.renderer import ContextRenderer
-from plugins.kokoro_flow_chatter.context.sources.history_source import restore_chain_payloads
-from plugins.kokoro_flow_chatter.context.types import InitialContextPlan
-from plugins.kokoro_flow_chatter.prompts.modules import register_kfc_prompts
-from plugins.kokoro_flow_chatter.domain.chain_entry import ChainEntry
-from plugins.kokoro_flow_chatter.domain.decision import Decision
-from plugins.kokoro_flow_chatter.domain.turn_trigger import TurnTrigger, classify_turn_trigger
-from plugins.kokoro_flow_chatter.execution.decision_executor import execute_decision_draft
-from plugins.kokoro_flow_chatter.models import DO_NOTHING, KFC_REPLY, ToolCallResult
-from plugins.kokoro_flow_chatter.protocol.decision_parser import build_decision
-from plugins.kokoro_flow_chatter.protocol.response_normalizer import normalize_response
-from plugins.kokoro_flow_chatter.protocol.tool_call_adapter import (
+from plugins.kokoro_flow_chatter.chatter import KokoroFlowChatter  # noqa: E402
+from plugins.kokoro_flow_chatter.context.renderer import ContextRenderer  # noqa: E402
+from plugins.kokoro_flow_chatter.context.sources.history_source import restore_chain_payloads  # noqa: E402
+from plugins.kokoro_flow_chatter.context.types import InitialContextPlan  # noqa: E402
+from plugins.kokoro_flow_chatter.prompts.modules import register_kfc_prompts  # noqa: E402
+from plugins.kokoro_flow_chatter.domain.chain_entry import ChainEntry  # noqa: E402
+from plugins.kokoro_flow_chatter.domain.decision import Decision  # noqa: E402
+from plugins.kokoro_flow_chatter.domain.turn_trigger import TurnTrigger, classify_turn_trigger  # noqa: E402
+from plugins.kokoro_flow_chatter.execution.decision_executor import execute_decision_draft  # noqa: E402
+from plugins.kokoro_flow_chatter.models import DO_NOTHING, KFC_REPLY, ToolCallResult  # noqa: E402
+from plugins.kokoro_flow_chatter.protocol.decision_parser import build_decision  # noqa: E402
+from plugins.kokoro_flow_chatter.protocol.response_normalizer import normalize_response  # noqa: E402
+from plugins.kokoro_flow_chatter.protocol.tool_call_adapter import (  # noqa: E402
     build_decision_draft,
     extract_call_args,
     is_kfc_control_call,
     normalize_call_name,
 )
-from plugins.kokoro_flow_chatter.runtime.phase_machine import (
+from plugins.kokoro_flow_chatter.runtime.phase_machine import (  # noqa: E402
     ConversationPhase,
     can_accept_user_payload,
     has_tool_result_tail,
     phase_for_model_result,
     phase_for_turn_start,
 )
-from plugins.kokoro_flow_chatter.runtime.request_view import (
+from plugins.kokoro_flow_chatter.runtime.request_view import (  # noqa: E402
     _without_transient_payloads,
     build_request_view,
 )
-from plugins.kokoro_flow_chatter.runtime.turn_controller import (
+from plugins.kokoro_flow_chatter.runtime.turn_controller import (  # noqa: E402
     build_chain_assistant_entry,
     prepare_turn_input,
 )
-from plugins.kokoro_flow_chatter.runtime.orchestrator import _heal_orphan_tool_results as heal_orphan_tool_results
-from src.app.plugin_system.types import LLMPayload, ROLE, Text, ToolCall, ToolResult
+from plugins.kokoro_flow_chatter.runtime.orchestrator import _heal_orphan_tool_results as heal_orphan_tool_results  # noqa: E402
+from src.app.plugin_system.types import LLMPayload, ROLE, Text, ToolCall, ToolResult  # noqa: E402
 
 
 class _FakeSession:
@@ -171,6 +171,8 @@ async def test_prepare_turn_input_non_message_triggers_keep_empty_wrapped_text()
 
     class _FakeChatter:
         """prepare_turn_input 所需的最小 Chatter 替身。"""
+
+        stream_id = "test-stream"
 
         async def fetch_unreads(self, time_format: str = "%Y-%m-%d %H:%M:%S") -> tuple[str, list[Any]]:
             """返回空未读，触发非新消息路径。"""

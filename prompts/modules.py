@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import datetime
 
-from src.core.config import get_core_config  # TODO: 待 prompt_api 暴露 get_bot_personality() 后迁移
+from src.core.config import get_core_config  # 公开 prompt API 尚未提供人格配置读取能力
 from src.core.prompt import optional, wrap, min_len  # 纯工具函数，无状态副作用
 
 from src.app.plugin_system.api.prompt_api import get_or_create as _pm_get_or_create

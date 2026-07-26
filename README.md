@@ -194,8 +194,8 @@ kokoro_flow_chatter/
 | `enabled` | `true` | 启用插件 |
 | `model_task` | `"actor"` | LLM 模型任务名 |
 | `models` | `[]` | 指定模型列表（优先级高于 model_task） |
-| `temperature` | `0.9` | 温度参数 |
-| `max_tokens` | `4096` | 最大输出 token |
+| `temperature` | `0.7` | 温度参数；仅在 `models` 非空时生效，范围 0~2 |
+| `max_tokens` | `8000` | 最大输出 token；仅在 `models` 非空时生效 |
 | `native_multimodal` | `false` | 图片直接进 LLM 上下文 |
 | `max_images_per_payload` | `4` | 单次最多图片数 |
 | `blocked_tools` | `[]` | 屏蔽的工具列表 |
@@ -257,6 +257,79 @@ kokoro_flow_chatter/
 |--------|--------|------|
 | `show_prompt` | `false` | 显示完整提示词 |
 | `show_response` | `true` | 显示响应摘要 |
+
+---
+
+## 组件签名
+
+- `kokoro_flow_chatter:chatter:kokoro_flow_chatter`
+- `kokoro_flow_chatter:action:kfc_reply`
+- `kokoro_flow_chatter:action:do_nothing`
+- `kokoro_flow_chatter:action:pass_and_wait`
+- `kokoro_flow_chatter:action:schedule_proactive`
+- `kokoro_flow_chatter:action:kfc_memo`
+- `kokoro_flow_chatter:action:kfc_memo_delete`
+- `kokoro_flow_chatter:event_handler:kfc_proactive_handler`
+- `kokoro_flow_chatter:event_handler:kfc_voice_call_history_handler`
+
+## 生命周期与数据
+
+- 插件加载后注册提示词模板，并通过 TaskManager 等待统一 Scheduler 启动。
+- 主动发起检查使用名为 `kfc_proactive_check` 的周期调度；插件卸载时会移除。
+- 近期摘要按聊天流去重调度；同一流不会并发启动多份压缩任务，卸载时会取消残留任务。
+- 会话状态保存在 `data/kokoro_flow_chatter/sessions/`，按 `stream_id` 隔离。
+- 禁用 `[general].enabled` 后不注册 Chatter，由框架为私聊流选择其他可用 Chatter。
+
+## 自动测试
+
+在仓库根目录执行：
+
+```bash
+uv run ruff check plugins/kokoro_flow_chatter
+uv run pytest plugins/kokoro_flow_chatter/test -q
+```
+
+测试覆盖对话相位、上下文规划、工具执行、未读策略、配置边界、manifest 组件一致性、Scheduler 卸载清理、摘要任务去重和框架兼容边界。
+
+## 故障排查
+
+### 插件启用但没有接管私聊
+
+1. 检查 `[general].enabled` 是否为 `true`。
+2. 检查 manifest 中是否启用了 `kokoro_flow_chatter` Chatter。
+3. 确认目标流是私聊；KFC 不接管群聊。
+4. 查看日志中是否出现“模型配置错误”或 Chatter 绑定恢复信息。
+
+### 主动发起没有触发
+
+1. 检查 `[proactive].enabled`、`silence_threshold`、`trigger_probability` 和 `min_interval`。
+2. 沉默触发受勿扰时间限制；模型预约不受勿扰时间限制。
+3. 查看 Scheduler 是否已启动，以及 `kfc_proactive_check` 是否注册成功。
+4. 冷启动流需要框架 `StreamLoopManager.start_stream_loop()` 能力；失败会记录明确警告。
+
+### 原生多模态仍出现 VLM 描述
+
+1. 检查 `[general].native_multimodal` 是否开启，主模型是否支持图片输入。
+2. 新用户第一条消息可能早于 KFC 注册流级识别跳过；后续消息会使用跳过设置。
+3. 流级识别跳过当前由框架 `MediaManager` 提供，但尚未暴露为插件公共 API；KFC 通过 `framework_compat.py` 集中隔离该内部边界。
+
+### 近期摘要不生成
+
+1. 首次有效对话会尝试生成空摘要；后续按 `compress_every_n_rounds` 触发。
+2. 检查 `compress_model_task` 是否存在可用模型。
+3. 检查 `min_compress_interval_minutes` 是否阻止了短时间重复压缩。
+4. 同一流已有压缩任务运行时，新请求会被去重而不是重复启动。
+
+## 人工验证清单
+
+1. 私聊发送文本和图片，确认 KFC 接管且多模态配置符合预期。
+2. 让模型分段回复，确认消息顺序、打字延迟和引用回复正常。
+3. 在模型生成期间连续发送新消息，确认旧请求被打断且消息合并处理。
+4. 测试 `do_nothing`、`pass_and_wait`、等待超时和最大连续超时。
+5. 创建、覆盖、取消主动预约，并验证热流和冷启动流触发。
+6. 达到摘要条件后确认摘要写入会话文件，重启后仍可恢复。
+7. 发布 `voice_call.ended` 事件，确认通话内容以一对 chain entry 回填。
+8. 禁用、重载、卸载插件，确认无残留 Scheduler 或摘要后台任务。
 
 ---
 

@@ -40,6 +40,7 @@ async def execute_decision_draft(
     """执行 DecisionDraft 并产出 ToolCallResult。"""
     result = ToolCallResult()
     is_first_reply = True
+    has_processed_reply = False
     pending_framework_calls: list[Any] = []
 
     async def flush_pending_framework_calls() -> None:
@@ -67,7 +68,22 @@ async def execute_decision_draft(
         logger.info(f"LLM 调用 {draft_call.raw_name}，原因: {reason}")
 
         if normalized_name == KFC_REPLY:
+            if has_processed_reply:
+                logger.warning(f"[KFC] 忽略重复的 kfc_reply 调用: {draft_call.call_id}")
+                response.add_payload(
+                    LLMPayload(
+                        ROLE.TOOL_RESULT,
+                        ToolResult(
+                            value="忽略重复调用：每轮响应只允许一个 kfc_reply。请将多段内容合并到一个 content 列表中。",
+                            call_id=draft_call.call_id,
+                            name=draft_call.raw_name,
+                        ),
+                    )
+                )
+                continue
+
             await flush_pending_framework_calls()
+            has_processed_reply = True
             result.has_reply = True
             extract_metadata(result, args)
             content_raw = args.get("content", "")

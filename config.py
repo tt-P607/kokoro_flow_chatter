@@ -14,8 +14,8 @@ from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_se
 class KFCConfig(BaseConfig):
     """KokoroFlowChatter 配置。"""
 
-    config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "KokoroFlowChatter 配置"
+    name: ClassVar[str] = "config"
+    description: ClassVar[str] = "KokoroFlowChatter 配置"
 
     @config_section("general")
     class GeneralSection(SectionBase):
@@ -27,16 +27,20 @@ class KFCConfig(BaseConfig):
             description="LLM 模型名称（对应 model.toml 中的 task），models 为空时使用",
         )
         models: list[str] = Field(
-            default=[],
+            default_factory=list,
             description="指定 LLM 模型列表（对应 model.toml 中的 name）。非空时覆盖 model_task，多个模型按顺序 fallback",
         )
         temperature: float = Field(
             default=0.7,
             description="模型温度，仅在 models 非空时生效",
+            ge=0.0,
+            le=2.0,
         )
         max_tokens: int = Field(
             default=8000,
             description="最大输出 token 数，仅在 models 非空时生效",
+            ge=1,
+            le=128000,
         )
         native_multimodal: bool = Field(
             default=False,
@@ -54,6 +58,8 @@ class KFCConfig(BaseConfig):
                 "优先级依次为：bot 已发 > 用户新消息 > 历史补充。"
                 "例如设为 4 时，若 bot 最近发了 1 张、用户本轮发了 2 张，则历史图片最多补 1 张。"
             ),
+            ge=1,
+            le=32,
         )
         custom_decision_prompt: str = Field(
             default="",
@@ -63,7 +69,11 @@ class KFCConfig(BaseConfig):
             ),
         )
         blocked_tools: list[str] = Field(
-            default=["send_text", "pass_and_wait", "stop_conversation"],
+            default_factory=lambda: [
+                "send_text",
+                "pass_and_wait",
+                "stop_conversation",
+            ],
             description=(
                 "需要从工具列表中屏蔽的工具末段名称（不含组件类型前缀）。"
                 "列表中的工具不会暴露给 LLM。"
@@ -77,6 +87,8 @@ class KFCConfig(BaseConfig):
                 "超过此次数后将强制停止续轮并进入等待，防止无限重试。"
                 "设为 0 表示不限制续轮次数（不推荐）。"
             ),
+            ge=0,
+            le=20,
         )
         enable_input_status: bool = Field(
             default=False,
@@ -128,10 +140,23 @@ class KFCConfig(BaseConfig):
             default=True,
             description="是否启用回复等待。设为 false 后模型不再等待用户回复",
         )
-        min_seconds: float = Field(default=10.0, description="最小等待秒数")
-        max_seconds: float = Field(default=600.0, description="最大等待秒数")
+        min_seconds: float = Field(
+            default=10.0,
+            description="最小等待秒数",
+            ge=0.0,
+            le=86400.0,
+        )
+        max_seconds: float = Field(
+            default=600.0,
+            description="最大等待秒数",
+            ge=0.0,
+            le=86400.0,
+        )
         max_consecutive_timeouts: int = Field(
-            default=3, description="连续超时上限，达到后不再等待"
+            default=3,
+            description="连续超时上限，达到后不再等待",
+            ge=0,
+            le=100,
         )
 
         def apply_rules(self, raw_seconds: float, consecutive_timeouts: int) -> float:
@@ -140,7 +165,9 @@ class KFCConfig(BaseConfig):
                 return 0.0
             if consecutive_timeouts >= self.max_consecutive_timeouts:
                 return 0.0
-            return max(self.min_seconds, min(raw_seconds, self.max_seconds))
+            lower = min(self.min_seconds, self.max_seconds)
+            upper = max(self.min_seconds, self.max_seconds)
+            return max(lower, min(raw_seconds, upper))
 
     @config_section("proactive")
     class ProactiveSection(SectionBase):
@@ -148,18 +175,38 @@ class KFCConfig(BaseConfig):
 
         enabled: bool = Field(default=True, description="是否启用主动发起")
         silence_threshold: int = Field(
-            default=7200, description="沉默阈值(秒)，超过后可能主动发起"
+            default=7200,
+            description="沉默阈值(秒)，超过后可能主动发起",
+            ge=0,
+            le=2592000,
         )
         trigger_probability: float = Field(
-            default=0.3, description="主动发起触发概率"
+            default=0.3,
+            description="主动发起触发概率",
+            ge=0.0,
+            le=1.0,
         )
         min_interval: int = Field(
-            default=1800, description="两次主动发起最小间隔(秒)"
+            default=1800,
+            description="两次主动发起最小间隔(秒)",
+            ge=0,
+            le=2592000,
         )
-        quiet_hours_start: str = Field(default="23:00", description="勿扰开始时间")
-        quiet_hours_end: str = Field(default="07:00", description="勿扰结束时间")
+        quiet_hours_start: str = Field(
+            default="23:00",
+            description="勿扰开始时间",
+            pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$",
+        )
+        quiet_hours_end: str = Field(
+            default="07:00",
+            description="勿扰结束时间",
+            pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$",
+        )
         check_interval: int = Field(
-            default=60, description="主动发起检查间隔(秒)"
+            default=60,
+            description="主动发起检查间隔(秒)",
+            ge=1,
+            le=86400,
         )
         schedule_guidance: str = Field(
             default=(
@@ -184,13 +231,22 @@ class KFCConfig(BaseConfig):
         """回复配置。"""
 
         typing_chars_per_sec: float = Field(
-            default=15.0, description="模拟打字速度(字/秒)"
+            default=15.0,
+            description="模拟打字速度(字/秒)",
+            gt=0.0,
+            le=200.0,
         )
         typing_delay_min: float = Field(
-            default=0.8, description="最小打字延迟(秒)"
+            default=0.8,
+            description="最小打字延迟(秒)",
+            ge=0.0,
+            le=60.0,
         )
         typing_delay_max: float = Field(
-            default=4.0, description="最大打字延迟(秒)"
+            default=4.0,
+            description="最大打字延迟(秒)",
+            ge=0.0,
+            le=60.0,
         )
 
     @config_section("prompt")
@@ -198,30 +254,46 @@ class KFCConfig(BaseConfig):
         """提示词配置。"""
 
         max_log_entries: int = Field(
-            default=50, description="最大活动流条目数"
+            default=50,
+            description="最大活动流条目数",
+            ge=1,
+            le=10000,
         )
         max_context_payloads: int = Field(
-            default=20, description="LLM 上下文持久化链最大条目数（超出时裁剪最旧的 USER/ASSISTANT 对）"
+            default=20,
+            description="LLM 上下文持久化链最大条目数（超出时裁剪最旧的 USER/ASSISTANT 对）",
+            ge=2,
+            le=1000,
         )
         compress_every_n_rounds: int = Field(
             default=50,
             description="每完成 N 轮对话触发一次近期记忆压缩（1 轮 = 1 次 USER→ASSISTANT 交换）",
+            ge=0,
+            le=10000,
         )
         compress_days_window: float = Field(
             default=3.0,
             description="压缩时覆盖的历史时间窗口（天），只对该窗口内的消息做摘要",
+            gt=0.0,
+            le=365.0,
         )
         min_compress_interval_minutes: float = Field(
             default=120.0,
             description="两次压缩之间的最短间隔（分钟），防止频繁触发",
+            ge=0.0,
+            le=525600.0,
         )
         compress_min_chars: int = Field(
             default=800,
             description="近期记忆摘要的最小字数（写入压缩指令，引导 LLM 控制摘要长度下限）",
+            ge=0,
+            le=100000,
         )
         compress_max_chars: int = Field(
             default=1200,
             description="近期记忆摘要的最大字数（写入压缩指令，引导 LLM 控制摘要长度上限）",
+            ge=0,
+            le=100000,
         )
         compress_model_task: str = Field(
             default="actor",
@@ -249,6 +321,8 @@ class KFCConfig(BaseConfig):
                 "打断检测轮询间隔（秒）。LLM 生成期间每隔此时间检查"
                 "一次是否有新消息到达。值越小响应越快，CPU 占用略高。"
             ),
+            gt=0.0,
+            le=60.0,
         )
         interrupt_cooldown: float = Field(
             default=3.0,
@@ -257,6 +331,8 @@ class KFCConfig(BaseConfig):
                 "以收集可能连发的后续消息。连续打断时每次叠加原值的 1/2："
                 "第 1 次 3.0s，第 2 次 4.5s，第 3 次 6.0s，以此类推。"
             ),
+            ge=0.0,
+            le=300.0,
         )
         max_consecutive_interrupts: int = Field(
             default=3,
@@ -264,6 +340,8 @@ class KFCConfig(BaseConfig):
                 "连续打断次数上限。达到后不再打断当前 LLM 请求，"
                 "让其正常完成后统一处理积累的消息，防止恶意刷消息导致无限 LLM 调用。"
             ),
+            ge=0,
+            le=100,
         )
 
     @config_section("debug")

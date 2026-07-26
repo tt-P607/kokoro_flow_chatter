@@ -19,9 +19,9 @@ from .reply import _force_kfc_metadata_required
 class DoNothingAction(BaseAction):
     """不回复，不做任何操作。"""
 
-    action_name: str = "do_nothing"
+    name: str = "do_nothing"
     associated_types: list[str] = ["text"]
-    action_description: str = (
+    description: str = (
         "决定不做任何回复。当对方的消息不需要回应、纯表情、或者你选择已读不回时使用。"
         "**调用时必须明确给出 thought / expected_reaction / max_wait_seconds / mood "
         "这四个字段，承载你这次决策的内心活动、对对方反应的预期、等待时长和当前情绪。**"

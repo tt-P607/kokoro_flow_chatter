@@ -1,12 +1,21 @@
 {
     "name": "kokoro_flow_chatter",
+    "api_version": {"adapter_api": "1.0.0", "chat_api": "1.0.0", "event_api": "1.0.0", "llm_api": "1.0.0", "log_api": "1.0.0", "prompt_api": "1.0.0", "send_api": "1.0.0", "storage_api": "1.0.0", "stream_api": "1.0.0"},
+
     "display_name": "KokoroFlow 对话引擎",
-    "version": "2.1.1",
+    "version": "2.1.2",
     "description": "KokoroFlow 对话引擎 — 基于心理活动流的私聊特化聊天器",
     "author": "言柒",
     "license": "AGPL-v3.0",
-    "categories": ["chat"],
-    "tags": ["chat", "chatter", "kokoro", "flow"],
+    "categories": [
+        "chat"
+    ],
+    "tags": [
+        "chat",
+        "chatter",
+        "kokoro",
+        "flow"
+    ],
     "dependencies": {
         "plugins": [],
         "components": []
@@ -25,6 +34,11 @@
         {
             "component_type": "action",
             "component_name": "do_nothing",
+            "dependencies": []
+        },
+        {
+            "component_type": "action",
+            "component_name": "pass_and_wait",
             "dependencies": []
         },
         {

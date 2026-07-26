@@ -120,6 +120,62 @@ def _preview_payload(payload: LLMPayload) -> str:
     return (repr(text_attr)[:80] if isinstance(text_attr, str) else repr(content)[:80])
 
 
+_REMINDER_OPEN_TAG = "<system_reminder>"
+_REMINDER_CLOSE_TAG = "</system_reminder>"
+
+
+def _strip_stale_reminder_prefixes(response: Any) -> None:
+    """剥离 response.payloads 中所有非首非尾 USER payload 上残留的旧 reminder 前缀。
+
+    框架 ``_apply_reminders`` 只处理 first_user 和 last_user，中间 USER 上
+    的旧 reminder 前缀不会被自动清理。KFC orchestrator 的 while 循环每轮
+    通过 ``response.add_payload(USER)`` 追加新消息时，上一轮的 last_user
+    变成中间 USER，其 reminder 前缀永久残留并累积，最终导致上下文中堆积
+    大量带 ``<system_reminder>`` 前缀的 USER payload。
+
+    本函数在每次发送 LLM 请求前扫描所有 USER payload，对非首非尾的 USER
+    剥离其 content 开头的 ``<system_reminder>...</system_reminder>`` 块，
+    确保 reminder 只出现在框架管线管理的首尾位置。
+
+    Args:
+        response: 拥有 payloads 列表的响应对象。
+    """
+
+    payloads = getattr(response, "payloads", None)
+    if not isinstance(payloads, list) or not payloads:
+        return
+
+    user_indices = [
+        idx
+        for idx, payload in enumerate(payloads)
+        if payload.role == ROLE.USER
+    ]
+    if len(user_indices) <= 2:
+        return
+
+    middle_user_indices = user_indices[1:-1]
+
+    for idx in middle_user_indices:
+        payload = payloads[idx]
+        content = payload.content
+        if not isinstance(content, list):
+            continue
+        new_content: list[Any] = []
+        skipped = True
+        for item in content:
+            text = getattr(item, "text", None)
+            if (
+                skipped
+                and isinstance(text, str)
+                and text.startswith(_REMINDER_OPEN_TAG)
+            ):
+                continue
+            skipped = False
+            new_content.append(item)
+        if len(new_content) != len(content):
+            payloads[idx] = LLMPayload(ROLE.USER, new_content)
+
+
 logger = get_logger("kfc_chatter")
 
 # 重试时注入的提醒文本
@@ -425,6 +481,9 @@ async def execute_orchestrator(
             if extra_payload is not None:
                 # 框架已允许 TOOL_RESULT → USER，extra_payload（USER 类型）可直接追加。
                 transient_payloads.append(extra_payload)
+            # 发送前清理中间 USER payload 上残留的旧 reminder 前缀，
+            # 避免多轮循环中 reminder 在中间 USER 上永久累积。
+            _strip_stale_reminder_prefixes(response)
             send_target = build_request_view(response, transient_payloads)
             if config.debug.show_prompt:
                 self._log_prompt(send_target, chain_payloads=session.chain_payloads)
@@ -453,11 +512,7 @@ async def execute_orchestrator(
                 await _set_input_status(session.user_id, 1)
 
                 async def _input_status_loop() -> None:
-                    """以 2.5 秒为基础间隔加随机抖动刷新「正在输入」状态。
-
-                    QQ 的「正在输入」状态持续约 2-3 秒，2.5 秒基础间隔刚好覆盖；
-                    加入 0.5-1.5 秒随机抖动模拟人类打字停顿，避免状态闪烁。
-                    """
+                    """以 2.5 秒为基础间隔加随机抖动刷新「正在输入」状态。"""
                     import random
 
                     while True:
@@ -470,6 +525,11 @@ async def execute_orchestrator(
                     _input_status_loop(),
                     name=f"kfc_input_status_{self.stream_id[:8]}",
                     daemon=True,
+                    metadata={
+                        "plugin": "kokoro_flow_chatter",
+                        "purpose": "input_status",
+                        "stream_id": self.stream_id,
+                    },
                 )
 
             try:
@@ -487,9 +547,6 @@ async def execute_orchestrator(
                         await self.flush_unreads(unread_msgs or [])
                         session.add_interrupt_event(interrupt_msgs)
                         await self._save_session(session)
-                        if _input_status_on:
-                            _cancel_input_status_refresh(_input_refresh_handle)
-                            await _set_input_status(session.user_id, 0)
                         # 打断冷却窗口：每次打断叠加原值的 1/2，递增等待时间
                         # 第 1 次: base, 第 2 次: base * 1.5, 第 3 次: base * 2.0, ...
                         base_cooldown = config.buffer.interrupt_cooldown
@@ -519,14 +576,8 @@ async def execute_orchestrator(
                     # 不可打断路径正常完成后也重置打断计数
                     consecutive_interrupt_count = 0
                 await self.flush_unreads(unread_msgs if unread_msgs else [])
-                if _input_status_on:
-                    _cancel_input_status_refresh(_input_refresh_handle)
-                    await _set_input_status(session.user_id, 0)
             except Exception as exc:
                 logger.error(f"LLM 请求失败: {exc}", exc_info=True)
-                if _input_status_on:
-                    _cancel_input_status_refresh(_input_refresh_handle)
-                    await _set_input_status(session.user_id, 0)
                 extra_payload = None
                 # 失败路径必须与成功路径保持同样的 unread 消费契约：
                 # 框架 LLM 层已在内部跑完 policy 重试与多模型 fallback，
@@ -547,6 +598,10 @@ async def execute_orchestrator(
                 await self._save_session(session)
                 yield Failure("LLM 请求失败", exc)
                 break
+            finally:
+                if _input_status_on:
+                    _cancel_input_status_refresh(_input_refresh_handle)
+                    await _set_input_status(session.user_id, 0)
 
             extra_payload = None
             phase = phase_for_model_result(response)

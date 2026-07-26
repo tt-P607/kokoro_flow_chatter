@@ -29,9 +29,9 @@ _BASE_DESCRIPTION = (
 class ScheduleProactiveAction(BaseAction):
     """预约下一次主动思考时间。"""
 
-    action_name: str = "schedule_proactive"
+    name: str = "schedule_proactive"
     associated_types: list[str] = ["text"]
-    action_description: str = _BASE_DESCRIPTION
+    description: str = _BASE_DESCRIPTION
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 
     # 可配置的指导语（由插件在 on_plugin_loaded 时从 config 写入，初始为空）

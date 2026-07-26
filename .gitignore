@@ -12,5 +12,11 @@ env/
 venv/
 *.mfp
 *.log
+.pytest_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
 temp/
 tmp/
+data/kokoro_flow_chatter/sessions/

@@ -21,9 +21,9 @@ from .reply import _force_kfc_metadata_required
 class PassAndWaitAction(BaseAction):
     """完成当前动作后等待对方回复。"""
 
-    action_name: str = "pass_and_wait"
+    name: str = "pass_and_wait"
     associated_types: list[str] = ["text"]
-    action_description: str = (
+    description: str = (
         "完成本轮所有动作后，登记一个等待点。"
         "可以在 action-kfc_reply 之后调用，表示发完消息后继续等待对方回复；"
         "也可以单独调用，表示本轮不回复但保持等待状态。"
