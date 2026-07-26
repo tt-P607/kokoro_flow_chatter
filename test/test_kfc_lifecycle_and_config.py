@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -64,21 +64,15 @@ def test_manifest_matches_registered_components_and_version_source() -> None:
             encoding="utf-8"
         )
     )
-    config = KFCConfig()
-    plugin = KFCPlugin(config)
-    component_names = {
-        getattr(component, "chatter_name", "")
-        or getattr(component, "action_name", "")
-        or getattr(component, "handler_name", "")
-        for component in plugin.get_components()
-    }
+    plugin = KFCPlugin(KFCConfig())
+    component_names = {component.name for component in plugin.get_components()}
     declared_names = {
         item["component_name"]
         for item in manifest["include"]
         if item["component_type"] != "config"
     }
 
-    assert manifest["version"] == "2.1.2"
+    assert manifest["version"] == "2.2.0"
     assert "plugin_version" not in KFCPlugin.__dict__
     assert component_names == declared_names
 
@@ -134,6 +128,8 @@ async def test_summary_service_deduplicates_stream_tasks(
 ) -> None:
     """同一聊天流只能同时存在一个摘要压缩任务。"""
 
+    from src.kernel.concurrency import get_task_manager
+
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -147,35 +143,26 @@ async def test_summary_service_deduplicates_stream_tasks(
         _fake_compress,
     )
     SummaryService._task_ids.clear()
-    session = SimpleNamespace(
-        stream_id="stream-1",
-        history_summary="",
-        compress_round_count=0,
+    session = cast(
+        Any,
+        SimpleNamespace(
+            stream_id="stream-1",
+            history_summary="",
+            compress_round_count=0,
+        ),
     )
     config = KFCConfig()
+    chat_stream = cast(Any, SimpleNamespace())
 
-    first = SummaryService.maybe_schedule_compression(
-        session,
-        SimpleNamespace(),
-        config,
-        SimpleNamespace(),
-    )
+    first = SummaryService.maybe_schedule_compression(session, config, chat_stream)
     await started.wait()
-    second = SummaryService.maybe_schedule_compression(
-        session,
-        SimpleNamespace(),
-        config,
-        SimpleNamespace(),
-    )
+    second = SummaryService.maybe_schedule_compression(session, config, chat_stream)
 
     assert first is True
     assert second is False
 
     release.set()
-    task_id = SummaryService._task_ids["stream-1"]
-    task_info = SummaryService.__dict__["_task_ids"] and __import__(
-        "src.kernel.concurrency", fromlist=["get_task_manager"]
-    ).get_task_manager().get_task(task_id)
+    task_info = get_task_manager().get_task(SummaryService._task_ids["stream-1"])
     assert task_info.task is not None
     await task_info.task
     assert "stream-1" not in SummaryService._task_ids

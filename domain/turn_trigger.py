@@ -1,7 +1,8 @@
 """KFC 回合触发类型。
 
-把 ``prepare_turn_input`` 中原本散落在 if/elif 链里的 4 种隐式分支
-显式化为枚举，便于阅读、调试和后续扩展。
+把主循环"本 tick 为什么要运行"这一判断显式化为枚举，与
+``runtime.phase_machine`` 的角色相位区分开：触发类型回答**为什么运行**，
+相位回答**当前上下文链允许做什么**。
 """
 
 from __future__ import annotations
@@ -18,33 +19,38 @@ class TurnTrigger(str, Enum):
 
     Members:
         NEW_MESSAGES: 收到新的未读消息（最常见路径）。
-        FOLLOWUP_TOOL_RESULT: 上一轮 LLM 产生 tool_call，本轮基于工具结果继续推理。
-        TIMEOUT_EXPIRED: ``session`` 处于 waiting 且 ``timeout_service`` 判定已超时，
-            需要由 bot 主动续话。
-        PROACTIVE_WAKE: 主动发起调度唤醒。
-        IDLE_WAIT: 既无新消息、也未到超时阈值，应该让出本 tick 等待下一次唤醒。
+        FOLLOWUP_TOOL_RESULT: 上轮产生了工具结果，本轮让模型继续消化。
+        TIMEOUT_EXPIRED: 等待已超时，需要 bot 主动续话。
+        IDLE_WAIT: 既无新消息也未到超时，让出本 tick。
     """
 
     NEW_MESSAGES = "new_messages"
     FOLLOWUP_TOOL_RESULT = "followup_tool_result"
     TIMEOUT_EXPIRED = "timeout_expired"
-    PROACTIVE_WAKE = "proactive_wake"
     IDLE_WAIT = "idle_wait"
-
-    TOOL_CONTINUE = FOLLOWUP_TOOL_RESULT
-    TIMEOUT = TIMEOUT_EXPIRED
 
 
 def classify_turn_trigger(
     *,
     has_unread: bool,
     has_pending_tool_results: bool,
-    session: "KFCSession",
+    session: KFCSession,
     is_timeout: bool,
 ) -> TurnTrigger:
-    """根据当前状态确定本轮触发类型。
+    """确定本轮触发类型。
 
-    优先级：``NEW_MESSAGES`` > ``FOLLOWUP_TOOL_RESULT`` > ``TIMEOUT_EXPIRED`` > ``IDLE_WAIT``。
+    优先级固定为
+    ``NEW_MESSAGES > FOLLOWUP_TOOL_RESULT > TIMEOUT_EXPIRED > IDLE_WAIT``，
+    确保新消息永远优先于工具续轮被处理。
+
+    Args:
+        has_unread: 是否存在待处理的未读消息。
+        has_pending_tool_results: 上轮是否留下了待消化的工具结果。
+        session: 当前会话，用于判断是否处于等待状态。
+        is_timeout: 等待是否已超时。
+
+    Returns:
+        TurnTrigger: 本轮触发类型。
     """
     if has_unread:
         return TurnTrigger.NEW_MESSAGES

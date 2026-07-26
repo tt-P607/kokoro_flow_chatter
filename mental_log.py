@@ -1,7 +1,11 @@
-"""心理活动流管理。
+"""心理活动流。
 
-MentalLog 容器负责条目的添加、查询、上限裁剪和格式化。
-MentalLogEntry 记录活动流中的每一个事件节点。
+``MentalLogEntry`` 记录活动流中的单个事件节点；``MentalLog`` 作为容器
+负责条目的追加、去重、上限裁剪与序列化。
+
+活动流的渲染不在本模块内完成——融合叙事由
+``context.sources.history_source.build_fused_narrative()`` 按时间线
+与聊天记录交织后统一产出。
 """
 
 from __future__ import annotations
@@ -10,41 +14,35 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import KFCEventType
+from .models import KFC_REPLY, KFCEventType
 
 
 @dataclass
 class MentalLogEntry:
-    """心理活动日志条目，记录活动流中的单个事件。"""
+    """心理活动流中的单个事件节点。"""
 
     event_type: KFCEventType
     timestamp: float
 
-    # 通用字段
     content: str = ""
+    """通用文本内容，语义随 ``event_type`` 变化。"""
 
-    # 用户消息相关
     user_name: str = ""
     user_id: str = ""
     message_id: str = ""
+    """``USER_MESSAGE`` 专用：发送者信息与消息 ID（消息 ID 同时用于去重）。"""
 
-    # Bot 规划相关
     thought: str = ""
     actions: list[dict[str, Any]] = field(default_factory=list)
     expected_reaction: str = ""
     max_wait_seconds: float = 0.0
+    """``BOT_PLANNING`` 专用：本轮决策的内心活动与动作快照。"""
 
-    # 等待相关
     elapsed_seconds: float = 0.0
-    waiting_thought: str = ""
-    mood: str = ""
+    """等待相关事件专用：已等待秒数。"""
 
-    # 元数据
     metadata: dict[str, Any] = field(default_factory=dict)
-
-    def get_time_str(self, fmt: str = "%H:%M") -> str:
-        """获取格式化的时间字符串。"""
-        return time.strftime(fmt, time.localtime(self.timestamp))
+    """附加信息，如回复时效标记、备忘 id 等。"""
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为字典。"""
@@ -60,17 +58,14 @@ class MentalLogEntry:
             "expected_reaction": self.expected_reaction,
             "max_wait_seconds": self.max_wait_seconds,
             "elapsed_seconds": self.elapsed_seconds,
-            "waiting_thought": self.waiting_thought,
-            "mood": self.mood,
             "metadata": self.metadata,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MentalLogEntry:
-        """从字典反序列化。"""
-        event_type_str = data.get("event_type", "user_message")
+        """从字典反序列化；未知事件类型回退为 ``USER_MESSAGE``。"""
         try:
-            event_type = KFCEventType(event_type_str)
+            event_type = KFCEventType(data.get("event_type", "user_message"))
         except ValueError:
             event_type = KFCEventType.USER_MESSAGE
 
@@ -86,41 +81,38 @@ class MentalLogEntry:
             expected_reaction=data.get("expected_reaction", ""),
             max_wait_seconds=float(data.get("max_wait_seconds", 0)),
             elapsed_seconds=float(data.get("elapsed_seconds", 0)),
-            waiting_thought=data.get("waiting_thought", ""),
-            mood=data.get("mood", ""),
             metadata=data.get("metadata", {}),
         )
 
 
 class MentalLog:
-    """心理活动流容器。
-
-    管理 MentalLogEntry 的添加、查询、裁剪和格式化。
-    """
+    """心理活动流容器，管理条目的追加、查询与上限裁剪。"""
 
     def __init__(self, max_entries: int = 50) -> None:
+        """初始化容器。
+
+        Args:
+            max_entries: 保留的最大条目数，超出时从头裁剪。
+        """
         self._entries: list[MentalLogEntry] = []
         self._max_entries = max_entries
 
     @property
     def entries(self) -> list[MentalLogEntry]:
-        """获取所有条目（只读视图）。"""
+        """返回所有条目的只读副本。"""
         return list(self._entries)
 
     def __len__(self) -> int:
+        """返回当前条目数。"""
         return len(self._entries)
 
     def add(self, entry: MentalLogEntry) -> None:
-        """添加条目，超出上限时自动裁剪最旧的。
+        """追加条目，超出上限时裁剪最旧的。
 
-        对 ``USER_MESSAGE`` 类型按 ``message_id`` 做幂等去重：
-        若该 ``message_id`` 已存在于现有条目中，则跳过本次追加。
-        防止 LLM 失败 → 下一 Tick 重新消费同一批 unread 时，
-        同一条用户消息被反复写入心理活动流，导致缓存膨胀。
-
-        注：仅对带有非空 ``message_id`` 的 ``USER_MESSAGE`` 启用去重；
-        其它事件类型（如 ``BOT_PLANNING``、``WAITING_UPDATE``）允许重复，
-        因为它们记录的是时间序列上的不同决策瞬间。
+        对 ``USER_MESSAGE`` 按 ``message_id`` 做幂等去重：LLM 调用失败后
+        下一 Tick 会重新消费同一批未读，若不去重，同一条用户消息会被反复
+        写入并撑爆活动流。其它事件类型允许重复——它们记录的是时间序列上
+        不同的决策瞬间。
         """
         if (
             entry.event_type == KFCEventType.USER_MESSAGE
@@ -136,153 +128,40 @@ class MentalLog:
         if len(self._entries) > self._max_entries:
             self._entries = self._entries[-self._max_entries :]
 
-    def get_recent(self, n: int = 20) -> list[MentalLogEntry]:
-        """获取最近 n 条条目。"""
-        return self._entries[-n:] if self._entries else []
-
-    def get_last_by_type(self, event_type: KFCEventType) -> MentalLogEntry | None:
-        """获取指定类型的最后一条条目。"""
-        for entry in reversed(self._entries):
-            if entry.event_type == event_type:
-                return entry
-        return None
-
     def get_last_bot_reply_content(self) -> str:
-        """获取最近一次 Bot 回复的文本内容。"""
+        """返回最近一次 Bot 回复的文本内容；无回复时返回空串。
+
+        供超时处理构建"你最后说的是什么"的上下文。
+        """
         for entry in reversed(self._entries):
-            if entry.event_type == KFCEventType.BOT_PLANNING:
-                for action in entry.actions:
-                    if action.get("type") in ("kfc_reply", "respond"):
-                        content = action.get("content", "")
-                        if isinstance(content, list):
-                            joined = " ".join(s for s in content if s)
-                            if joined:
-                                return joined
-                        elif isinstance(content, str) and content:
-                            return content
+            if entry.event_type != KFCEventType.BOT_PLANNING:
+                continue
+            for action in entry.actions:
+                if action.get("type") != KFC_REPLY:
+                    continue
+                content = action.get("content", "")
+                if isinstance(content, list):
+                    joined = " ".join(str(item) for item in content if item)
+                    if joined:
+                        return joined
+                elif isinstance(content, str) and content:
+                    return content
         return ""
-
-    def format_narrative(self) -> str:
-        """以线性叙事格式输出活动流。"""
-        if not self._entries:
-            return "（暂无活动记录）"
-
-        lines: list[str] = []
-        for entry in self._entries:
-            time_str = entry.get_time_str()
-            line = self._format_entry_narrative(entry, time_str)
-            if line:
-                lines.append(line)
-        return "\n".join(lines)
-
-    def format_as_summary(self, max_entries: int = 10) -> str:
-        """格式化为简短摘要，用于 system prompt 注入。"""
-        recent = self.get_recent(max_entries)
-        if not recent:
-            return ""
-
-        lines: list[str] = []
-        for entry in recent:
-            time_str = entry.get_time_str()
-            summary = self._get_entry_summary(entry)
-            lines.append(f"[{time_str}] {summary}")
-        return "\n".join(lines)
 
     def to_list(self) -> list[dict[str, Any]]:
         """序列化为字典列表。"""
-        return [e.to_dict() for e in self._entries]
+        return [entry.to_dict() for entry in self._entries]
 
     @classmethod
-    def from_list(cls, data: list[dict[str, Any]], max_entries: int = 50) -> MentalLog:
-        """从字典列表反序列化。"""
+    def from_list(
+        cls,
+        data: list[dict[str, Any]],
+        max_entries: int = 50,
+    ) -> MentalLog:
+        """从字典列表反序列化，并裁剪到上限。"""
         log = cls(max_entries=max_entries)
         for item in data:
             log._entries.append(MentalLogEntry.from_dict(item))
-        # 裁剪到上限
         if len(log._entries) > max_entries:
             log._entries = log._entries[-max_entries:]
         return log
-
-    def clear(self) -> None:
-        """清空所有条目。"""
-        self._entries.clear()
-
-    @staticmethod
-    def _format_entry_narrative(entry: MentalLogEntry, time_str: str) -> str:
-        """将单个条目格式化为叙事行。"""
-        event = entry.event_type
-
-        if event == KFCEventType.USER_MESSAGE:
-            name = entry.user_name or "用户"
-            msg_id_part = f" [消息id:{entry.message_id}]" if entry.message_id else ""
-            return f"[{time_str}] {name}{msg_id_part}说：{entry.content}"
-
-        if event == KFCEventType.BOT_PLANNING:
-            parts = [f"[{time_str}] 你的内心想法：{entry.thought}"]
-            if entry.actions:
-                action_desc = ", ".join(
-                    a.get("type", "unknown") for a in entry.actions
-                )
-                parts.append(f"  执行动作：{action_desc}")
-            if entry.expected_reaction:
-                parts.append(f"  期望对方回应：{entry.expected_reaction}")
-            return "\n".join(parts)
-
-        if event == KFCEventType.WAITING_UPDATE:
-            return f"[{time_str}] (等待中的内心活动) {entry.waiting_thought}"
-
-        if event == KFCEventType.WAIT_TIMEOUT:
-            return f"[{time_str}] 等待超时，已等待 {entry.elapsed_seconds:.0f} 秒"
-
-        if event == KFCEventType.REPLY_IN_TIME:
-            return f"[{time_str}] 在预期时间内收到了对方回复"
-
-        if event == KFCEventType.REPLY_LATE:
-            return f"[{time_str}] 对方回复较晚（已等待 {entry.elapsed_seconds:.0f} 秒）"
-
-        if event == KFCEventType.PROACTIVE_TRIGGER:
-            return f"[{time_str}] (主动发起) {entry.content}"
-
-        if event == KFCEventType.WAITING_START:
-            return f"[{time_str}] 开始等待对方回复（最多 {entry.max_wait_seconds:.0f} 秒）"
-
-        return f"[{time_str}] {entry.content}"
-
-    @staticmethod
-    def _get_entry_summary(entry: MentalLogEntry) -> str:
-        """获取条目的简短摘要。"""
-        event = entry.event_type
-
-        if event == KFCEventType.USER_MESSAGE:
-            name = entry.user_name or "用户"
-            text = entry.content[:60]
-            return f"{name}: {text}"
-
-        if event == KFCEventType.BOT_PLANNING:
-            return entry.thought[:60] if entry.thought else "(无想法)"
-
-        if event == KFCEventType.WAITING_UPDATE:
-            return entry.waiting_thought[:60] if entry.waiting_thought else "(思考中)"
-
-        if event == KFCEventType.WAIT_TIMEOUT:
-            return f"等待超时 ({entry.elapsed_seconds:.0f}s)"
-
-        if event == KFCEventType.REPLY_IN_TIME:
-            return "及时收到回复"
-
-        if event == KFCEventType.REPLY_LATE:
-            return f"延迟回复 ({entry.elapsed_seconds:.0f}s)"
-
-        if event == KFCEventType.PROACTIVE_TRIGGER:
-            return entry.content[:60] if entry.content else "主动发起"
-
-        if event == KFCEventType.MEMO_WRITTEN:
-            return f"记下备忘: {entry.content[:40]}"
-
-        if event == KFCEventType.MEMO_DELETED:
-            return f"删除备忘: {entry.content[:40]}"
-
-        if event == KFCEventType.MEMO_EXPIRED:
-            return f"备忘到期: {entry.content[:40]}"
-
-        return entry.content[:60] if entry.content else str(event)

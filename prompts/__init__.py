@@ -1,28 +1,19 @@
-"""提示词模块。
+"""KFC 提示词层。
 
-提供 KFC 专用的提示词模板、模块函数和构建器。
+``templates`` 存放静态模板文本，``modules`` 负责注册模板并按运行时
+状态渲染动态提示词（主动发起、超时决策）。
 """
 
-from __future__ import annotations
-
-from .templates import (
-    KFC_SYSTEM_PROMPT,
-    KFC_PROACTIVE_PROMPT,
-    KFC_TIMEOUT_PROMPT,
+from .modules import (
+    build_mental_log_hint,
+    build_proactive_context,
+    build_timeout_payload,
+    register_kfc_prompts,
 )
 
 __all__ = [
-    "KFC_SYSTEM_PROMPT",
-    "KFC_PROACTIVE_PROMPT",
-    "KFC_TIMEOUT_PROMPT",
-    "KFCPromptBuilder",
+    "build_mental_log_hint",
+    "build_proactive_context",
+    "build_timeout_payload",
+    "register_kfc_prompts",
 ]
-
-
-def __getattr__(name: str) -> object:
-    """惰性导出 builder，避免 context/planner 导入 templates 时触发循环导入。"""
-    if name == "KFCPromptBuilder":
-        from .builder import KFCPromptBuilder
-
-        return KFCPromptBuilder
-    raise AttributeError(name)

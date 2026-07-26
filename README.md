@@ -103,82 +103,86 @@ LLM 可自主管理的中短期提醒系统：
 
 ## 文件结构
 
+分层依赖严格单向：`runtime → execution → protocol → domain`，
+`context` / `services` / `prompts` 作为被调用的能力层，`domain` 与
+`models` 不依赖任何上层。
+
 ```
 kokoro_flow_chatter/
 ├── manifest.json              # 插件元数据
-├── plugin.py                  # 插件入口
+├── plugin.py                  # 插件入口：组件注册、调度任务、会话存储
 ├── config.py                  # 配置定义
-├── chatter.py                 # 聊天器门面
+├── chatter.py                 # 组件门面：实现框架契约，向 runtime 暴露能力
+├── models.py                  # 共享数据模型：常量、事件类型、备忘、等待状态
+├── mental_log.py              # 心理活动流容器
+├── session.py                 # 会话状态与持久化存储
 ├── compressor.py              # 近期记忆压缩
-├── session.py                 # 会话状态持久化
-├── mental_log.py              # 心理活动流
-├── models.py                  # 共享数据模型
-├── multimodal.py              # 多模态图片处理
+├── multimodal.py              # 原生多模态图片处理
+├── framework_compat.py        # 框架未公开能力的兼容边界
 │
-├── domain/                    # 领域模型
+├── domain/                    # 领域模型（纯数据，无 IO）
 │   ├── decision.py            # 决策对象
-│   ├── scene_state.py         # 场景状态
 │   ├── chain_entry.py         # 对话链条目
 │   └── turn_trigger.py        # 回合触发分类
 │
-├── runtime/                   # 运行时主循环
-│   ├── orchestrator.py        # 主循环编排
-│   ├── turn_controller.py     # 回合准备与提交
-│   ├── phase_machine.py       # 对话阶段状态机
-│   ├── request_view.py        # LLM 请求视图
-│   ├── interrupt_controller.py # 生成打断控制
-│   └── unread_policy.py       # 未读消息过滤
+├── protocol/                  # 协议层（纯函数，无副作用）
+│   ├── response_normalizer.py # 响应标准化（含 provider 兼容）
+│   ├── tool_call_adapter.py   # 工具名/参数归一化的唯一来源
+│   └── decision_parser.py     # 执行结果 → Decision 收敛
 │
-├── context/                   # 上下文构建
-│   ├── planner.py             # 上下文规划
-│   ├── renderer.py            # 上下文渲染
+├── execution/                 # 执行层（唯一产生对外副作用）
+│   ├── runner.py              # 单轮执行入口：解析 → 执行 → 收敛
+│   └── decision_executor.py   # 控制动作解释与第三方工具调度
+│
+├── runtime/                   # 运行时（对话主循环及配套）
+│   ├── orchestrator.py        # 主循环编排
+│   ├── turn_controller.py     # 回合输入准备与决策提交
+│   ├── context_builder.py     # 初始请求构建
+│   ├── model_setup.py         # 模型集解析
+│   ├── payload_hygiene.py     # 上下文链清理（孤立结果 / 残留提醒）
+│   ├── summary_sync.py        # 记忆摘要热更新
+│   ├── input_status.py        # 「正在输入」状态上报
+│   ├── request_view.py        # 一次性发送视图
+│   ├── interrupt_controller.py# 可打断的 LLM 调用
+│   ├── phase_machine.py       # 上下文链角色相位
+│   └── unread_policy.py       # 未读消息优先级策略
+│
+├── context/                   # 上下文层（规划 + 渲染）
+│   ├── planner.py             # 上下文规划（产出纯数据）
+│   ├── renderer.py            # payload 组装
 │   ├── types.py               # 上下文类型定义
 │   └── sources/               # 各上下文来源
-│       ├── history_source.py  # 历史/摘要/叙事
-│       ├── scene_source.py    # 场景状态
-│       ├── plugin_source.py   # 第三方注入
+│       ├── history_source.py  # 历史 / 摘要 / 融合叙事
+│       ├── initial_source.py  # 启动时的系统模板变量
 │       ├── memo_source.py     # 备忘录
-│       └── initial_source.py  # 初始上下文
+│       └── plugin_source.py   # 第三方注入
 │
-├── protocol/                  # 协议层
-│   ├── compat_adapter.py      # Provider 兼容
-│   ├── response_normalizer.py # 响应标准化
-│   ├── decision_parser.py     # 决策解析
-│   └── tool_call_adapter.py   # 工具调用适配
+├── services/                  # 运行时服务（带状态副作用）
+│   ├── proactive_service.py   # 主动发起：预约管理 + 触发判定
+│   ├── timeout_service.py     # 等待超时：判定 + 状态推进
+│   └── summary_service.py     # 摘要压缩任务调度与去重
 │
 ├── actions/                   # KFC 专属动作
-│   ├── reply.py               # kfc_reply
+│   ├── reply.py               # kfc_reply（含元数据 schema 工具）
 │   ├── do_nothing.py          # do_nothing
+│   ├── pass_and_wait.py       # pass_and_wait
 │   ├── memo.py                # kfc_memo / kfc_memo_delete
-│   ├── schedule_proactive.py  # schedule_proactive
-│   └── pass_and_wait.py       # pass_and_wait
+│   └── schedule_proactive.py  # schedule_proactive
 │
 ├── prompts/                   # 提示词
-│   ├── templates.py           # 模板定义
-│   ├── builder.py             # 提示词构建
-│   └── modules.py             # 模板注册
-│
-├── services/                  # 服务层
-│   ├── summary_service.py     # 摘要压缩调度
-│   ├── timeout_service.py     # 超时处理
-│   └── proactive_service.py   # 主动发起调度
-│
-├── thinker/                   # 思考决策
-│   ├── proactive.py           # 沉默检测与触发
-│   └── timeout_handler.py     # 超时判定
+│   ├── templates.py           # 静态模板文本
+│   └── modules.py             # 模板注册与动态提示词构建
 │
 ├── handlers/                  # 事件处理
 │   ├── proactive_handler.py   # 主动发起事件
-│   └── voice_call_history_handler.py
-│
-├── execution/                 # 执行层
-│   └── decision_executor.py   # 决策执行
+│   └── voice_call_history_handler.py  # 通话历史回填
 │
 ├── debug/                     # 调试工具
-│   └── log_formatter.py       # 日志美化
+│   └── log_formatter.py       # 提示词面板与决策摘要
 │
 └── test/                      # 测试
-    └── test_kfc_refactor_protocol.py
+    ├── test_kfc_refactor_protocol.py    # 核心协议
+    └── test_kfc_lifecycle_and_config.py # 生命周期与配置
 ```
 
 ---
@@ -277,7 +281,7 @@ kokoro_flow_chatter/
 - 插件加载后注册提示词模板，并通过 TaskManager 等待统一 Scheduler 启动。
 - 主动发起检查使用名为 `kfc_proactive_check` 的周期调度；插件卸载时会移除。
 - 近期摘要按聊天流去重调度；同一流不会并发启动多份压缩任务，卸载时会取消残留任务。
-- 会话状态保存在 `data/kokoro_flow_chatter/sessions/`，按 `stream_id` 隔离。
+- 会话状态保存在 `data/kokoro_flow_chatter/sessions/`，按 `stream_id` 隔离；同目录下的 `_index.json` 维护 `stream_id` 与账号的可读映射。
 - 禁用 `[general].enabled` 后不注册 Chatter，由框架为私聊流选择其他可用 Chatter。
 
 ## 自动测试
@@ -312,6 +316,7 @@ uv run pytest plugins/kokoro_flow_chatter/test -q
 1. 检查 `[general].native_multimodal` 是否开启，主模型是否支持图片输入。
 2. 新用户第一条消息可能早于 KFC 注册流级识别跳过；后续消息会使用跳过设置。
 3. 流级识别跳过当前由框架 `MediaManager` 提供，但尚未暴露为插件公共 API；KFC 通过 `framework_compat.py` 集中隔离该内部边界。
+4. 表情包按设计仍走 VLM 文字描述，以复用其哈希缓存，属预期行为。
 
 ### 近期摘要不生成
 

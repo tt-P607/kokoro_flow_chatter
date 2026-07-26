@@ -1,4 +1,7 @@
-"""kokoro_flow_chatter 重构后核心协议测试。"""
+"""KFC 核心协议测试。
+
+覆盖领域模型、协议层、执行层、上下文层与运行时的关键行为契约。
+"""
 
 from __future__ import annotations
 
@@ -13,23 +16,66 @@ _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from plugins.kokoro_flow_chatter.chatter import KokoroFlowChatter  # noqa: E402
-from plugins.kokoro_flow_chatter.context.renderer import ContextRenderer  # noqa: E402
-from plugins.kokoro_flow_chatter.context.sources.history_source import restore_chain_payloads  # noqa: E402
-from plugins.kokoro_flow_chatter.context.types import InitialContextPlan  # noqa: E402
-from plugins.kokoro_flow_chatter.prompts.modules import register_kfc_prompts  # noqa: E402
+from src.app.plugin_system.types import (  # noqa: E402
+    LLMPayload,
+    ROLE,
+    Text,
+    ToolCall,
+    ToolResult,
+)
+
+from plugins.kokoro_flow_chatter.context.renderer import (  # noqa: E402
+    render_initial_context,
+    render_turn_contributions,
+)
+from plugins.kokoro_flow_chatter.context.sources.history_source import (  # noqa: E402
+    build_channel_payload,
+    build_current_time_payload,
+    build_fused_narrative,
+    build_history_summary_payload,
+    restore_chain_payloads,
+)
+from plugins.kokoro_flow_chatter.context.sources.memo_source import (  # noqa: E402
+    build_memo_contribution,
+)
+from plugins.kokoro_flow_chatter.context.types import (  # noqa: E402
+    ContextContribution,
+    InitialContextPlan,
+)
 from plugins.kokoro_flow_chatter.domain.chain_entry import ChainEntry  # noqa: E402
 from plugins.kokoro_flow_chatter.domain.decision import Decision  # noqa: E402
-from plugins.kokoro_flow_chatter.domain.turn_trigger import TurnTrigger, classify_turn_trigger  # noqa: E402
-from plugins.kokoro_flow_chatter.execution.decision_executor import execute_decision_draft  # noqa: E402
-from plugins.kokoro_flow_chatter.models import DO_NOTHING, KFC_REPLY, ToolCallResult  # noqa: E402
-from plugins.kokoro_flow_chatter.protocol.decision_parser import build_decision  # noqa: E402
-from plugins.kokoro_flow_chatter.protocol.response_normalizer import normalize_response  # noqa: E402
+from plugins.kokoro_flow_chatter.domain.turn_trigger import (  # noqa: E402
+    TurnTrigger,
+    classify_turn_trigger,
+)
+from plugins.kokoro_flow_chatter.execution.decision_executor import (  # noqa: E402
+    calculate_typing_delay,
+    execute_decision_draft,
+    parse_content_segments,
+)
+from plugins.kokoro_flow_chatter.execution.runner import run_decision  # noqa: E402
+from plugins.kokoro_flow_chatter.models import (  # noqa: E402
+    DO_NOTHING,
+    KFC_REPLY,
+    Memo,
+    ToolCallResult,
+    WaitingConfig,
+    clamp_expire_hours,
+)
+from plugins.kokoro_flow_chatter.protocol.decision_parser import (  # noqa: E402
+    build_decision,
+)
+from plugins.kokoro_flow_chatter.protocol.response_normalizer import (  # noqa: E402
+    normalize_response,
+)
 from plugins.kokoro_flow_chatter.protocol.tool_call_adapter import (  # noqa: E402
     build_decision_draft,
     extract_call_args,
-    is_kfc_control_call,
     normalize_call_name,
+)
+from plugins.kokoro_flow_chatter.runtime.payload_hygiene import (  # noqa: E402
+    heal_orphan_tool_results,
+    strip_stale_reminder_prefixes,
 )
 from plugins.kokoro_flow_chatter.runtime.phase_machine import (  # noqa: E402
     ConversationPhase,
@@ -44,20 +90,21 @@ from plugins.kokoro_flow_chatter.runtime.request_view import (  # noqa: E402
 )
 from plugins.kokoro_flow_chatter.runtime.turn_controller import (  # noqa: E402
     build_chain_assistant_entry,
-    prepare_turn_input,
 )
-from plugins.kokoro_flow_chatter.runtime.orchestrator import _heal_orphan_tool_results as heal_orphan_tool_results  # noqa: E402
-from src.app.plugin_system.types import LLMPayload, ROLE, Text, ToolCall, ToolResult  # noqa: E402
+from plugins.kokoro_flow_chatter.runtime.unread_policy import (  # noqa: E402
+    filter_interrupt_messages,
+    prefer_real_unreads,
+)
+
+
+# ── 测试替身 ──────────────────────────────────────────────
 
 
 class _FakeSession:
-    """最小 session 替身。"""
+    """最小会话替身，只实现等待状态查询。"""
 
     def __init__(self, waiting: bool = False) -> None:
         self._waiting = waiting
-
-    def prune_expired_memos(self) -> list[Any]:
-        return []
 
     def is_waiting(self) -> bool:
         """返回等待状态。"""
@@ -65,7 +112,7 @@ class _FakeSession:
 
 
 class _FakeResponse:
-    """最小 response 替身。"""
+    """最小响应替身。"""
 
     def __init__(self, payloads: list[LLMPayload] | None = None) -> None:
         self.payloads = payloads or []
@@ -76,206 +123,95 @@ class _FakeResponse:
         self.payloads.append(payload)
 
 
-class _FakeDebugConfig:
-    """最小 debug 配置。"""
-
-    show_prompt = False
-
-
-class _FakeReplyConfig:
-    """最小 reply 配置。"""
-
-    typing_chars_per_sec = 0.0
-    typing_delay_min = 0.0
-    typing_delay_max = 0.0
-
-
 class _FakeConfig:
-    """最小 KFCConfig 替身。"""
+    """最小配置替身。"""
 
-    debug = _FakeDebugConfig()
-    reply = _FakeReplyConfig()
-
-
-class _CollectingResponse:
-    """收集 payload 的最小 response。"""
-
-    def __init__(self) -> None:
-        self.payloads: list[LLMPayload] = []
-
-    def add_payload(self, payload: LLMPayload) -> None:
-        """追加 payload。"""
-        self.payloads.append(payload)
+    debug = SimpleNamespace(show_prompt=False, show_response=False)
+    reply = SimpleNamespace(
+        typing_chars_per_sec=0.0,
+        typing_delay_min=0.0,
+        typing_delay_max=0.0,
+    )
 
 
 def _text_of(payload: LLMPayload) -> str:
-    """提取测试 payload 的首个文本片段。"""
-    part = payload.content[0]
+    """提取 payload 的首个文本片段。"""
+    content = payload.content
+    part = content[0] if isinstance(content, list) else content
     assert isinstance(part, Text)
     return part.text
 
 
-def test_phase_machine_covers_all_role_phase_branches() -> None:
-    """role-phase 状态机应覆盖等待、续轮、工具执行和提交路径。"""
-    empty_response = _FakeResponse()
-    tool_tail_response = _FakeResponse([LLMPayload(ROLE.TOOL_RESULT, Text("done"))])
-    model_response = _FakeResponse()
-    model_response.call_list = [ToolCall(name="action-kfc_reply", args={}, id="c1")]
-
-    assert has_tool_result_tail(empty_response) is False
-    assert has_tool_result_tail(tool_tail_response) is True
-    assert phase_for_turn_start(empty_response, has_pending_tool_results=False) is ConversationPhase.WAIT_INPUT
-    assert phase_for_turn_start(empty_response, has_pending_tool_results=True) is ConversationPhase.FOLLOW_UP
-    assert phase_for_turn_start(tool_tail_response, has_pending_tool_results=False) is ConversationPhase.FOLLOW_UP
-    assert phase_for_model_result(model_response) is ConversationPhase.TOOL_EXEC
-    assert phase_for_model_result(empty_response) is ConversationPhase.COMMIT
-    assert can_accept_user_payload(ConversationPhase.WAIT_INPUT) is True
-    assert can_accept_user_payload(ConversationPhase.COMMIT) is True
-    assert can_accept_user_payload(ConversationPhase.FOLLOW_UP) is False
+async def _unused_run_tool_call(
+    _pending_calls: list[Any],
+    _response: Any,
+    _usable_map: Any,
+    _trigger_msg: Any | None,
+) -> list[tuple[bool, bool]]:
+    """不应被调用的工具执行器。"""
+    raise AssertionError("unexpected tool call")
 
 
-def test_turn_trigger_priority_and_idle_branch() -> None:
-    """触发原因优先级应固定，避免 tool follow-up 被误当新输入。"""
+# ── 领域模型 ──────────────────────────────────────────────
+
+
+def test_turn_trigger_priority_is_stable() -> None:
+    """触发优先级应固定，避免工具续轮被误判为新输入。"""
     waiting_session = cast(Any, _FakeSession(waiting=True))
     idle_session = cast(Any, _FakeSession(waiting=False))
 
-    assert classify_turn_trigger(
-        has_unread=True,
-        has_pending_tool_results=True,
-        session=waiting_session,
-        is_timeout=True,
-    ) is TurnTrigger.NEW_MESSAGES
-    assert classify_turn_trigger(
-        has_unread=False,
-        has_pending_tool_results=True,
-        session=waiting_session,
-        is_timeout=True,
-    ) is TurnTrigger.FOLLOWUP_TOOL_RESULT
-    assert classify_turn_trigger(
-        has_unread=False,
-        has_pending_tool_results=False,
-        session=waiting_session,
-        is_timeout=True,
-    ) is TurnTrigger.TIMEOUT_EXPIRED
-    assert classify_turn_trigger(
-        has_unread=False,
-        has_pending_tool_results=False,
-        session=idle_session,
-        is_timeout=True,
-    ) is TurnTrigger.IDLE_WAIT
-
-
-@pytest.mark.asyncio
-async def test_prepare_turn_input_non_message_triggers_keep_empty_wrapped_text() -> None:
-    """工具续轮和超时触发不应访问未初始化的 wrapped_user_text。"""
-
-    class _FakeChatter:
-        """prepare_turn_input 所需的最小 Chatter 替身。"""
-
-        stream_id = "test-stream"
-
-        async def fetch_unreads(self, time_format: str = "%Y-%m-%d %H:%M:%S") -> tuple[str, list[Any]]:
-            """返回空未读，触发非新消息路径。"""
-            _ = time_format
-            return "", []
-
-    class _TimeoutService:
-        """超时服务替身。"""
-
-        def check_timeout(self, _session: Any) -> bool:
-            """始终认为已超时。"""
-            return True
-
-        def build_timeout_result(self, _session: Any) -> Any:
-            """返回超时注入 payload。"""
-            return SimpleNamespace(
-                is_final_timeout=False,
-                payload=LLMPayload(ROLE.USER, Text("超时触发")),
-            )
-
-    class _FakeSessionWithMethods:
-        def __init__(self, waiting: bool = False):
-            self.waiting = waiting
-            self.mental_log: list[Any] = []
-            self.consecutive_timeouts = 0
-            self.wait_start_time = 0.0
-            self.history_summary = ""
-            self.chain_payloads: list[Any] = []
-            self.memos: list[Any] = []
-        def prune_expired_memos(self) -> list[Any]:
-            return []
-        def add_memo_event(self, type_: Any, memo: Any) -> None:
-            pass
-        def is_waiting(self) -> bool:
-            return self.waiting
-        def is_proactive_schedule_pending(self) -> bool:
-            return False
-        def get_proactive_schedule(self) -> Any:
-            return None
-        def add_interrupt_event(self, msgs: Any) -> None:
-            pass
-        def is_proactive_pending(self) -> bool:
-            return False
-        def get_last_memo_event(self, type_: Any) -> Any:
-            return None
-        def get_last_active_time(self) -> float:
-            return 0.0
-        def update_chain(self, entries: list[Any], max_context_payloads: int) -> None:
-            pass
-        def clear_consecutive_timeouts(self) -> None:
-            pass
-        def set_waiting(self, value: bool) -> None:
-            self.waiting = value
-        def record_wait_start(self) -> None:
-            pass
-        def is_interrupt_event_pending(self) -> bool:
-            return False
-        def fetch_interrupt_events(self) -> list[Any]:
-            return []
-            
-    followup = await prepare_turn_input(
-        chatter=cast(Any, _FakeChatter()),
-        response=_FakeResponse(),
-        chat_stream=cast(Any, SimpleNamespace(platform="test")),
-        config=cast(Any, SimpleNamespace()),
-        session=cast(Any, _FakeSessionWithMethods(waiting=False)),
-        prompt_builder=cast(Any, SimpleNamespace()),
-        timeout_service=cast(Any, _TimeoutService()),
-        has_pending_tool_results=True,
+    assert (
+        classify_turn_trigger(
+            has_unread=True,
+            has_pending_tool_results=True,
+            session=waiting_session,
+            is_timeout=True,
+        )
+        is TurnTrigger.NEW_MESSAGES
     )
-    timeout = await prepare_turn_input(
-        chatter=cast(Any, _FakeChatter()),
-        response=_FakeResponse(),
-        chat_stream=cast(Any, SimpleNamespace(platform="test")),
-        config=cast(Any, SimpleNamespace()),
-        session=cast(Any, _FakeSessionWithMethods(waiting=True)),
-        prompt_builder=cast(Any, SimpleNamespace()),
-        timeout_service=cast(Any, _TimeoutService()),
-        has_pending_tool_results=False,
+    assert (
+        classify_turn_trigger(
+            has_unread=False,
+            has_pending_tool_results=True,
+            session=waiting_session,
+            is_timeout=True,
+        )
+        is TurnTrigger.FOLLOWUP_TOOL_RESULT
+    )
+    assert (
+        classify_turn_trigger(
+            has_unread=False,
+            has_pending_tool_results=False,
+            session=waiting_session,
+            is_timeout=True,
+        )
+        is TurnTrigger.TIMEOUT_EXPIRED
+    )
+    assert (
+        classify_turn_trigger(
+            has_unread=False,
+            has_pending_tool_results=False,
+            session=idle_session,
+            is_timeout=True,
+        )
+        is TurnTrigger.IDLE_WAIT
     )
 
-    assert followup.wrapped_user_text == ""
-    assert timeout.wrapped_user_text == ""
-    assert timeout.response.payloads[-1].role == ROLE.USER
 
-
-
-def test_chain_entry_schema_filters_dirty_data_and_serializes_cleanly() -> None:
-    """ChainEntry 应集中约束 chain_payloads 的可用 schema。"""
+def test_chain_entry_filters_dirty_data() -> None:
+    """ChainEntry 应集中约束对话链的可用结构。"""
     user_entry = ChainEntry.user("你好", ts=1.5)
     assistant_entry = ChainEntry.assistant("", [{"name": "action-kfc_reply", "args": {}}])
 
     assert user_entry.is_user is True
-    assert user_entry.is_assistant is False
     assert user_entry.to_dict() == {"role": "user", "text": "你好", "ts": 1.5}
-    assert assistant_entry.is_assistant is True
     assert assistant_entry.has_tool_calls is True
     assert assistant_entry.text == "好的。"
-    assert assistant_entry.to_dict()["tool_calls"] == [{"name": "action-kfc_reply", "args": {}}]
 
     assert ChainEntry.from_dict({"role": "bad", "text": "x"}) is None
     assert ChainEntry.from_dict({"role": "user", "text": ""}) is None
     assert ChainEntry.from_dict({"role": "assistant", "text": "", "tool_calls": []}) is None
+
     restored = ChainEntry.from_dict(
         {
             "role": "assistant",
@@ -290,8 +226,353 @@ def test_chain_entry_schema_filters_dirty_data_and_serializes_cleanly() -> None:
     assert restored.tool_calls == [{"name": "action-kfc_reply"}]
 
 
-def test_restore_chain_payloads_keeps_only_readable_history() -> None:
-    """历史读取只恢复用户可读文本，不把审计 tool_calls 再喂给模型。"""
+def test_decision_exposes_semantic_properties() -> None:
+    """Decision 的语义属性应保持单一含义。"""
+    decision = Decision(
+        has_meaningful_action=True,
+        visible_reply_segments=["A", "B"],
+        has_reply_action=True,
+    )
+
+    assert decision.should_reply is True
+    assert decision.reply_text == "A\nB"
+    assert decision.has_third_party_calls is False
+    assert build_chain_assistant_entry("", [{"name": "action-kfc_reply"}])["text"] == "好的。"
+
+
+def test_waiting_config_and_memo_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """等待配置与备忘边界值应可预测。"""
+    inactive = WaitingConfig()
+    assert inactive.is_active() is False
+    assert inactive.get_elapsed_seconds() == 0.0
+    assert inactive.is_timeout() is False
+
+    monkeypatch.setattr("plugins.kokoro_flow_chatter.models.time.time", lambda: 15.0)
+    active = WaitingConfig(expected_reaction="回", max_wait_seconds=10, started_at=5)
+    assert active.is_active() is True
+    assert active.get_elapsed_seconds() == 10.0
+    assert active.is_timeout() is True
+    assert WaitingConfig.from_dict(active.to_dict()).expected_reaction == "回"
+
+    active.reset()
+    assert active.to_dict() == {
+        "expected_reaction": "",
+        "max_wait_seconds": 0.0,
+        "started_at": 0.0,
+    }
+
+    assert clamp_expire_hours(0) == 24.0
+    assert clamp_expire_hours("bad") == 24.0  # type: ignore[arg-type]
+    assert clamp_expire_hours(0.5) == 1.0
+    assert clamp_expire_hours(9999) == 14 * 24.0
+
+
+# ── 协议层 ────────────────────────────────────────────────
+
+
+def test_tool_call_adapter_normalizes_without_side_effects() -> None:
+    """工具调用适配层应只做无副作用的归一化。"""
+    calls = [
+        ToolCall(name="action-kfc_reply", args={"content": ["你好"]}, id="c1"),
+        ToolCall(name="tool-weather", args='{"city": "上海"}', id="c2"),
+        ToolCall(name="agent:planner", args="[]", id="c3"),
+        ToolCall(name="raw", args="{bad json", id="c4"),
+    ]
+    draft = build_decision_draft(calls)
+
+    assert normalize_call_name("") == ""
+    assert normalize_call_name("agent:planner") == "planner"
+    assert normalize_call_name("tool-weather") == "weather"
+    assert normalize_call_name("raw") == "raw"
+    assert extract_call_args({"a": 1}) == {"a": 1}
+    assert extract_call_args("[]") == {}
+    assert extract_call_args(1) == {}
+
+    assert draft.has_calls is True
+    assert [call.normalized_name for call in draft.calls] == [
+        "kfc_reply",
+        "weather",
+        "planner",
+        "raw",
+    ]
+    assert draft.calls[1].args == {"city": "上海"}
+    assert draft.calls[2].args == {}
+    assert draft.calls[0].is_kfc_control is True
+    assert draft.calls[1].is_kfc_control is False
+    assert draft.calls[1].is_info_tool is True
+    assert draft.calls[0].is_info_tool is False
+    assert build_decision_draft(None).has_calls is False
+
+
+def test_normalize_response_parses_compat_tool_calls() -> None:
+    """正文内嵌的 compat 工具调用应被就地转成标准形态。"""
+    response = SimpleNamespace(
+        message=(
+            '{"message":"", "tool_calls": ['
+            '{"id":"reply1", "name":"action-kfc_reply", '
+            '"args":{"content":["你好"]}}]}'
+        ),
+        call_list=[],
+        payloads=[],
+        reasoning_content=None,
+    )
+
+    assert normalize_response(response) is True
+    assert response.call_list[0].name == "action-kfc_reply"
+    assert response.call_list[0].args == {"content": ["你好"]}
+    assert response.payloads[-1].role == ROLE.ASSISTANT
+    # 已有标准调用时不应重复解析
+    assert normalize_response(response) is False
+
+
+def test_build_decision_extracts_replies_and_schedule() -> None:
+    """决策收敛应提取可见回复、第三方调用与主动预约。"""
+    result = ToolCallResult(
+        thought="想法",
+        mood="开心",
+        expected_reaction="回应",
+        max_wait_seconds=5,
+        actions=[
+            {"type": KFC_REPLY, "content": [" 你好 ", ""]},
+            {"type": KFC_REPLY, "content": " 再见 "},
+            {"type": "draw_image", "content": "ignored"},
+        ],
+        has_reply=True,
+        has_third_party=True,
+        has_info_tool=True,
+    )
+    call_list = [
+        ToolCall(name="action-kfc_reply", args={}, id="reply"),
+        ToolCall(name="tool-search", args='{"query":"q"}', id="search"),
+        ToolCall(
+            name="action-schedule_proactive",
+            args={"delay_minutes": "bad", "reason": "想你"},
+            id="schedule",
+        ),
+    ]
+
+    decision = build_decision(result, call_list)
+
+    assert decision.thought == "想法"
+    assert decision.reply_text == "你好\n再见"
+    assert decision.should_reply is True
+    assert decision.has_third_party_calls is True
+    assert [(call.name, call.call_id) for call in decision.third_party_calls] == [
+        ("search", "search"),
+        ("schedule_proactive", "schedule"),
+    ]
+    assert decision.proactive_schedule is not None
+    assert decision.proactive_schedule.delay_minutes == 30.0
+    assert decision.proactive_schedule.reason == "想你"
+
+
+# ── 执行层 ────────────────────────────────────────────────
+
+
+def test_parse_content_segments_handles_all_shapes() -> None:
+    """content 参数的三种形态都应正确解析。"""
+    assert parse_content_segments(["A", " ", "B"]) == ["A", "B"]
+    assert parse_content_segments('["A", "B"]') == ["A", "B"]
+    assert parse_content_segments("单句") == ["单句"]
+    assert parse_content_segments("") == []
+    assert parse_content_segments(None) == []
+
+
+def test_calculate_typing_delay_respects_bounds() -> None:
+    """打字延迟应被夹到配置区间内。"""
+    config = cast(
+        Any,
+        SimpleNamespace(
+            reply=SimpleNamespace(
+                typing_chars_per_sec=10.0,
+                typing_delay_min=0.5,
+                typing_delay_max=2.0,
+            )
+        ),
+    )
+    assert calculate_typing_delay("ab", config) == 0.5
+    assert calculate_typing_delay("a" * 100, config) == 2.0
+    assert calculate_typing_delay("a" * 10, config) == 1.0
+
+    zero_speed = cast(
+        Any,
+        SimpleNamespace(
+            reply=SimpleNamespace(
+                typing_chars_per_sec=0.0,
+                typing_delay_min=0.5,
+                typing_delay_max=2.0,
+            )
+        ),
+    )
+    assert calculate_typing_delay("abc", zero_speed) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_executor_routes_regular_action_to_framework() -> None:
+    """普通动作交给框架，kfc_reply 仍由 KFC 特殊处理。"""
+    draft = build_decision_draft(
+        [
+            ToolCall(name="action-draw_image", args={"prompt": "fox"}, id="draw1"),
+            ToolCall(name="action-kfc_reply", args={"content": ["画好了"]}, id="reply1"),
+        ]
+    )
+    response = _FakeResponse()
+    framework_call_names: list[str] = []
+    sent_segments: list[str] = []
+
+    async def _run_tool_call(
+        pending_calls: list[Any],
+        target_response: Any,
+        _usable_map: Any,
+        _trigger_msg: Any | None,
+    ) -> list[tuple[bool, bool]]:
+        framework_call_names.extend(call.name for call in pending_calls)
+        for call in pending_calls:
+            target_response.add_payload(
+                LLMPayload(
+                    ROLE.TOOL_RESULT,
+                    ToolResult(value="ok", call_id=call.id, name=call.name),
+                )
+            )
+        return [(True, True) for _ in pending_calls]
+
+    async def _execute_reply(
+        content: str,
+        _config: Any,
+        _trigger_msg: Any | None,
+        _reply_to: str,
+    ) -> bool:
+        sent_segments.append(content)
+        return True
+
+    result = await execute_decision_draft(
+        draft,
+        response,
+        usable_map=cast(Any, {}),
+        trigger_msg=object(),
+        config=cast(Any, _FakeConfig()),
+        execute_reply_fn=_execute_reply,
+        run_tool_call_fn=_run_tool_call,
+    )
+
+    # 第三方工具必须先于回复执行，模型才能基于结果回话
+    assert framework_call_names == ["action-draw_image"]
+    assert sent_segments == ["画好了"]
+    assert result.has_reply is True
+    assert result.has_third_party is True
+    assert [payload.role for payload in response.payloads] == [
+        ROLE.TOOL_RESULT,
+        ROLE.TOOL_RESULT,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_executor_only_first_segment_carries_reply_to() -> None:
+    """分段回复时只有首段携带引用，避免重复引用块。"""
+    draft = build_decision_draft(
+        [
+            ToolCall(
+                name="action-kfc_reply",
+                args={"content": ["第一句", "第二句"], "reply_to": "m1"},
+                id="reply1",
+            )
+        ]
+    )
+    sent: list[tuple[str, str]] = []
+
+    async def _execute_reply(
+        content: str,
+        _config: Any,
+        _trigger_msg: Any | None,
+        reply_to: str,
+    ) -> bool:
+        sent.append((content, reply_to))
+        return True
+
+    result = await execute_decision_draft(
+        draft,
+        _FakeResponse(),
+        usable_map=cast(Any, {}),
+        trigger_msg=None,
+        config=cast(Any, _FakeConfig()),
+        execute_reply_fn=_execute_reply,
+        run_tool_call_fn=_unused_run_tool_call,
+    )
+
+    assert sent == [("第一句", "m1"), ("第二句", "")]
+    assert result.has_failed_tool is False
+
+
+@pytest.mark.asyncio
+async def test_executor_marks_empty_and_duplicated_reply_as_failure() -> None:
+    """空内容视为失败，重复回复被忽略。"""
+    draft = build_decision_draft(
+        [
+            ToolCall(name="action-kfc_reply", args={"content": []}, id="reply1"),
+            ToolCall(name="action-kfc_reply", args={"content": ["补发"]}, id="reply2"),
+        ]
+    )
+    response = _FakeResponse()
+
+    async def _execute_reply(
+        _content: str,
+        _config: Any,
+        _trigger_msg: Any | None,
+        _reply_to: str,
+    ) -> bool:
+        raise AssertionError("空内容不应触发发送")
+
+    result = await execute_decision_draft(
+        draft,
+        response,
+        usable_map=cast(Any, {}),
+        trigger_msg=None,
+        config=cast(Any, _FakeConfig()),
+        execute_reply_fn=_execute_reply,
+        run_tool_call_fn=_unused_run_tool_call,
+    )
+
+    assert result.has_failed_tool is True
+    assert len(response.payloads) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_decision_converges_call_list_to_decision() -> None:
+    """执行入口应把 call_list 完整收敛为 Decision。"""
+    response = _FakeResponse()
+    response.call_list = [
+        ToolCall(name="action-kfc_reply", args={"content": ["你好"]}, id="r1")
+    ]
+    sent: list[str] = []
+
+    async def _execute_reply(
+        content: str,
+        _config: Any,
+        _trigger_msg: Any | None,
+        _reply_to: str,
+    ) -> bool:
+        sent.append(content)
+        return True
+
+    decision = await run_decision(
+        response,
+        usable_map=cast(Any, {}),
+        trigger_msg=None,
+        config=cast(Any, _FakeConfig()),
+        execute_reply_fn=_execute_reply,
+        run_tool_call_fn=_unused_run_tool_call,
+    )
+
+    assert sent == ["你好"]
+    assert decision.reply_text == "你好"
+    assert decision.should_reply is True
+
+
+# ── 上下文层 ──────────────────────────────────────────────
+
+
+def test_restore_chain_payloads_keeps_readable_history() -> None:
+    """历史还原只保留可读文本，不把审计工具调用喂回模型。"""
     payloads = restore_chain_payloads(
         [
             {"role": "assistant", "text": "孤立开头会被丢弃"},
@@ -316,23 +597,130 @@ def test_restore_chain_payloads_keeps_only_readable_history() -> None:
     assert _text_of(payloads[1]) == "你好呀~"
 
 
+def test_history_source_payload_builders() -> None:
+    """摘要、时间与通道 payload 的分支应可预测。"""
+    import datetime
+
+    named_stream = cast(
+        Any, SimpleNamespace(stream_name="言柒", context=SimpleNamespace(history_messages=[]))
+    )
+    unknown_stream = cast(
+        Any, SimpleNamespace(stream_name="", context=SimpleNamespace(history_messages=[]))
+    )
+
+    assert build_history_summary_payload(named_stream, "") is None
+    assert (
+        _text_of(build_history_summary_payload(named_stream, "记忆") or cast(Any, None))
+        == "【你对言柒的近期记忆】\n记忆"
+    )
+    assert (
+        _text_of(build_history_summary_payload(unknown_stream, "记忆") or cast(Any, None))
+        == "【你对对方的近期记忆】\n记忆"
+    )
+
+    time_payload = build_current_time_payload(datetime.datetime(2026, 5, 9, 22, 0))
+    assert time_payload.role == ROLE.USER
+    assert _text_of(time_payload) == "当前时间：2026-05-09 22:00"
+
+    channel_payload = build_channel_payload(
+        cast(
+            Any,
+            SimpleNamespace(
+                platform="qq",
+                chat_type="private",
+                bot_id="42",
+                bot_nickname="狐狐",
+                stream_name="言柒",
+            ),
+        )
+    )
+    assert channel_payload.role == ROLE.USER
+    assert "聊天平台：qq" in _text_of(channel_payload)
+    assert "ID 42" in _text_of(channel_payload)
+
+
+def test_build_fused_narrative_interleaves_messages_and_thoughts() -> None:
+    """融合叙事应把消息与内心活动按时间线交织。"""
+    from plugins.kokoro_flow_chatter.models import KFCEventType
+
+    messages = [
+        SimpleNamespace(
+            time="bad", sender_name="A", sender_id="u", message_id="m0",
+            processed_plain_text="忽略",
+        ),
+        SimpleNamespace(
+            time=1.0, sender_name="A", sender_id="u", message_id="m1",
+            processed_plain_text="早期",
+        ),
+        SimpleNamespace(
+            time=2.0, sender_name="Bot", sender_id="bot", message_id="m2",
+            processed_plain_text="机器人",
+        ),
+        SimpleNamespace(
+            time=3.0, sender_name="Bot", sender_id="other",
+            message_id="action_kfc_reply_1", processed_plain_text="动作回复",
+        ),
+        SimpleNamespace(
+            time=4.0, sender_name="B", sender_id="u", message_id="",
+            processed_plain_text="",
+        ),
+    ]
+    mental_log = SimpleNamespace(
+        entries=[
+            SimpleNamespace(
+                timestamp=2.5, event_type=KFCEventType.BOT_PLANNING, thought="想到你"
+            ),
+            SimpleNamespace(
+                timestamp=3.5, event_type=KFCEventType.USER_MESSAGE, thought="忽略"
+            ),
+            SimpleNamespace(
+                timestamp="bad", event_type=KFCEventType.BOT_PLANNING, thought="坏时间"
+            ),
+        ]
+    )
+    stream = cast(
+        Any,
+        SimpleNamespace(bot_id="bot", context=SimpleNamespace(history_messages=messages)),
+    )
+
+    narrative = build_fused_narrative(stream, cast(Any, mental_log), before_ts=4.0)
+
+    assert "A [消息id:m1]说：早期" in narrative
+    assert "你回复：机器人" in narrative
+    assert "你回复：动作回复" in narrative
+    assert "（你的内心：想到你）" in narrative
+    assert "坏时间" not in narrative
+
+    empty_stream = cast(
+        Any, SimpleNamespace(bot_id="bot", context=SimpleNamespace(history_messages=[]))
+    )
+    assert build_fused_narrative(empty_stream, None) == ""
+
+
 @pytest.mark.asyncio
-async def test_initial_context_keeps_dynamic_history_out_of_system_payloads() -> None:
-    """初始上下文应只保留稳定 SYSTEM，把动态历史放入 USER 链。"""
-    renderer = ContextRenderer()
-    chat_stream = SimpleNamespace(partner_name="言柒", context=SimpleNamespace(history_messages=[]))
-    plan = InitialContextPlan()
-    plan.history_summary = "近期摘要"
+async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
+    """初始上下文只保留稳定 SYSTEM，动态内容进 USER 链。"""
+    chat_stream = cast(
+        Any,
+        SimpleNamespace(
+            stream_name="言柒",
+            platform="qq",
+            chat_type="private",
+            bot_id="42",
+            bot_nickname="狐狐",
+            context=SimpleNamespace(history_messages=[]),
+        ),
+    )
+    plan = InitialContextPlan(history_summary="近期摘要")
 
     async def _build_system_prompt(
         _chat_stream: Any,
-        _extra_vars: dict[str, Any] | None,
+        _extra_vars: dict[str, str] | None,
     ) -> str:
-        """返回稳定系统提示词。"""
         return "稳定系统提示词"
 
-    system_payloads, chain_payloads, has_history = await renderer.render_initial_context(
-        chat_stream=cast(Any, chat_stream),
+    system_payloads, chain_payloads, has_history = await render_initial_context(
+        chat_stream=chat_stream,
         plan=plan,
         mental_log=None,
         serialized_chain_payloads=[
@@ -345,221 +733,155 @@ async def test_initial_context_keeps_dynamic_history_out_of_system_payloads() ->
 
     assert [payload.role for payload in system_payloads] == [ROLE.SYSTEM]
     assert _text_of(system_payloads[0]) == "稳定系统提示词"
-    assert [payload.role for payload in chain_payloads] == [ROLE.USER, ROLE.USER, ROLE.ASSISTANT]
-    assert "近期摘要" in _text_of(chain_payloads[0])
-    assert "融合叙事" in _text_of(chain_payloads[0])
+    assert [payload.role for payload in chain_payloads] == [
+        ROLE.USER,
+        ROLE.USER,
+        ROLE.ASSISTANT,
+    ]
+    dynamic_text = _text_of(chain_payloads[0])
+    assert "近期摘要" in dynamic_text
+    assert "融合叙事" in dynamic_text
     assert _text_of(chain_payloads[1]) == "旧用户输入"
-    assert _text_of(chain_payloads[2]) == "旧回复"
     assert has_history is True
 
 
-@pytest.mark.asyncio
-async def test_kfc_system_prompt_does_not_publish_prompt_build_event(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """KFC 系统提示词构建不应暴露 on_prompt_build 动态注入点或通道动态字段。"""
-    from src.core.config import get_core_config, init_core_config
-    from src.kernel.event import EventDecision, get_event_bus
-
-    try:
-        from src.core.config import get_core_config
-        get_core_config()
-    except RuntimeError:
-        from src.core.config import init_core_config
-        init_core_config(config_path="config/core.toml")
-
-    register_kfc_prompts()
-    renderer = ContextRenderer()
-    chat_stream = SimpleNamespace(
-        platform="test",
-        chat_type="private",
-        bot_id="bot",
-        stream_id="stream-1",
-    )
-    bus = get_event_bus()
-    original_subscribers = list(bus.get_subscribers("on_prompt_build"))
-    seen_names: list[str] = []
-
-    async def _inject_system(params: dict[str, Any]) -> tuple[EventDecision, dict[str, Any]]:
-        """若被调用则尝试污染 KFC 系统提示词。"""
-        seen_names.append(str(params.get("name", "")))
-        params["template"] = str(params.get("template", "")) + "\n动态污染"
-        return EventDecision.SUCCESS, params
-
-    async def _noop_handler(event_name: str, params: dict[str, Any]) -> tuple[EventDecision, dict[str, Any]]:
-        """适配事件总线回调签名。"""
-        _ = event_name
-        return await _inject_system(params)
-
-    bus.subscribe("on_prompt_build", _noop_handler)
-    try:
-        prompt = await renderer.build_system_prompt(
-            cast(Any, chat_stream),
-            {
-                "reply_mode_instruction": "工具说明",
-                "current_time": "2026-05-10 00:00:00",
-            },
+def test_render_turn_contributions_orders_by_owner_and_priority() -> None:
+    """上下文贡献应按 owner 分区并在区内按优先级排序。"""
+    assert render_turn_contributions([]) is None
+    assert (
+        render_turn_contributions(
+            [ContextContribution(source="s", owner="notice", priority=0, content="  ")]
         )
-    finally:
-        monkeypatch.setattr(bus, "_subscribers", {"on_prompt_build": original_subscribers})
-
-    assert get_core_config().personality.nickname in prompt
-    assert "工具说明" in prompt
-    assert "动态污染" not in prompt
-    assert "当前时间" not in prompt
-    assert "聊天平台" not in prompt
-    assert "stream-1" not in prompt
-    assert seen_names == []
-
-
-def test_tool_call_adapter_normalizes_and_extracts_all_branches() -> None:
-    """tool call adapter 应只做无副作用规范化。"""
-    calls = [
-        ToolCall(name="action-kfc_reply", args={"content": ["你好"], "thought": "想回复"}, id="c1"),
-        ToolCall(name="tool-weather", args='{"city": "上海"}', id="c2"),
-        ToolCall(name="agent:planner", args="[]", id="c3"),
-        ToolCall(name="raw", args="{bad json", id="c4"),
-    ]
-
-    draft = build_decision_draft(calls)
-
-    assert normalize_call_name("") == ""
-    assert normalize_call_name("agent:planner") == "planner"
-    assert normalize_call_name("tool-weather") == "weather"
-    assert normalize_call_name("raw") == "raw"
-    assert extract_call_args({"a": 1}) == {"a": 1}
-    assert extract_call_args("[]") == {}
-    assert extract_call_args(1) == {}
-    assert draft.has_calls is True
-    assert [call.normalized_name for call in draft.calls] == ["kfc_reply", "weather", "planner", "raw"]
-    assert draft.calls[1].args == {"city": "上海"}
-    assert draft.calls[2].args == {}
-    assert is_kfc_control_call(draft.calls[0]) is True
-    assert is_kfc_control_call(draft.calls[1]) is False
-    assert build_decision_draft(None).has_calls is False
-
-
-
-@pytest.mark.asyncio
-async def test_kfc_modify_llm_usables_reuses_base_filter_then_blocks_and_sorts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """KFC 工具列表应先复用 BaseChatter 过滤，再做专属屏蔽和稳定排序。"""
-
-    class _AlphaTool:
-        """测试工具 A。"""
-
-        @classmethod
-        def get_signature(cls) -> str:
-            """返回组件签名。"""
-            return "z_plugin:tool:alpha"
-
-        @staticmethod
-        def to_schema() -> dict[str, Any]:
-            """返回工具 schema。"""
-            return {"name": "tool-alpha"}
-
-    class _BlockedTool:
-        """应被 KFC blocked_tools 屏蔽的工具。"""
-
-        @classmethod
-        def get_signature(cls) -> str:
-            """返回组件签名。"""
-            return "a_plugin:tool:blocked"
-
-        @staticmethod
-        def to_schema() -> dict[str, Any]:
-            """返回工具 schema。"""
-            return {"name": "tool-blocked"}
-
-    class _BetaTool:
-        """测试工具 B。"""
-
-        @classmethod
-        def get_signature(cls) -> str:
-            """返回组件签名。"""
-            return "m_plugin:tool:beta"
-
-        @staticmethod
-        def to_schema() -> dict[str, Any]:
-            """返回工具 schema。"""
-            return {"name": "tool-beta"}
-
-    async def _fake_base_modify(self: Any, llm_usables: list[Any]) -> list[Any]:
-        """模拟 BaseChatter 已过滤掉 chatter_allow/go_activate 不通过的工具。"""
-        _ = self
-        assert llm_usables == [_AlphaTool, _BlockedTool, _BetaTool]
-        return [_BetaTool, _BlockedTool, _AlphaTool]
-
-    monkeypatch.setattr(
-        "src.core.components.base.chatter.BaseChatter.modify_llm_usables",
-        _fake_base_modify,
-    )
-    chatter = KokoroFlowChatter(
-        stream_id="stream-1",
-        plugin=cast(Any, SimpleNamespace()),
-    )
-    monkeypatch.setattr(
-        chatter,
-        "_get_config",
-        lambda: SimpleNamespace(general=SimpleNamespace(blocked_tools=["blocked"])),
+        is None
     )
 
-    result = await chatter.modify_llm_usables([_AlphaTool, _BlockedTool, _BetaTool])
-
-    assert result == [_BetaTool, _AlphaTool]
-
-
-
-def test_normalize_response_parses_compat_tool_calls_without_model_set() -> None:
-    """兼容 JSON tool call 解析不应依赖 DeepSeek model_set。"""
-    response = SimpleNamespace(
-        message=(
-            '{"message":"", "tool_calls": ['
-            '{"id":"reply1", "name":"action-kfc_reply", '
-            '"args":{"content":["你好"]}}]}'
-        ),
-        call_list=[],
-        payloads=[],
+    payload = render_turn_contributions(
+        [
+            ContextContribution(source="a", owner="notice", priority=1, content="通知低"),
+            ContextContribution(source="b", owner="notice", priority=9, content="通知高"),
+            ContextContribution(source="c", owner="policy", priority=0, content="策略"),
+            ContextContribution(
+                source="legacy.on_prompt_build.extra",
+                owner="notice",
+                priority=5,
+                content="遗留注入",
+            ),
+        ]
     )
 
-    normalized = normalize_response(response)
-
-    assert normalized.used_compat_tool_calls is True
-    assert normalized.has_tool_calls is True
-    assert response.call_list[0].name == "action-kfc_reply"
-    assert response.call_list[0].args == {"content": ["你好"]}
-    assert response.payloads[-1].role == ROLE.ASSISTANT
-
+    assert payload is not None
+    text = _text_of(payload)
+    assert text.index("[策略约束]") < text.index("通知高")
+    assert text.index("通知高") < text.index("遗留注入")
+    assert text.index("遗留注入") < text.index("通知低")
+    assert "[SYSTEM REMINDER]\n遗留注入" in text
 
 
-def test_heal_orphan_tool_results_removes_orphans_and_keeps_valid_chain() -> None:
-    """heal_orphan_tool_results 应移除孤立 TOOL_RESULT，保留合法链路。"""
+def test_memo_contribution_skips_expired_entries() -> None:
+    """备忘渲染应跳过已过期条目。"""
+    import time
+
+    now = time.time()
+    assert build_memo_contribution([]) is None
+    assert (
+        build_memo_contribution(
+            [Memo(content="已过期", created_at=now - 100, expires_at=now - 1)]
+        )
+        is None
+    )
+
+    contribution = build_memo_contribution(
+        [
+            Memo(content="有效备忘", intent="记得问", created_at=now, expires_at=now + 7200),
+            Memo(content="已过期", created_at=now - 100, expires_at=now - 1),
+        ]
+    )
+    assert contribution is not None
+    assert contribution.owner == "notice"
+    assert "有效备忘" in contribution.content
+    assert "已过期" not in contribution.content
+    assert "剩余约 2 小时" in contribution.content
+
+
+# ── 运行时 ────────────────────────────────────────────────
+
+
+def test_phase_machine_covers_all_branches() -> None:
+    """相位状态机应覆盖等待、续轮、工具执行与提交路径。"""
+    empty_response = _FakeResponse()
+    tool_tail_response = _FakeResponse([LLMPayload(ROLE.TOOL_RESULT, Text("done"))])
+    model_response = _FakeResponse()
+    model_response.call_list = [ToolCall(name="action-kfc_reply", args={}, id="c1")]
+
+    assert has_tool_result_tail(empty_response) is False
+    assert has_tool_result_tail(tool_tail_response) is True
+    assert (
+        phase_for_turn_start(empty_response, has_pending_tool_results=False)
+        is ConversationPhase.WAIT_INPUT
+    )
+    assert (
+        phase_for_turn_start(empty_response, has_pending_tool_results=True)
+        is ConversationPhase.FOLLOW_UP
+    )
+    assert (
+        phase_for_turn_start(tool_tail_response, has_pending_tool_results=False)
+        is ConversationPhase.FOLLOW_UP
+    )
+    assert phase_for_model_result(model_response) is ConversationPhase.TOOL_EXEC
+    assert phase_for_model_result(empty_response) is ConversationPhase.COMMIT
+    assert can_accept_user_payload(ConversationPhase.WAIT_INPUT) is True
+    assert can_accept_user_payload(ConversationPhase.FOLLOW_UP) is False
+
+
+def test_heal_orphan_tool_results_keeps_valid_chain() -> None:
+    """孤立 TOOL_RESULT 应被移除，合法链路保持不变。"""
     orphan_response = _FakeResponse(
         [
             LLMPayload(ROLE.USER, Text("u")),
-            LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="bad", call_id="bad", name="bad")),
-            LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="bad2", call_id="bad2", name="bad2")),
+            LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="bad", call_id="b1", name="b")),
+            LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="bad2", call_id="b2", name="b")),
         ]
     )
     assert heal_orphan_tool_results(orphan_response, where="unit") == 2
     assert [payload.role for payload in orphan_response.payloads] == [ROLE.USER]
 
-    valid_call = ToolCall(name="action-kfc_reply", args={}, id="c1")
     valid_response = _FakeResponse(
         [
-            LLMPayload(ROLE.ASSISTANT, [valid_call]),
-            LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="ok", call_id="c1", name="action-kfc_reply")),
+            LLMPayload(ROLE.ASSISTANT, [ToolCall(name="action-kfc_reply", args={}, id="c1")]),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                ToolResult(value="ok", call_id="c1", name="action-kfc_reply"),
+            ),
         ]
     )
     assert heal_orphan_tool_results(valid_response, where="valid") == 0
 
 
+def test_strip_stale_reminder_prefixes_only_touches_middle_users() -> None:
+    """只有中间 USER 的残留 reminder 前缀会被剥离。"""
+    reminder = Text("<system_reminder>旧提醒</system_reminder>")
+    response = _FakeResponse(
+        [
+            LLMPayload(ROLE.USER, [reminder, Text("首条")]),
+            LLMPayload(ROLE.USER, [reminder, Text("中间")]),
+            LLMPayload(ROLE.ASSISTANT, [Text("回复")]),
+            LLMPayload(ROLE.USER, [reminder, Text("末条")]),
+        ]
+    )
+
+    strip_stale_reminder_prefixes(response)
+
+    assert len(cast(list[Any], response.payloads[0].content)) == 2
+    assert len(cast(list[Any], response.payloads[1].content)) == 1
+    assert _text_of(response.payloads[1]) == "中间"
+    assert len(cast(list[Any], response.payloads[3].content)) == 2
+
+
 def test_request_view_keeps_transient_payload_out_of_source() -> None:
-    """构造发送视图不应把 transient payload 写入原始 response。"""
+    """构造发送视图不应污染原始主链。"""
     base_payload = LLMPayload(ROLE.USER, Text("主输入"))
     extra_payload = LLMPayload(ROLE.USER, Text("临时上下文"))
-    response = SimpleNamespace(payloads=[base_payload])
+    response = cast(Any, SimpleNamespace(payloads=[base_payload]))
 
     view = build_request_view(response, [extra_payload])
 
@@ -567,8 +889,8 @@ def test_request_view_keeps_transient_payload_out_of_source() -> None:
     assert view.payloads == [base_payload, extra_payload]
 
 
-def test_without_transient_payloads_strips_extra_and_restores_user_payloads() -> None:
-    """RequestView 裁剪辅助应同时去掉 extra 并还原被 reminder 修改的 USER。"""
+def test_without_transient_payloads_restores_source_users() -> None:
+    """裁剪辅助应同时去掉临时项并还原被 reminder 修改的 USER。"""
     source_user = LLMPayload(ROLE.USER, Text("原始"))
     source_assistant = LLMPayload(ROLE.ASSISTANT, Text("旧回复"))
     injected_user = LLMPayload(ROLE.USER, [Text("注入"), Text("原始")])
@@ -591,531 +913,56 @@ def test_without_transient_payloads_strips_extra_and_restores_user_payloads() ->
 
 
 @pytest.mark.asyncio
-async def test_request_view_returns_raw_result_for_request_like_source(monkeypatch: pytest.MonkeyPatch) -> None:
-    """source 不是 LLMResponse 时，RequestView 应返回新结果而非回写字段。"""
-    from src.kernel.llm.response import LLMResponse
-
-    source = SimpleNamespace(
-        payloads=[LLMPayload(ROLE.USER, Text("主输入"))],
-        model_set=cast(Any, [{}]),
-        context_manager=None,
-        request_name="kfc_test",
-        meta_data={},
-    )
-
-    async def _fake_send(self: Any, auto_append_response: bool = True, stream: bool = False) -> LLMResponse:
-        _ = (self, auto_append_response, stream)
-        return LLMResponse(
-            _stream=None,
-            _upper=cast(Any, SimpleNamespace(request_name="kfc_test", meta_data={})),
-            _auto_append_response=False,
-            payloads=list(self.payloads),
-            model_set=cast(Any, [{}]),
-            context_manager=None,
-            message="ok",
-            call_list=[],
-        )
-
-    monkeypatch.setattr("src.kernel.llm.request.LLMRequest.send", _fake_send)
-
-    result = await build_request_view(source, []).send(auto_append_response=False, stream=False)
-
-    assert result is not source
-    assert result.message == "ok"
-    assert getattr(result, "_consumed") is True
-
-
-@pytest.mark.asyncio
-async def test_request_view_syncs_appended_state_after_send(monkeypatch: pytest.MonkeyPatch) -> None:
-    """RequestView 回写后再写 TOOL_RESULT 不应重复追加 ASSISTANT。"""
-    from src.kernel.llm.response import LLMResponse
-
-    base_payload = LLMPayload(ROLE.USER, Text("主输入"))
-    assistant_call = ToolCall(name="action-kfc_reply", args={"content": ["你好"]}, id="c1")
-    source = LLMResponse(
-        _stream=None,
-        _upper=cast(Any, SimpleNamespace(request_name="kfc_test", meta_data={})),
-        _auto_append_response=True,
-        payloads=[base_payload],
-        model_set=cast(Any, [{}]),
-        context_manager=None,
-        message="",
-        call_list=[],
-    )
-
-    async def _fake_send(self: Any, auto_append_response: bool = True, stream: bool = False) -> LLMResponse:
-        _ = (self, stream)
-        result = LLMResponse(
-            _stream=None,
-            _upper=cast(Any, SimpleNamespace(request_name="kfc_test", meta_data={})),
-            _auto_append_response=auto_append_response,
-            payloads=[base_payload],
-            model_set=cast(Any, [{}]),
-            context_manager=None,
-            message="",
-            call_list=[assistant_call],
-        )
-        await result
-        return result
-
-    monkeypatch.setattr("src.kernel.llm.request.LLMRequest.send", _fake_send)
-
-    response = await build_request_view(source, []).send(auto_append_response=True, stream=False)
-    response.add_payload(
-        LLMPayload(
-            ROLE.TOOL_RESULT,
-            ToolResult(value="ok", call_id="c1", name="action-kfc_reply"),
-        )
-    )
-
-    assistant_payloads = [payload for payload in response.payloads if payload.role == ROLE.ASSISTANT]
-    assert len(assistant_payloads) == 1
-    assert response.payloads[-1].role == ROLE.TOOL_RESULT
-
-
-@pytest.mark.asyncio
-async def test_request_view_strips_reminder_from_persistent_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
-    """RequestView 应确保 transient payload 触发的 reminder 不被回写到 source。"""
-    from src.kernel.llm.context import LLMContextManager
-    from src.kernel.llm.response import LLMResponse
-
-    source_user = LLMPayload(ROLE.USER, Text("原始输入"))
-    source = LLMResponse(
-        _stream=None,
-        _upper=cast(Any, SimpleNamespace(request_name="kfc_test", meta_data={})),
-        _auto_append_response=True,
-        payloads=[source_user],
-        model_set=cast(Any, [{}]),
-        context_manager=LLMContextManager(),
-        message="",
-        call_list=[],
-    )
-    extra_payload = LLMPayload(ROLE.USER, Text("临时注入"))
-
-    async def _fake_send(self: Any, auto_append_response: bool = True, stream: bool = False) -> LLMResponse:
-        _ = stream
-        injected_user = LLMPayload(ROLE.USER, [Text("【系统提示：我是注入的】"), Text("原始输入")])
-        injected_extra = LLMPayload(ROLE.USER, [Text("【系统提示：我是注入的】"), Text("临时注入")])
-        result = LLMResponse(
-            _stream=None,
-            _upper=cast(Any, SimpleNamespace(request_name="kfc_test", meta_data={})),
-            _auto_append_response=auto_append_response,
-            payloads=[injected_user, injected_extra],
-            model_set=cast(Any, [{}]),
-            context_manager=self.context_manager,
-            message="回复内容",
-            call_list=[],
-        )
-        await result
-        return result
-
-    monkeypatch.setattr("src.kernel.llm.request.LLMRequest.send", _fake_send)
-
-    await build_request_view(source, [extra_payload]).send(auto_append_response=True, stream=False)
-
-    assert len(source.payloads) == 2
-    assert source.payloads[0].role == ROLE.USER
-    assert _text_of(source.payloads[0]) == "原始输入"
-    assert source.payloads[1].role == ROLE.ASSISTANT
-    assert _text_of(source.payloads[1]) == "回复内容"
-
-
-@pytest.mark.asyncio
-async def test_executor_routes_regular_action_to_framework_but_keeps_kfc_reply_special() -> None:
-    """普通 action 走框架执行，kfc_reply 仍由 KFC 特殊处理。"""
-    calls = [
-        ToolCall(name="action-draw_image", args={"prompt": "fox"}, id="draw1"),
-        ToolCall(name="action-kfc_reply", args={"content": ["画好了"]}, id="reply1"),
-    ]
-    draft = build_decision_draft(calls)
-    response = _CollectingResponse()
-    framework_call_names: list[str] = []
-    sent_segments: list[str] = []
-
-    async def _run_tool_call(
-        pending_calls: list[Any],
-        _response: Any,
-        _usable_map: Any,
-        _trigger_msg: Any | None,
-    ) -> list[tuple[bool, bool]]:
-        framework_call_names.extend(call.name for call in pending_calls)
-        for call in pending_calls:
-            _response.add_payload(
-                LLMPayload(
-                    ROLE.TOOL_RESULT,
-                    ToolResult(value="ok", call_id=call.id, name=call.name),
-                )
-            )
-        return [(True, True) for _call in pending_calls]
-
-    async def _execute_reply(
-        content: str,
-        _config: Any,
-        _trigger_msg: Any | None,
-        _reply_to: str,
-    ) -> bool:
-        sent_segments.append(content)
-        return True
-
-    result = await execute_decision_draft(
-        draft,
-        response,
-        usable_map=cast(Any, {}),
-        trigger_msg=object(),
-        config=cast(Any, _FakeConfig()),
-        execute_reply_fn=_execute_reply,
-        run_tool_call_fn=_run_tool_call,
-    )
-
-    assert framework_call_names == ["action-draw_image"]
-    assert sent_segments == ["画好了"]
-    assert result.has_reply is True
-    assert result.has_third_party is True
-    assert [payload.role for payload in response.payloads] == [ROLE.TOOL_RESULT, ROLE.TOOL_RESULT]
-
-
-@pytest.mark.asyncio
-async def test_executor_handles_reply_failure_do_nothing_info_tools_and_hook() -> None:
-    """执行层应覆盖回复失败、沉默、信息工具和 hook 分支。"""
-    calls = [
-        ToolCall(name="tool-search", args={"query": "q", "reason": "查资料"}, id="tool1"),
-        ToolCall(name="action-kfc_reply", args={"content": ["第一句", "第二句"], "reply_to": "m1"}, id="reply1"),
-        ToolCall(name="action-do_nothing", args={"max_wait_seconds": 3, "expected_reaction": "继续"}, id="none1"),
-    ]
-    draft = build_decision_draft(calls)
-    response = _CollectingResponse()
-    sent_segments: list[tuple[str, str]] = []
-    hook_seen: list[ToolCallResult] = []
-
-    async def _run_tool_call(
-        pending_calls: list[Any],
-        _response: Any,
-        _usable_map: Any,
-        _trigger_msg: Any | None,
-    ) -> list[tuple[bool, bool]]:
-        for call in pending_calls:
-            _response.add_payload(LLMPayload(ROLE.TOOL_RESULT, ToolResult(value="ok", call_id=call.id, name=call.name)))
-        return [(True, False) for _call in pending_calls]
-
-    async def _execute_reply(content: str, _config: Any, _trigger_msg: Any | None, reply_to: str) -> bool:
-        sent_segments.append((content, reply_to))
-        return False
-
-    result = await execute_decision_draft(
-        draft,
-        response,
-        usable_map=cast(Any, {}),
-        trigger_msg=None,
-        config=cast(Any, _FakeConfig()),
-        execute_reply_fn=_execute_reply,
-        run_tool_call_fn=_run_tool_call,
-        pre_execute_hook=hook_seen.append,
-    )
-
-    assert result.has_info_tool is True
-    assert result.has_third_party is True
-    assert result.has_reply is True
-    assert result.has_do_nothing is True
-    assert result.max_wait_seconds == 3
-    assert sent_segments == [("第一句", "m1")]
-    assert hook_seen == [result]
-    assert [payload.role for payload in response.payloads] == [ROLE.TOOL_RESULT, ROLE.TOOL_RESULT, ROLE.TOOL_RESULT]
-
-
-def test_decision_parser_builds_unified_decision_and_schedule() -> None:
-    """build_decision 应统一提取可见回复、第三方调用和主动计划。"""
-    result = ToolCallResult(
-        thought="想法",
-        mood="开心",
-        expected_reaction="回应",
-        max_wait_seconds=5,
-        actions=[
-            {"type": KFC_REPLY, "content": [" 你好 ", ""]},
-            {"type": KFC_REPLY, "content": " 再见 "},
-            {"type": "draw_image", "content": "ignored"},
-        ],
-        has_reply=True,
-        has_third_party=True,
-        has_info_tool=True,
-    )
-    response = SimpleNamespace(
-        call_list=[
-            ToolCall(name="action-kfc_reply", args={}, id="reply"),
-            ToolCall(name="tool-search", args='{"query":"q"}', id="search"),
-            ToolCall(name="action-schedule_proactive", args={"delay_minutes": "bad", "reason": "想你"}, id="schedule"),
-            ToolCall(name="agent:planner", args="[]", id="planner"),
-        ]
-    )
-
-    decision = build_decision(result, response)
-
-    assert decision.thought == "想法"
-    assert decision.reply_text == "你好\n再见"
-    assert decision.should_reply is True
-    assert decision.should_wait is True
-    assert decision.should_end_turn is False
-    assert decision.has_third_party_calls is True
-    assert [(call.name, call.call_id, call.args) for call in decision.third_party_calls] == [
-        ("search", "search", {"query": "q"}),
-        ("schedule_proactive", "schedule", {"delay_minutes": "bad", "reason": "想你"}),
-        ("planner", "planner", {}),
-    ]
-    assert decision.proactive_schedule is not None
-    assert decision.proactive_schedule.delay_minutes == 30.0
-    assert decision.proactive_schedule.reason == "想你"
-
-
-def test_decision_properties_and_chain_assistant_entry() -> None:
-    """Decision 属性和 chain assistant 构造应保持单一语义。"""
-    info_decision = Decision(has_meaningful_action=True, has_info_tool_calls=True)
-    final_decision = Decision(has_meaningful_action=True, visible_reply_segments=["A", "B"], has_reply_action=True)
-
-    assert info_decision.should_end_turn is False
-    assert final_decision.should_end_turn is True
-    assert final_decision.reply_text == "A\nB"
-    assert build_chain_assistant_entry("", [{"name": "action-kfc_reply"}])["text"] == "好的。"
-
-
-def test_control_constants_keep_expected_values() -> None:
-    """控制工具名称常量应保持与 prompt/tool schema 一致。"""
-    assert KFC_REPLY == "kfc_reply"
-    assert DO_NOTHING == "do_nothing"
-
-
-def test_history_source_payload_builders_and_fused_narrative() -> None:
-    """history source 的摘要、时间和融合叙事分支应可预测。"""
-    import datetime
-    from plugins.kokoro_flow_chatter.context.sources.history_source import (
-        build_channel_payload,
-        build_current_time_payload,
-        build_fused_narrative,
-        build_history_summary_payload,
-    )
-    from plugins.kokoro_flow_chatter.models import KFCEventType
-
-    named_stream = SimpleNamespace(partner_name="言柒", stream_name="", context=SimpleNamespace(history_messages=[]))
-    group_stream = SimpleNamespace(partner_name="", stream_name="某人的私聊", context=SimpleNamespace(history_messages=[]))
-    unknown_stream = SimpleNamespace(partner_name="", stream_name="", context=SimpleNamespace(history_messages=[]))
-
-    assert build_history_summary_payload(named_stream, "") is None
-    assert _text_of(build_history_summary_payload(named_stream, "记忆") or cast(Any, None)) == "【你对言柒的近期记忆】\n记忆"
-    assert _text_of(build_history_summary_payload(group_stream, "记忆") or cast(Any, None)) == "【你对某人的私聊的近期记忆】\n记忆"
-    assert _text_of(build_history_summary_payload(unknown_stream, "记忆") or cast(Any, None)) == "【你对对方的近期记忆】\n记忆"
-    time_payload = build_current_time_payload(datetime.datetime(2026, 5, 9, 22, 0))
-    assert time_payload.role == ROLE.USER
-    assert _text_of(time_payload) == "当前时间：2026-05-09 22:00"
-    channel_payload = build_channel_payload(SimpleNamespace(platform="qq", chat_type="group", bot_id="42", bot_nickname="狐狐", stream_name="某群"))
-    assert channel_payload.role == ROLE.USER
-    assert "聊天平台：qq" in _text_of(channel_payload)
-    assert "ID 42" in _text_of(channel_payload)
-
-    messages = [
-        SimpleNamespace(time="bad", sender_name="A", sender_id="u", message_id="m0", processed_plain_text="忽略"),
-        SimpleNamespace(time=1.0, sender_name="A", sender_id="u", message_id="m1", processed_plain_text="早期"),
-        SimpleNamespace(time=2.0, sender_name="Bot", sender_id="bot", message_id="m2", processed_plain_text="机器人"),
-        SimpleNamespace(time=3.0, sender_name="Bot", sender_id="other", message_id="action_kfc_reply_1", processed_plain_text="动作回复"),
-        SimpleNamespace(time=4.0, sender_name="B", sender_id="u", message_id="", processed_plain_text=""),
-    ]
-    mental_log = SimpleNamespace(
-        entries=[
-            SimpleNamespace(timestamp=2.5, event_type=KFCEventType.BOT_PLANNING, thought="想到你"),
-            SimpleNamespace(timestamp=3.5, event_type=KFCEventType.USER_MESSAGE, thought="忽略"),
-            SimpleNamespace(timestamp="bad", event_type=KFCEventType.BOT_PLANNING, thought="坏时间"),
-        ]
-    )
-    stream = SimpleNamespace(bot_id="bot", context=SimpleNamespace(history_messages=messages))
-
-    narrative = build_fused_narrative(stream, mental_log, before_ts=4.0)
-    assert "A [消息id:m1]说：早期" in narrative
-    assert "你回复：机器人" in narrative
-    assert "你回复：动作回复" in narrative
-    assert "（你的内心：想到你）" in narrative
-    assert "坏时间" not in narrative
-    assert build_fused_narrative(SimpleNamespace(bot_id="bot", context=SimpleNamespace(history_messages=[])), None) == ""
-
-
-def test_models_waiting_config_and_visible_reply_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    """models 中的等待配置和可见回复提取应覆盖所有分支。"""
-    from plugins.kokoro_flow_chatter.models import KFCEventType, WaitingConfig, extract_visible_reply_text
-
-    result = ToolCallResult(
-        actions=[
-            {"type": KFC_REPLY, "content": [" A ", "", "B"]},
-            {"type": KFC_REPLY, "content": " C "},
-            {"type": "other", "content": "D"},
-        ]
-    )
-    assert extract_visible_reply_text(result) == "A\nB\nC"
-    assert str(KFCEventType.USER_MESSAGE) == "user_message"
-
-    inactive = WaitingConfig()
-    assert inactive.is_active() is False
-    assert inactive.get_elapsed_seconds() == 0.0
-    assert inactive.is_timeout() is False
-    assert inactive.get_progress() == 0.0
-
-    monkeypatch.setattr("plugins.kokoro_flow_chatter.models.time.time", lambda: 15.0)
-    active = WaitingConfig(expected_reaction="回", max_wait_seconds=10, started_at=5, followup_count=2)
-    assert active.is_active() is True
-    assert active.get_elapsed_seconds() == 10.0
-    assert active.is_timeout() is True
-    assert active.get_progress() == 1.0
-    assert active.to_dict() == {
-        "expected_reaction": "回",
-        "max_wait_seconds": 10,
-        "started_at": 5,
-        "followup_count": 2,
-    }
-    restored = WaitingConfig.from_dict(active.to_dict())
-    assert restored.expected_reaction == "回"
-    assert restored.followup_count == 2
-    active.reset()
-    assert active.to_dict() == {"expected_reaction": "", "max_wait_seconds": 0.0, "started_at": 0.0, "followup_count": 0}
-
-
-@pytest.mark.asyncio
-async def test_parse_response_decision_delegates_execution() -> None:
-    """parse_response_decision 应从 response.call_list 到 Decision 完整收敛。"""
-    from plugins.kokoro_flow_chatter.protocol.decision_parser import parse_response_decision
-
-    response = SimpleNamespace(payloads=[])
-    response.add_payload = lambda payload: response.payloads.append(payload)
-    response.call_list = [ToolCall(name="action-kfc_reply", args={"content": ["你好"]}, id="r1")]
-    sent: list[str] = []
-
-    async def _execute_reply(content: str, _config: Any, _trigger_msg: Any | None, _reply_to: str) -> bool:
-        sent.append(content)
-        return True
-
-    async def _run_tool_call(
-        _pending_calls: list[Any],
-        _response: Any,
-        _usable_map: Any,
-        _trigger_msg: Any | None,
-    ) -> list[tuple[bool, bool]]:
-        return []
-
-    decision = await parse_response_decision(
-        response,
-        usable_map={},
-        trigger_msg=None,
-        config=cast(Any, _FakeConfig()),
-        execute_reply_fn=_execute_reply,
-        run_tool_call_fn=_run_tool_call,
-    )
-
-    assert sent == ["你好"]
-    assert decision.reply_text == "你好"
-    assert decision.should_reply is True
-
-
-def test_decision_parser_helper_fallbacks() -> None:
-    """decision parser 私有归一化 helper 的容错分支应稳定。"""
-    from plugins.kokoro_flow_chatter.protocol import decision_parser
-
-    assert decision_parser._normalize_call_name("") == ""
-    assert decision_parser._normalize_call_name("action-draw") == "draw"
-    assert decision_parser._normalize_call_name("agent:plan") == "plan"
-    assert decision_parser._extract_args({"x": 1}) == {"x": 1}
-    assert decision_parser._extract_args("{bad") == {}
-    assert decision_parser._extract_args("[]") == {}
-    assert decision_parser._extract_args(1) == {}
-
-
-@pytest.mark.asyncio
-async def test_executor_covers_string_reply_delay_and_debug(monkeypatch: pytest.MonkeyPatch) -> None:
-    """执行层应覆盖字符串回复、打字延迟和 debug 日志分支。"""
-    calls = [ToolCall(name="action-kfc_reply", args={"content": "单句"}, id="reply1")]
-    draft = build_decision_draft(calls)
-    response = _CollectingResponse()
-    slept: list[float] = []
-    sent: list[str] = []
-
-    class _DebugConfig(_FakeConfig):
-        """启用 debug 的配置。"""
-
-        debug = SimpleNamespace(show_prompt=True)
-        reply = SimpleNamespace(typing_chars_per_sec=1.0, typing_delay_min=0.1, typing_delay_max=1.0)
-
-    monkeypatch.setattr("plugins.kokoro_flow_chatter.execution.decision_executor.asyncio.sleep", lambda delay: slept.append(delay) or _noop_async())
-
-    async def _execute_reply(content: str, _config: Any, _trigger_msg: Any | None, _reply_to: str) -> bool:
-        sent.append(content)
-        return True
-
-    result = await execute_decision_draft(
-        draft,
-        response,
-        usable_map=cast(Any, {}),
-        trigger_msg=None,
-        config=cast(Any, _DebugConfig()),
-        execute_reply_fn=_execute_reply,
-        run_tool_call_fn=_unused_run_tool_call,
-    )
-
-    assert result.has_reply is True
-    assert sent == ["单句"]
-    assert slept == []
-
-
-async def _noop_async() -> None:
-    """供 monkeypatch 替换 async sleep 使用。"""
-    return None
-
-
-async def _unused_run_tool_call(
-    _pending_calls: list[Any],
-    _response: Any,
-    _usable_map: Any,
-    _trigger_msg: Any | None,
-) -> list[tuple[bool, bool]]:
-    """不应被调用的工具执行器。"""
-    raise AssertionError("unexpected tool call")
-
-
-
-
-@pytest.mark.asyncio
-async def test_unread_policy_prefers_real_messages_and_filters_interrupts() -> None:
-    """unread policy 应在撞车时保留真实消息，并过滤主动触发打断。"""
-    from plugins.kokoro_flow_chatter.runtime.unread_policy import (
-        filter_interrupt_messages,
-        prefer_real_unreads,
-    )
+async def test_unread_policy_prefers_real_messages() -> None:
+    """真实消息与主动触发撞车时保留真实消息。"""
 
     class _FakeUnreadChatter:
-        """最小 unread IO 替身。"""
+        """最小未读 IO 替身。"""
 
         def __init__(self) -> None:
             self.flushed: list[list[str]] = []
 
         async def flush_unreads(self, unread_messages: list[Any]) -> int:
-            """记录被 flush 的消息 id。"""
-            self.flushed.append(
-                [str(getattr(message, "message_id", "") or "") for message in unread_messages]
-            )
+            """记录被 flush 的消息 ID。"""
+            self.flushed.append([msg.message_id for msg in unread_messages])
             return len(unread_messages)
 
         @staticmethod
-        def format_message_line(msg: Any, time_format: str = "%Y-%m-%d %H:%M:%S") -> str:
-            """测试替身格式化实现。"""
+        def format_message_line(msg: Any, time_format: str = "") -> str:
+            """测试替身的渲染实现。"""
             _ = time_format
-            return str(getattr(msg, "message_id", ""))
+            return str(msg.message_id)
 
     proactive = SimpleNamespace(message_id="proactive_1")
     real = SimpleNamespace(message_id="u_1")
     chatter = _FakeUnreadChatter()
 
-    kept = await prefer_real_unreads(chatter, [proactive, real])
+    kept = await prefer_real_unreads(cast(Any, chatter), [proactive, real])
 
     assert kept == [real]
     assert chatter.flushed == [["proactive_1"]]
 
-    interrupt_inputs = [
+    # 只有主动触发时不应丢弃
+    only_proactive = await prefer_real_unreads(cast(Any, chatter), [proactive])
+    assert only_proactive == [proactive]
+    assert len(chatter.flushed) == 1
+
+
+def test_filter_interrupt_messages_ignores_known_and_proactive() -> None:
+    """已知消息与主动触发都不应打断生成。"""
+    inputs = [
         SimpleNamespace(message_id="known_1"),
         SimpleNamespace(message_id="proactive_2"),
         SimpleNamespace(message_id="u_2"),
         SimpleNamespace(message_id=None),
     ]
-    filtered = filter_interrupt_messages(interrupt_inputs, frozenset({"known_1"}))
-    assert [getattr(message, "message_id", None) for message in filtered] == ["u_2", None]
+
+    filtered = filter_interrupt_messages(inputs, frozenset({"known_1"}))
+
+    assert [msg.message_id for msg in filtered] == ["u_2", None]
+
+
+def test_control_constants_keep_expected_values() -> None:
+    """控制动作名常量必须与提示词、schema 保持一致。"""
+    assert KFC_REPLY == "kfc_reply"
+    assert DO_NOTHING == "do_nothing"

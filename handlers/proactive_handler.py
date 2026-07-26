@@ -1,8 +1,10 @@
 """主动发起事件处理器。
 
-订阅 ``kfc.proactive_trigger`` 事件，
-将系统触发消息注入目标流的 unread_messages 并唤醒流循环，
-从而端到端打通主动发起功能。
+订阅 ``kfc.proactive_trigger``，把系统触发消息注入目标流的未读队列并
+唤醒流循环，从而端到端打通主动发起。
+
+流不在内存中时执行冷启动：先从会话存档取回平台与账号信息重建流，
+再显式拉起流循环——否则注入的消息不会被任何 tick 消费。
 """
 
 from __future__ import annotations
@@ -13,202 +15,222 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.event_api import EventDecision
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.stream_api import get_or_create_stream, get_stream
 from src.app.plugin_system.base import BaseEventHandler
+from src.app.plugin_system.types import Message
 
 from ..framework_compat import start_stream_loop
+from ..prompts.modules import build_proactive_context
+from ..runtime.unread_policy import PROACTIVE_MESSAGE_PREFIX
 
 if TYPE_CHECKING:
     from src.app.plugin_system.api.event_api import EventType
+    from src.app.plugin_system.types import ChatStream
+
+    from ..session import KFCSession
 
 logger = get_logger("kfc_proactive_handler")
 
-# 主动发起事件名
-_PROACTIVE_EVENT = "kfc.proactive_trigger"
+PROACTIVE_TRIGGER_EVENT = "kfc.proactive_trigger"
+"""主动发起事件名，由插件的周期任务发布。"""
+
+_RECENT_ACTIVITY_LIMIT = 5
+"""构建近期活动摘要时回溯的历史消息条数。"""
+
+_FALLBACK_CONTENT = "[主动发起] 你已经沉默很久了，主动找对方聊聊吧。"
+"""富上下文构建失败时的兜底触发内容。"""
+
+_SECONDS_PER_MINUTE = 60.0
 
 
 class ProactiveHandler(BaseEventHandler):
-    """主动发起事件处理器。
-
-    当定时器检测到满足主动发起条件后，通过 EventBus 发布
-    ``kfc.proactive_trigger`` 事件。本处理器接收该事件，
-    向目标流注入一条系统触发消息并唤醒流循环。
-    """
+    """响应主动发起事件，唤醒目标聊天流。"""
 
     name: str = "kfc_proactive_handler"
     description: str = "响应主动发起事件，唤醒目标聊天流"
     weight: int = 0
     intercept_message: bool = False
-    init_subscribe: list[EventType | str] = [_PROACTIVE_EVENT]
+    init_subscribe: list[EventType | str] = [PROACTIVE_TRIGGER_EVENT]
 
     async def execute(
-        self, event_name: str, params: dict[str, Any]
+        self,
+        event_name: str,
+        params: dict[str, Any],
     ) -> tuple[EventDecision, dict[str, Any]]:
         """处理主动发起事件。
 
-        流程:
-        1. 从事件参数中提取 stream_id
-        2. 获取目标流的 StreamContext
-        3. 构造系统触发 Message 并塞入 unread_messages
-        4. 清除 StreamLoopManager 的 _wait_states 等待锁，唤醒流循环
-
         Args:
-            event_name: 触发本处理器的事件名称
-            params: 事件参数，需包含 ``stream_id`` 字段
+            event_name: 触发本处理器的事件名。
+            params: 事件参数，需含 ``stream_id``。
 
         Returns:
-            tuple[EventDecision, dict[str, Any]]: 决策与参数
+            tuple: 事件决策与参数。
         """
-        stream_id = params.get("stream_id")
+        _ = event_name
+        stream_id = str(params.get("stream_id") or "")
         if not stream_id:
             return EventDecision.PASS, params
 
-        scheduled_reason: str = params.get("scheduled_reason", "")
         try:
-            success = await self._wake_stream(stream_id, scheduled_reason)
-            if success:
+            if await self._wake_stream(
+                stream_id,
+                str(params.get("scheduled_reason") or ""),
+            ):
                 logger.info(f"主动发起: 流 {stream_id[:8]} 已唤醒")
             return EventDecision.SUCCESS, params
-        except Exception as e:
-            logger.error(f"主动发起处理异常: {e}", exc_info=True)
+        except Exception as error:
+            logger.error(f"主动发起处理异常: {error}", exc_info=True)
             return EventDecision.PASS, params
 
-    async def _wake_stream(self, stream_id: str, scheduled_reason: str = "") -> bool:
-        """向目标流注入触发消息并唤醒流循环。
+    async def _wake_stream(self, stream_id: str, scheduled_reason: str) -> bool:
+        """向目标流注入触发消息并确保其循环在运行。
 
         Args:
-            stream_id: 目标聊天流 ID
-            scheduled_reason: 预约理由（已在 mark_triggered 中读取并通过事件 payload 传入）
+            stream_id: 目标流 ID。
+            scheduled_reason: 预约理由，由调用方在清除预约前读出。
 
         Returns:
-            bool: 是否成功唤醒
+            bool: 是否成功唤醒。
         """
-        from src.app.plugin_system.api.stream_api import get_stream, get_or_create_stream
-
         chat_stream = await get_stream(stream_id)
         is_cold_start = chat_stream is None
 
+        if chat_stream is None:
+            chat_stream = await self._cold_start_stream(stream_id)
+            if chat_stream is None:
+                return False
+
+        session = await self._load_session(stream_id)
+        target_user_id = session.user_id if session else ""
+        silence_minutes = (
+            (time.time() - session.last_activity_at) / _SECONDS_PER_MINUTE
+            if session
+            else 0.0
+        )
+
+        content = await self._build_trigger_content(
+            chat_stream, silence_minutes, scheduled_reason
+        )
+        chat_stream.context.add_unread_message(
+            _build_proactive_message(stream_id, chat_stream, target_user_id, content)
+        )
+
         if is_cold_start:
-            # 流不在内存中，尝试从 KFC session 获取元信息并冷启动
-            cold_session = None
+            # 冷启动流没有正在运行的 tick，必须显式拉起循环
             try:
-                from ..plugin import KFCPlugin
-                if isinstance(self.plugin, KFCPlugin):
-                    cold_session = await self.plugin._session_store.peek(stream_id)  # type: ignore[attr-defined]
-            except Exception as e:
-                logger.debug(f"读取 session 失败: {e}")
+                await start_stream_loop(stream_id)
+                logger.info(f"冷启动流 {stream_id[:8]} 循环已启动")
+            except Exception as error:
+                logger.warning(f"冷启动流 {stream_id[:8]} 启动循环失败: {error}")
+        else:
+            logger.debug(f"触发消息已注入热流 {stream_id[:8]}，等待下一次 tick 处理")
+        return True
 
-            if cold_session is None:
-                logger.warning(f"目标流 {stream_id[:8]} 不在内存中且无 session 记录，跳过")
-                return False
+    async def _cold_start_stream(self, stream_id: str) -> ChatStream | None:
+        """从会话存档重建不在内存中的聊天流。"""
+        session = await self._load_session(stream_id, peek_only=True)
+        if session is None:
+            logger.warning(f"流 {stream_id[:8]} 不在内存中且无会话记录，跳过")
+            return None
 
-            try:
-                chat_stream = await get_or_create_stream(
-                    stream_id=stream_id,
-                    platform=cold_session.platform,
-                    user_id=cold_session.user_id,
-                )
-            except Exception as e:
-                logger.warning(f"冷启动流 {stream_id[:8]} 失败: {e}")
-                return False
-
-            logger.info(f"主动发起：冷启动流 {stream_id[:8]}")
-
-        context = chat_stream.context
-
-        # 尝试从 KFCSession 获取真实 user_id 和沉默时长
-        target_user_id: str = ""
-        silence_minutes: float = 0.0
         try:
-            from ..plugin import KFCPlugin
-            if isinstance(self.plugin, KFCPlugin):
-                session = await self.plugin._session_store.get(stream_id)  # type: ignore[attr-defined]
-                if session:
-                    if session.user_id:
-                        target_user_id = session.user_id
-                    if session.last_activity_at:
-                        silence_minutes = (time.time() - session.last_activity_at) / 60
-                    # scheduled_reason 已由调用方（mark_triggered）在清除前读取并通过参数传入
-        except Exception as e:
-            logger.debug(f"获取 session 信息失败，将使用默认值: {e}")
+            chat_stream = await get_or_create_stream(
+                stream_id=stream_id,
+                platform=session.platform,
+                user_id=session.user_id,
+            )
+        except Exception as error:
+            logger.warning(f"冷启动流 {stream_id[:8]} 失败: {error}")
+            return None
 
-        # 从近期历史消息构建近期活动摘要
-        recent_activity = ""
+        logger.info(f"主动发起：冷启动流 {stream_id[:8]}")
+        return chat_stream
+
+    async def _load_session(
+        self,
+        stream_id: str,
+        peek_only: bool = False,
+    ) -> KFCSession | None:
+        """读取目标流的会话。
+
+        Args:
+            stream_id: 目标流 ID。
+            peek_only: 为真时不写入内存缓存。
+
+        Returns:
+            KFCSession | None: 会话；插件上下文不可用或无记录时为 ``None``。
+        """
+        from ..plugin import KFCPlugin
+
+        if not isinstance(self.plugin, KFCPlugin):
+            return None
         try:
-            recent_msgs = context.history_messages[-5:] if context.history_messages else []
-            if recent_msgs:
-                lines = []
-                for msg in recent_msgs:
-                    sender = msg.sender_name or "未知"
-                    content = msg.processed_plain_text or str(msg.content or "")
-                    lines.append(f"{sender}: {content}")
-                recent_activity = "\n".join(lines)
-        except Exception as e:
-            logger.debug(f"构建近期活动摘要失败: {e}")
+            store = self.plugin.session_store
+            return await (
+                store.peek(stream_id) if peek_only else store.get(stream_id)
+            )
+        except Exception as error:
+            logger.debug(f"读取会话失败: {error}")
+            return None
 
-        # 调用 build_proactive_context 生成富上下文提示词
-        proactive_content = "[主动发起] 你已经沉默很久了，主动找对方聊聊吧。"
+    @staticmethod
+    async def _build_trigger_content(
+        chat_stream: ChatStream,
+        silence_minutes: float,
+        scheduled_reason: str,
+    ) -> str:
+        """构建注入的触发内容；失败时退回兜底文本。"""
+        history = chat_stream.context.history_messages
+        recent_messages = history[-_RECENT_ACTIVITY_LIMIT:] if history else []
+        recent_activity = "\n".join(
+            f"{message.sender_name or '未知'}: "
+            f"{message.processed_plain_text or str(message.content or '')}"
+            for message in recent_messages
+        )
+
         try:
-            from ..prompts.modules import build_proactive_context
-
-            proactive_content = await build_proactive_context(
+            return await build_proactive_context(
                 silence_minutes=silence_minutes,
                 recent_activity=recent_activity,
                 scheduled_reason=scheduled_reason,
             )
-        except Exception as e:
-            logger.debug(f"构建主动发起上下文失败，使用默认消息: {e}")
+        except Exception as error:
+            logger.debug(f"构建主动发起上下文失败，使用兜底消息: {error}")
+            return _FALLBACK_CONTENT
 
-        # 构造系统触发消息并注入
-        trigger_message = self._build_proactive_message(stream_id, chat_stream, target_user_id, proactive_content)
-        context.add_unread_message(trigger_message)
-        logger.debug(f"已注入主动发起触发消息到流 {stream_id[:8]}")
 
-        if is_cold_start:
-            # 冷启动流（不在内存中）：消息已注入队列，需主动启动该流的循环任务。
-            # 使用 StreamLoopManager 的公开方法启动，不访问私有属性。
-            try:
-                await start_stream_loop(stream_id)
-                logger.info(f"冷启动流 {stream_id[:8]} 流循环已启动")
-            except Exception as error:
-                logger.warning(f"冷启动流 {stream_id[:8]} 启动流循环失败: {error}")
-        else:
-            # 热流：消息已注入未读队列，流循环在下一次 tick 时会自然处理。
-            logger.debug(f"主动触发消息已注入热流 {stream_id[:8]} 未读队列，等待下一次 tick 处理")
+def _build_proactive_message(
+    stream_id: str,
+    chat_stream: ChatStream,
+    target_user_id: str,
+    content: str,
+) -> Message:
+    """构造一条主动发起用的系统触发消息。
 
-        return True
+    消息 ID 带 ``proactive_`` 前缀，使未读策略能识别其内部来源——
+    与真实消息撞车时让位，也永不打断正在进行的生成。
 
-    @staticmethod
-    def _build_proactive_message(
-        stream_id: str,
-        chat_stream: Any,
-        target_user_id: str = "",
-        content: str = "[主动发起] 你已经沉默很久了，主动找对方聊聊吧。",
-    ) -> Any:
-        """构造一条用于主动发起的系统触发消息。
+    Args:
+        stream_id: 目标流 ID。
+        chat_stream: 目标聊天流。
+        target_user_id: 目标用户的平台账号，用于消息路由。
+        content: 注入的触发内容。
 
-        Args:
-            stream_id: 目标流 ID
-            chat_stream: 聊天流对象
-            target_user_id: 目标用户的真实 ID（QQ 号等），用于消息路由
-            content: 注入的消息内容（默认为简单提示，推荐传入 build_proactive_context 生成的富上下文）
+    Returns:
+        Message: 系统触发消息。
+    """
+    extra_kwargs: dict[str, Any] = {}
+    if target_user_id:
+        extra_kwargs["target_user_id"] = target_user_id
 
-        Returns:
-            Message: 系统触发消息对象
-        """
-        from src.app.plugin_system.types import Message
-
-        extra_kwargs: dict[str, Any] = {}
-        if target_user_id:
-            extra_kwargs["target_user_id"] = target_user_id
-
-        return Message(
-            message_id=f"proactive_{uuid.uuid4().hex[:12]}",
-            platform=chat_stream.platform or "unknown",
-            stream_id=stream_id,
-            sender_id=target_user_id or "system",
-            sender_name="系统",
-            content=content,
-            processed_plain_text=content,
-            time=time.time(),
-            **extra_kwargs,
-        )
+    return Message(
+        message_id=f"{PROACTIVE_MESSAGE_PREFIX}{uuid.uuid4().hex[:12]}",
+        platform=chat_stream.platform or "unknown",
+        stream_id=stream_id,
+        sender_id=target_user_id or "system",
+        sender_name="系统",
+        content=content,
+        processed_plain_text=content,
+        time=time.time(),
+        **extra_kwargs,
+    )

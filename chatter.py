@@ -1,97 +1,114 @@
-"""KokoroFlowChatter 核心聊天器。
+"""KokoroFlowChatter 组件门面。
 
-实现完整的心理活动流对话循环：
-1. 构建 LLM 上下文（系统提示 + 活动流 + 未读消息）
-2. 维护 LLMResponse 链（response = request → loop）
-3. 通过原生 Tool Calling 执行动作
-4. 管理等待状态
-5. 超时后重新注入上下文继续对话
+本类只承担两类职责：
 
-严格遵循 DefaultChatter._execute_enhanced() 的 response 链模式。
+1. **实现框架契约**——覆写 ``execute()``、``modify_llm_usables()``、
+   ``format_message_line()`` 等 ``BaseChatter`` 接口；
+2. **对 runtime 暴露能力**——把会话读写、回复发送、VLM 跳过等操作封装
+   成公开方法，供主循环调用。
+
+对话逻辑本身全部位于 ``runtime`` 包，本类不含流程控制。
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import AsyncGenerator
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from typing import TYPE_CHECKING, Any
 
-from src.app.plugin_system.api.llm_api import (
-    LLMContextManager,
-    ReminderSourceSpec,
-    create_llm_request,
-)
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.stream_api import get_stream
-from src.app.plugin_system.base import (
-    BaseChatter,
-    Failure,
-    Stop,
-    Success,
-    Wait,
-)
+from src.app.plugin_system.base import BaseChatter, Failure, Stop, Success, Wait
 from src.app.plugin_system.types import ChatType, Message
 
 from .actions.reply import KFCReplyAction
+from .config import KFCConfig
 from .debug.log_formatter import format_prompt_for_log
 from .framework_compat import (
     clear_stream_recognition_skip,
     set_stream_recognition_skip,
 )
 from .mental_log import MentalLogEntry
-from .models import KFC_REPLY, DO_NOTHING, KFCEventType
-from .prompts.builder import KFCPromptBuilder
-from .runtime import (
-    execute_orchestrator,
-    send_interruptable_response,
-)
+from .models import DO_NOTHING, KFC_REPLY, KFCEventType
+from .runtime import execute_orchestrator, send_interruptable_response
 
 if TYPE_CHECKING:
-    from src.app.plugin_system.types import ChatStream
-    from src.app.plugin_system.api.llm_api import ToolRegistry
-
-    from .config import KFCConfig
     from .session import KFCSession, KFCSessionStore
 
 logger = get_logger("kfc_chatter")
 
+_VIRTUAL_TRIGGER_MESSAGE_ID = "virtual_timeout_trigger"
+"""超时等无真实触发消息场景下使用的虚拟消息 ID。"""
+
+_TOOL_NAME_PREFIXES: tuple[str, ...] = ("action-", "tool-", "agent-")
 
 
 class KokoroFlowChatter(BaseChatter):
-    """KokoroFlowChatter 核心聊天器。
+    """基于心理活动流的私聊聊天器。
 
-    基于心理活动流的对话模型：
-    - 维护 LLMResponse 链贯穿整个 execute() 生命周期
-    - 通过原生 Tool Calling 注入工具并解析响应
-    - 活动流为持久化审计日志，LLM 上下文通过 response 链自动积累
+    与常规聊天器的差异在于：每次决策都与内心独白绑定，对话历史与内心
+    活动按时间线交织，使模型在回复时不仅看到"说了什么"，还能"回想起"
+    当时在想什么。
     """
 
     name: str = "kokoro_flow_chatter"
-    description: str = (
-        "心理活动流聊天器，模拟真实人类的连续心理活动和对话节奏"
-    )
+    description: str = "心理活动流聊天器，模拟真实人类的连续心理活动和对话节奏"
 
     associated_platforms: list[str] = []
     chat_type: ChatType = ChatType.PRIVATE
     dependencies: list[str] = []
 
-    # ── 配置与会话辅助 ──────────────────────────────────────
+    # ── 框架契约 ──────────────────────────────────────────
 
-    def _get_config(self) -> KFCConfig:
-        """获取 KFC 配置。"""
-        from .config import KFCConfig
-        from .plugin import KFCPlugin
+    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:  # type: ignore[override]
+        """执行对话循环，委托 runtime 编排器。"""
+        async for result in execute_orchestrator(self):
+            yield result
 
-        if isinstance(self.plugin, KFCPlugin) and isinstance(self.plugin.config, KFCConfig):
-            return self.plugin.config
-        return KFCConfig()
+    async def modify_llm_usables(self, llm_usables: list[Any]) -> list[Any]:  # type: ignore[override]
+        """在框架通用过滤之上，应用 KFC 屏蔽规则并稳定排序。
+
+        排序是为了让工具列表在多轮请求间保持一致，避免顺序抖动破坏
+        provider 的前缀缓存。
+
+        Args:
+            llm_usables: 框架给出的候选工具列表。
+
+        Returns:
+            list[Any]: 过滤并排序后的工具列表。
+        """
+        base_available = await super().modify_llm_usables(llm_usables)
+        blocked_names = frozenset(
+            name
+            for name in self.get_config().general.blocked_tools
+            # KFC 的核心控制动作不允许被配置屏蔽，否则模型将无法表达决策
+            if name not in {KFC_REPLY, DO_NOTHING}
+        )
+
+        available = [
+            usable
+            for usable in base_available
+            if _resolve_usable_name(usable) not in blocked_names
+        ]
+        return sorted(available, key=_resolve_usable_sort_key)
 
     @staticmethod
-    def format_message_line(msg: "Message", time_format: str = "%Y-%m-%d %H:%M:%S") -> str:  # type: ignore[override]
-        """将单条消息格式化为带标签的显示行（KFC 层覆盖）。
+    def format_message_line(  # type: ignore[override]
+        msg: Message,
+        time_format: str = "%Y-%m-%d %H:%M:%S",
+    ) -> str:
+        """把单条消息渲染为带标签的展示行。
 
-        格式：》时间》[QQ:xxx] 昵称 [消息id:xxx]： 内容
-        两种括号将含义明确区分，避免模型将 QQ 号与消息 ID 混淆。
+        格式为 ``》时间》[QQ:xxx] 昵称 [消息id:xxx]： 内容``——两种括号
+        把平台账号与消息 ID 明确区分，避免模型混淆二者。
+
+        Args:
+            msg: 待渲染的消息。
+            time_format: 时间格式。
+
+        Returns:
+            str: 渲染后的展示行。
         """
         raw_time = msg.time
         if isinstance(raw_time, (int, float)):
@@ -99,7 +116,7 @@ class KokoroFlowChatter(BaseChatter):
         elif isinstance(raw_time, datetime):
             time_str = raw_time.strftime(time_format)
         else:
-            time_str = str(raw_time or "")
+            time_str = ""
 
         role_str = BaseChatter._format_role(msg.sender_role)
         role_part = f"<{role_str}> " if role_str else ""
@@ -120,132 +137,77 @@ class KokoroFlowChatter(BaseChatter):
         content = msg.processed_plain_text or str(msg.content or "")
         return f"》{time_str}》{role_part}{id_part}{name_part} {msg_id_part}： {content}"
 
-    async def _get_session(self) -> KFCSession:
-        """获取当前 stream 的 Session（持有 per-stream 锁）。"""
-        session_store = self._get_session_store()
-        async with session_store.lock(self.stream_id):
-            return await session_store.get_or_create(self.stream_id)
+    # ── 配置与会话 ────────────────────────────────────────
 
-    def _get_session_store(self) -> KFCSessionStore:
-        """获取 Session Store（由 plugin.__init__ 初始化）。"""
-        return self.plugin._session_store  # type: ignore[attr-defined]
+    def get_config(self) -> KFCConfig:
+        """获取 KFC 配置；插件上下文缺失时回退到默认配置。"""
+        from .plugin import KFCPlugin
 
-    async def modify_llm_usables(self, llm_usables: list[Any]) -> list[Any]:  # type: ignore[override]
-        """按框架通用规则过滤工具后，再应用 KFC 专属屏蔽与稳定排序。"""
-        base_available = await super().modify_llm_usables(llm_usables)
-        config = self._get_config()
-        blocked_names = frozenset(
-            name
-            for name in config.general.blocked_tools
-            if name not in {KFC_REPLY, DO_NOTHING}
-        )
+        if isinstance(self.plugin, KFCPlugin) and isinstance(
+            self.plugin.config, KFCConfig
+        ):
+            return self.plugin.config
+        return KFCConfig()
 
-        def _normalize_usable_name(usable: Any) -> str:
-            """从 schema/signature 中提取工具末段名。"""
-            try:
-                schema = usable.to_schema()
-                raw_name: str = schema.get("function", schema).get("name", "") or ""
-            except Exception:
-                raw_name = str(getattr(usable, "name", "") or "")
-            normalized = raw_name.rsplit(":", 1)[-1]
-            for prefix in ("action-", "tool-", "agent-"):
-                if normalized.startswith(prefix):
-                    return normalized[len(prefix):]
-            return normalized
+    @property
+    def session_store(self) -> KFCSessionStore:
+        """获取会话存储（由插件初始化时创建）。"""
+        from .plugin import KFCPlugin
 
-        available = [
-            usable
-            for usable in base_available
-            if _normalize_usable_name(usable) not in blocked_names
-        ]
-        return sorted(
-            available,
-            key=lambda usable: str(
-                getattr(usable, "get_signature", lambda: "")()
-                or getattr(usable, "__name__", "")
-            ),
-        )
+        if not isinstance(self.plugin, KFCPlugin):
+            raise RuntimeError("KokoroFlowChatter 未运行在 KFCPlugin 上下文中")
+        return self.plugin.session_store
 
-    # ── 核心对话循环 ──────────────────────────────────────────
+    async def load_session(self) -> KFCSession:
+        """读取当前流的会话（持有流级锁）。"""
+        store = self.session_store
+        async with store.lock(self.stream_id):
+            return await store.get_or_create(self.stream_id)
 
-    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:  # type: ignore[override]
-        """执行聊天器对话循环，委托 runtime orchestrator。"""
-        async for result in execute_orchestrator(self):
-            yield result
+    async def save_session(self, session: KFCSession) -> None:
+        """保存会话（持有流级锁）。"""
+        store = self.session_store
+        async with store.lock(session.stream_id):
+            await store.save(session)
 
-    # ── LLM 上下文构建 ──────────────────────────────────────
+    # ── 发送能力 ──────────────────────────────────────────
 
-    async def _build_initial_context(
+    async def send_reply(
         self,
-        chat_stream: ChatStream,
+        content: str,
         config: KFCConfig,
-        session: KFCSession,
-        model_set: Any,
-    ) -> tuple[Any, ToolRegistry, KFCPromptBuilder, bool]:
-        """构建初始 LLM 上下文（系统提示 + 工具注册）。
-
-        组装 LLM 请求所需的全部初始 payload：系统提示词、人物关系、
-        历史叙事，并注册可用工具。
+        trigger_msg: Message | None = None,
+        reply_to: str = "",
+    ) -> bool:
+        """通过框架标准路径发送一段回复。
 
         Args:
-            chat_stream: 当前聊天流
-            config: KFC 配置
-            session: 当前会话状态
-            model_set: LLM 模型配置
+            content: 回复文本。
+            config: KFC 配置（保留参数以对齐执行层回调签名）。
+            trigger_msg: 触发消息；为 ``None`` 时构造虚拟消息。
+            reply_to: 要引用的消息 ID。
 
         Returns:
-            tuple: (request, usable_map, prompt_builder, has_history)
+            bool: 是否发送成功。
         """
-        # 同时订阅全局 actor bucket 和当前流的私有 actor bucket，
-        # 与 ``BaseChatter.create_request`` 的 ``with_reminder`` 行为一致。
-        reminder_sources = [
-            ReminderSourceSpec(
-                bucket="actor",
-                wrap_with_system_tag=True,
-            )
-        ]
-        if self.stream_id:
-            reminder_sources.append(
-                ReminderSourceSpec(
-                    bucket=f"stream:{self.stream_id}:actor",
-                    wrap_with_system_tag=True,
-                )
-            )
-        context_manager = LLMContextManager(
-            reminder_sources=reminder_sources,
-        )
-        request = create_llm_request(
-            model_set,
-            "kokoro_flow_chatter",
-            context_manager=context_manager,
-        )
+        _ = config
+        if trigger_msg is None:
+            trigger_msg = await self.build_virtual_trigger_message()
+            if trigger_msg is None:
+                logger.warning("无触发消息，无法发送回复")
+                return False
 
-        # 系统提示词
-        prompt_builder = KFCPromptBuilder()
+        kwargs: dict[str, Any] = {"content": content}
+        if reply_to:
+            kwargs["reply_to"] = reply_to
+        try:
+            await self.exec_llm_usable(KFCReplyAction, trigger_msg, **kwargs)
+            return True
+        except Exception as error:
+            logger.error(f"执行 KFCReplyAction 失败: {error}", exc_info=True)
+            return False
 
-        system_payloads, chain_payloads, has_history = (
-            await prompt_builder.build_initial_payloads(
-                chat_stream,
-                config,
-                session,
-            )
-        )
-        # 所有 Payload 统一通过 add_payload 注入，由 context manager 的
-        # _apply_reminders 管理 system_reminder 的注入与剥离，避免 USER payload
-        # 绕过 reminder 管线后在多轮循环中重复堆积系统提醒前缀。
-        for payload in system_payloads:
-            request.add_payload(payload)
-        for payload in chain_payloads:
-            request.add_payload(payload)
-
-        # ── 注册工具（原生 Tool Calling） ──
-        usable_map = await self.inject_usables(request)
-
-        return request, usable_map, prompt_builder, has_history
-
-    # ── 可打断 LLM 调用 ─────────────────────────────────────
-
-    async def _send_interruptable(
+    async def send_interruptable(
         self,
         send_target: Any,
         config: KFCConfig,
@@ -253,89 +215,28 @@ class KokoroFlowChatter(BaseChatter):
     ) -> tuple[Any | None, list[Any]]:
         """以可打断方式发送 LLM 请求。"""
         return await send_interruptable_response(
-            self,
-            send_target,
-            config,
-            known_unread_ids,
+            self, send_target, config, known_unread_ids
         )
 
-    # ── 动作执行 ────────────────────────────────────────────
+    async def build_virtual_trigger_message(self) -> Message | None:
+        """构造虚拟触发消息，用于超时主动发言等无真实触发的场景。
 
-    async def _execute_reply(
-        self,
-        content: str,
-        config: KFCConfig,
-        trigger_msg: Any | None = None,
-        reply_to: str = "",
-    ) -> bool:
-        """通过框架标准路径发送回复。
-
-        Args:
-            content: 回复文本内容
-            config: KFC 配置
-            trigger_msg: 触发消息，为 None 时构造虚拟消息
-            reply_to: 要引用的消息 ID（可选）
+        优先复用最近一条历史消息以保留真实的会话上下文；历史为空时才
+        退化为合成消息。
 
         Returns:
-            bool: 是否发送成功
+            Message | None: 触发消息；聊天流不可用时返回 ``None``。
         """
-        if trigger_msg is None:
-            trigger_msg = await self._get_virtual_trigger_message()
-            if trigger_msg is None:
-                logger.warning("无触发消息，无法发送回复")
-                return False
-
-        try:
-            kwargs: dict[str, Any] = {"content": content}
-            if reply_to:
-                kwargs["reply_to"] = reply_to
-            await self.exec_llm_usable(KFCReplyAction, trigger_msg, **kwargs)
-            return True
-        except Exception as e:
-            logger.error(f"通过框架执行 KFCReplyAction 失败: {e}", exc_info=True)
-            return False
-
-    # ── 辅助方法 ────────────────────────────────────────────
-
-    def _register_vlm_skip(self) -> None:
-        """为当前聊天流注册 image 类型的 VLM 跳过。
-
-        在 native_multimodal 模式下，KFC 直接将原始图片数据打包进
-        LLM payload，由主模型理解图片内容。框架的 VLM 管线会将图片
-        转述为文本描述，这对 KFC 是冗余操作。
-        表情包仍走 VLM 文字描述，以利用其哈希缓存。
-
-        此方法在 execute() 开头调用，确保后续到达的消息不再触发 VLM。
-        调用是幂等的——多次注册同一 stream_id 不会产生副作用。
-        """
-        try:
-            set_stream_recognition_skip(self.stream_id, ["image"])
-        except Exception as error:
-            logger.debug(f"注册识别跳过失败（不影响功能）: {error}")
-
-    def _unregister_vlm_skip(self) -> None:
-        """注销当前聊天流的识别跳过。
-
-        在 execute() 结束时调用（通过 try/finally），
-        恢复框架对该 stream 的识别能力。
-        """
-        try:
-            clear_stream_recognition_skip(self.stream_id)
-        except Exception as error:
-            logger.debug(f"注销 VLM 跳过失败: {error}")
-
-    async def _get_virtual_trigger_message(self) -> Any:
-        """构造虚拟触发消息，用于超时主动发言等无真实触发消息的场景。"""
         chat_stream = await get_stream(self.stream_id)
-        if not chat_stream:
+        if chat_stream is None:
             return None
 
-        context = chat_stream.context
-        if context and context.history_messages:
-            return context.history_messages[-1]
+        history = chat_stream.context.history_messages
+        if history:
+            return history[-1]
 
         return Message(
-            message_id="virtual_timeout_trigger",
+            message_id=_VIRTUAL_TRIGGER_MESSAGE_ID,
             platform=chat_stream.platform or "unknown",
             stream_id=self.stream_id,
             sender_id="system",
@@ -344,18 +245,35 @@ class KokoroFlowChatter(BaseChatter):
             processed_plain_text="[超时触发]",
         )
 
-    async def _save_session(self, session: KFCSession) -> None:
-        """保存 Session（持有 per-stream 锁）。"""
-        store = self._get_session_store()
-        async with store.lock(session.stream_id):
-            await store.save(session)
+    # ── 多模态识别跳过 ────────────────────────────────────
+
+    def register_vlm_skip(self) -> None:
+        """为当前流注册图片类型的 VLM 跳过。
+
+        原生多模态模式下 KFC 直接把图片打包进 LLM payload，框架的 VLM
+        转述属于冗余调用。表情包仍走 VLM 文字描述，以复用其哈希缓存。
+        重复注册同一流是幂等的。
+        """
+        try:
+            set_stream_recognition_skip(self.stream_id, ["image"])
+        except Exception as error:
+            logger.debug(f"注册识别跳过失败（不影响功能）: {error}")
+
+    def unregister_vlm_skip(self) -> None:
+        """注销当前流的识别跳过，恢复框架的默认识别行为。"""
+        try:
+            clear_stream_recognition_skip(self.stream_id)
+        except Exception as error:
+            logger.debug(f"注销识别跳过失败: {error}")
+
+    # ── 辅助方法 ──────────────────────────────────────────
 
     @staticmethod
-    def _extract_timestamp(msg: "Message") -> float:
-        """从消息对象提取时间戳。
+    def extract_timestamp(msg: Message) -> float:
+        """提取消息时间戳。
 
-        框架 ``Message.time`` 类型为 ``datetime | float | None``，
-        这里只在 ``int|float`` 时接受，其余回退到当前时间。
+        框架的 ``Message.time`` 类型为 ``datetime | float | None``，
+        这里只接受数值形态，其余回退到当前时间。
         """
         raw_time = msg.time
         if isinstance(raw_time, (int, float)):
@@ -363,30 +281,62 @@ class KokoroFlowChatter(BaseChatter):
         return time.time()
 
     @staticmethod
-    def _record_reply_timing(session: KFCSession) -> None:
-        """记录回复时效到活动流。"""
+    def record_reply_timing(session: KFCSession) -> None:
+        """把本次回复的时效（及时 / 迟到）记入活动流。"""
         elapsed = session.waiting_config.get_elapsed_seconds()
-        max_wait = session.waiting_config.max_wait_seconds
-
-        if elapsed <= max_wait:
-            event_type = KFCEventType.REPLY_IN_TIME
-        else:
-            event_type = KFCEventType.REPLY_LATE
-
-        entry = MentalLogEntry(
-            event_type=event_type,
-            timestamp=time.time(),
-            elapsed_seconds=elapsed,
+        event_type = (
+            KFCEventType.REPLY_IN_TIME
+            if elapsed <= session.waiting_config.max_wait_seconds
+            else KFCEventType.REPLY_LATE
         )
-        session.mental_log.add(entry)
+        session.mental_log.add(
+            MentalLogEntry(
+                event_type=event_type,
+                timestamp=time.time(),
+                elapsed_seconds=elapsed,
+            )
+        )
 
-    # ── 调试日志方法 ────────────────────────────────────────
-
-    def _log_prompt(self, response: Any, chain_payloads: list[dict] | None = None) -> None:
-        """输出发送给 LLM 的完整提示词（面板格式）。"""
-        prompt_text = format_prompt_for_log(response, chain_payloads=chain_payloads)
+    def log_prompt(
+        self,
+        response: Any,
+        chain_payloads: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """以面板格式输出发送给 LLM 的完整提示词。"""
         logger.print_panel(
-            prompt_text,
+            format_prompt_for_log(response, chain_payloads=chain_payloads),
             title=f"KFC 提示词 (stream={self.stream_id[:8]})",
             border_style="cyan",
         )
+
+
+def _resolve_usable_name(usable: Any) -> str:
+    """解析工具的末段名，用于匹配屏蔽列表。
+
+    工具对象来自各插件，形态并不统一：优先读 schema 中的规范名，
+    读取失败时退回类属性 ``name``。
+    """
+    try:
+        schema = usable.to_schema()
+        raw_name = str(schema.get("function", schema).get("name", "") or "")
+    except (AttributeError, TypeError, KeyError):
+        raw_name = str(usable.name or "") if hasattr(usable, "name") else ""
+
+    normalized = raw_name.rsplit(":", 1)[-1]
+    for prefix in _TOOL_NAME_PREFIXES:
+        if normalized.startswith(prefix):
+            return normalized[len(prefix) :]
+    return normalized
+
+
+def _resolve_usable_sort_key(usable: Any) -> str:
+    """解析工具的排序键。
+
+    优先使用组件签名——它在插件间全局唯一且稳定；签名不可用时退回
+    类名，保证排序结果仍然确定。
+    """
+    if hasattr(usable, "get_signature"):
+        signature = str(usable.get_signature() or "")
+        if signature:
+            return signature
+    return str(usable.__name__) if hasattr(usable, "__name__") else ""

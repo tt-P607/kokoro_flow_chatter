@@ -1,58 +1,101 @@
-"""KFC 超时服务。"""
+"""KFC 等待超时服务。
+
+管理"发完消息后等待回复"的超时判定与状态推进：检测超时、递增连续
+超时计数、写入活动流事件，并构建供模型决策的超时 payload。
+"""
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import LLMPayload
 
-from ..thinker.timeout_handler import TimeoutHandler
+from ..mental_log import MentalLogEntry
+from ..models import KFCEventType
+from ..prompts.modules import build_timeout_payload
 
 if TYPE_CHECKING:
     from ..config import KFCConfig
     from ..session import KFCSession
 
-
-logger = get_logger("kfc_timeout_service")
+logger = get_logger("kfc_timeout")
 
 
 @dataclass(slots=True)
 class TimeoutResult:
-    """一次超时处理的输出。"""
+    """一次超时处理的产出。"""
 
     payload: LLMPayload
+    """供模型决策的超时提示 payload，由调用方追加到上下文。"""
+
     is_final_timeout: bool
+    """是否为最后一次超时——为真时主循环必须强制结束等待。"""
 
 
 class TimeoutService:
-    """封装等待超时处理与 payload 构建。
+    """等待超时的判定与状态推进。
 
-    本服务保持纯函数：不会对 ``response.payloads`` 做任何写入，
-    调用方负责将返回的 payload 追加到上下文。
+    ``build_timeout_result()`` 会修改 session（递增计数、清除等待、写
+    活动流），但**不会**触碰 ``response.payloads``——payload 的追加时机
+    由主循环掌握。
     """
 
     def __init__(self, config: KFCConfig) -> None:
+        """初始化服务。
+
+        Args:
+            config: KFC 配置，提供连续超时上限。
+        """
         self._config = config
-        self._handler = TimeoutHandler(config)
 
     def check_timeout(self, session: KFCSession) -> bool:
-        """检查是否达到超时条件。"""
-        return self._handler.check_timeout(session)
+        """检查会话的等待是否已超时。"""
+        return session.waiting_config.is_timeout()
 
     def build_timeout_result(self, session: KFCSession) -> TimeoutResult:
-        """处理超时并返回追加到 response 的 user payload。"""
-        timeout_ctx = self._handler.handle_timeout(session)
-        is_final_timeout = self._handler.should_give_up(session)
+        """处理一次超时并构建决策 payload。
 
-        from ..prompts.builder import KFCPromptBuilder
+        副作用：递增 ``consecutive_timeout_count``、写入 ``WAIT_TIMEOUT``
+        活动流事件、清除等待状态。
 
-        payload = KFCPromptBuilder.build_timeout_payload(
-            elapsed_seconds=timeout_ctx["elapsed_seconds"],  # type: ignore[arg-type]
-            expected_reaction=timeout_ctx["expected_reaction"],  # type: ignore[arg-type]
-            consecutive_timeouts=timeout_ctx["consecutive_timeouts"],  # type: ignore[arg-type]
-            last_bot_message=timeout_ctx.get("last_bot_message", ""),  # type: ignore[arg-type]
-            max_consecutive_timeouts=self._config.wait.max_consecutive_timeouts,
+        Args:
+            session: 当前会话。
+
+        Returns:
+            TimeoutResult: 超时 payload 与是否为最后一次超时。
+        """
+        elapsed = session.waiting_config.get_elapsed_seconds()
+        expected_reaction = session.waiting_config.expected_reaction
+        session.consecutive_timeout_count += 1
+
+        session.mental_log.add(
+            MentalLogEntry(
+                event_type=KFCEventType.WAIT_TIMEOUT,
+                timestamp=time.time(),
+                elapsed_seconds=elapsed,
+                content=f"等待超时，已等待 {elapsed:.0f} 秒",
+            )
+        )
+        last_bot_message = session.mental_log.get_last_bot_reply_content()
+        session.clear_waiting()
+
+        max_timeouts = self._config.wait.max_consecutive_timeouts
+        is_final_timeout = session.consecutive_timeout_count >= max_timeouts
+
+        logger.info(
+            f"等待超时: stream={session.stream_id[:8]}, "
+            f"elapsed={elapsed:.0f}s, "
+            f"consecutive={session.consecutive_timeout_count}/{max_timeouts}"
+        )
+
+        payload = build_timeout_payload(
+            elapsed_seconds=elapsed,
+            expected_reaction=expected_reaction,
+            consecutive_timeouts=session.consecutive_timeout_count,
+            last_bot_message=last_bot_message,
+            max_consecutive_timeouts=max_timeouts,
         )
         return TimeoutResult(payload=payload, is_final_timeout=is_final_timeout)

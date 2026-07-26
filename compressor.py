@@ -1,9 +1,11 @@
-"""KFC 近期记忆压缩模块。
+"""KFC 近期记忆压缩。
 
-异步生成"近期记忆摘要"（history_summary），覆盖最近 N 天的对话。
-使用 actor 模型任务（config.general.model_task），以完整人设 + 第一人称书写，直接替换旧摘要。
+把最近 N 天的对话与内心活动压缩成一段第一人称的记忆摘要，替换式更新
+``session.history_summary``。摘要以完整人设书写，注入后续每轮上下文，
+使长期对话不因上下文窗口限制而失忆。
 
-压缩时机由 KFCChatter 在每轮对话结束后检查并触发（见 chatter.py）。
+压缩是替换而非累积——每次都基于原始消息重新生成，避免摘要在多次
+迭代中逐渐失真。调度与去重由 ``services.summary_service`` 负责。
 """
 
 from __future__ import annotations
@@ -13,263 +15,331 @@ import json
 import time
 from typing import TYPE_CHECKING, Any
 
+from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.prompt_api import get_system_reminder
 from src.app.plugin_system.api.stream_api import get_stream_messages
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
+from .context.renderer import build_system_prompt
 from .models import KFCEventType
 
 if TYPE_CHECKING:
-    from .config import KFCConfig
-    from .session import KFCSession
-    from .prompts.builder import KFCPromptBuilder
+    from src.app.plugin_system.types import ChatStream, Message
 
-from src.app.plugin_system.api.llm_api import get_model_set_by_task, create_llm_request
+    from .config import KFCConfig
+    from .mental_log import MentalLog
+    from .session import KFCSession, KFCSessionStore
 
 logger = get_logger("kfc_compressor")
 
+_FETCH_LIMIT = 10000
+"""单次拉取的消息上限。私聊消息量有限，一次取够后按时间过滤即可。"""
 
-async def compress_history(
-    session: "KFCSession",
-    prompt_builder: "KFCPromptBuilder",
-    config: "KFCConfig",
-    chat_stream: Any,
-    session_store: Any = None,
-) -> None:
-    """对最近 N 天的对话生成近期记忆摘要，更新 session.history_summary。
+_MAX_RETRIES = 3
+"""LLM 调用与 JSON 解析的最大重试次数。"""
 
-    该函数为"替换式"：每次调用都基于原始消息重新生成摘要，不累积旧摘要。
-    应在 task_manager 中异步调用，不阻塞主对话流程。
-    使用 config.general.model_task 对应的 actor 模型，避免继承对话 model_set 的 max_tokens 限制。
+_SECONDS_PER_DAY = 86400
+
+_WEEKDAY_ZH: tuple[str, ...] = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+"""中文星期，下标直接取自 ``date.weekday()``。"""
+
+_ACTOR_REMINDER_BUCKET = "actor"
+
+
+def should_compress(session: KFCSession, config: KFCConfig) -> bool:
+    """判断会话是否满足周期性压缩条件。
 
     Args:
-        session: 当前用户的 KFCSession（会被直接修改）
-        prompt_builder: KFC prompt 构建器（用于获取 system_prompt）
-        config: KFC 配置
-        chat_stream: 当前聊天流（用于 system_prompt 构建）
-        session_store: 可选的 KFCSessionStore，传入时会在摘要更新后立即持久化
+        session: 当前会话。
+        config: KFC 配置。
+
+    Returns:
+        bool: 是否应触发压缩。
     """
-    # 立即标记压缩时间，防止异步并发重复触发
+    every_n_rounds = config.prompt.compress_every_n_rounds
+    if every_n_rounds <= 0:
+        return False
+    if session.compress_round_count < every_n_rounds:
+        return False
+
+    min_interval = config.prompt.min_compress_interval_minutes * 60
+    return time.time() - session.last_compress_at >= min_interval
+
+
+async def compress_history(
+    session: KFCSession,
+    config: KFCConfig,
+    chat_stream: ChatStream,
+    session_store: KFCSessionStore | None = None,
+) -> None:
+    """生成近期记忆摘要并更新会话。
+
+    应在后台任务中调用，不阻塞对话主流程。使用独立的压缩模型任务，
+    避免继承对话模型的 ``max_tokens`` 限制。
+
+    Args:
+        session: 目标会话，会被就地修改。
+        config: KFC 配置。
+        chat_stream: 当前聊天流，用于构建系统提示词。
+        session_store: 会话存储；传入时摘要更新后立即持久化。
+    """
+    # 先占位，防止并发调度重复触发
     session.last_compress_at = time.time()
 
     stream_id = session.stream_id
     days = config.prompt.compress_days_window
-    since_ts = time.time() - days * 86400
+    since_ts = time.time() - days * _SECONDS_PER_DAY
 
-    # ── 1. 从 DB 读取时间窗口内的历史消息 ──
-    # 私聊流消息量有限，以大上限一次性拉取后按时间过滤，无需分页。
-    _FETCH_LIMIT = 10000
-    try:
-        all_msgs = await get_stream_messages(stream_id=stream_id, limit=_FETCH_LIMIT)
-    except Exception as exc:
-        logger.warning(f"[KFC] 压缩：读取 DB 消息失败：{exc}")
-        return
-
-    # 过滤到时间窗口内
-    window_msgs = [m for m in all_msgs if _msg_time(m) >= since_ts]
-
-    if not window_msgs:
-        logger.debug(f"[KFC] 压缩：流 {stream_id} 最近 {days} 天无消息，跳过")
-        return
-
-    # ── 2. 收集 (时间戳, 单行文本) 元组 ──
-    # 同时容纳消息与内心活动，按时间戳统一排序，再按天分组渲染
-    bot_id = chat_stream.bot_id or ""
-    collected: list[tuple[float, str]] = []
-
-    for msg in window_msgs:
-        ts = _msg_time(msg)
-        if ts <= 0:
-            continue
-        try:
-            time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-        except (OSError, ValueError, OverflowError):
-            continue
-
-        text = (msg.processed_plain_text or "").strip()
-        if not text:
-            continue
-
-        sender_id = msg.sender_id or ""
-        message_id = msg.message_id or ""
-        sender = msg.sender_name or "用户"
-
-        is_bot = bool(
-            (bot_id and sender_id == bot_id)
-            or message_id.startswith("action_kfc_reply")
-        )
-        if is_bot:
-            collected.append((ts, f"[{time_str}] 你回复：{text}"))
-        else:
-            collected.append((ts, f"[{time_str}] {sender}说：{text}"))
-
-    # 同时从 mental_log 中加入内心活动（BOT_PLANNING 的 thought）
-    _merge_mental_log(collected, session, since_ts)
-
+    collected = await _collect_timeline(stream_id, chat_stream, session, since_ts)
     if not collected:
-        logger.debug(f"[KFC] 压缩：流 {stream_id} 格式化后无有效内容，跳过")
+        logger.debug(f"压缩：流 {stream_id[:8]} 窗口内无有效内容，跳过")
         return
 
     collected.sort(key=lambda item: item[0])
     history_text = _render_by_day(collected)
 
-    # ── 3. 构建 LLM 请求 ──
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    user_name = (
-        getattr(chat_stream, "partner_name", None)
-        or getattr(chat_stream, "stream_name", None)
-        or "对方"
-    )
-
     try:
-        system_prompt = await prompt_builder.build_system_prompt(chat_stream)
-    except Exception as exc:
-        logger.warning(f"[KFC] 压缩：构建 system_prompt 失败：{exc}")
+        system_prompt = await build_system_prompt(chat_stream)
+    except Exception as error:
+        logger.warning(f"压缩：构建系统提示词失败：{error}")
         return
 
-    min_chars = config.prompt.compress_min_chars
-    max_chars = config.prompt.compress_max_chars
-    # 防御式校正：保证 max >= min 且二者均为正数
-    if min_chars < 0:
-        min_chars = 0
-    if max_chars < min_chars:
-        max_chars = min_chars
+    instruction = _build_compress_instruction(chat_stream, config, days, history_text)
+    summary = await _request_summary(stream_id, config, system_prompt, instruction)
+    if not summary:
+        return
 
-    compress_instruction = (
-        f"当前时间：{now_str}\n\n"
+    session.history_summary = summary
+    session.last_compress_at = time.time()
+    session.compress_round_count = 0
+    logger.info(
+        f"近期记忆压缩完成：流 {stream_id[:8]}，"
+        f"覆盖 {len(collected)} 条记录，摘要 {len(summary)} 字"
+    )
+
+    if session_store is not None:
+        try:
+            async with session_store.lock(stream_id):
+                await session_store.save(session)
+        except Exception as error:
+            logger.warning(f"近期记忆摘要持久化失败：{error}")
+
+
+# ── 时间线收集 ────────────────────────────────────────────
+
+
+def _message_timestamp(message: Message) -> float:
+    """提取消息时间戳；类型非法时返回 0。"""
+    raw_time = message.time
+    return float(raw_time) if isinstance(raw_time, (int, float)) else 0.0
+
+
+def _format_clock(timestamp: float) -> str | None:
+    """把时间戳格式化为 ``HH:MM:SS``；越界时返回 ``None``。"""
+    try:
+        return datetime.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+async def _collect_timeline(
+    stream_id: str,
+    chat_stream: ChatStream,
+    session: KFCSession,
+    since_ts: float,
+) -> list[tuple[float, str]]:
+    """收集窗口内的消息与内心活动，合并为 ``(时间戳, 单行文本)`` 序列。"""
+    try:
+        all_messages = await get_stream_messages(stream_id=stream_id, limit=_FETCH_LIMIT)
+    except Exception as error:
+        logger.warning(f"压缩：读取消息失败：{error}")
+        return []
+
+    bot_id = chat_stream.bot_id or ""
+    collected: list[tuple[float, str]] = []
+
+    for message in all_messages:
+        timestamp = _message_timestamp(message)
+        if timestamp < since_ts or timestamp <= 0:
+            continue
+        text = (message.processed_plain_text or "").strip()
+        if not text:
+            continue
+        clock = _format_clock(timestamp)
+        if clock is None:
+            continue
+
+        message_id = message.message_id or ""
+        is_bot = bool(
+            (bot_id and message.sender_id == bot_id)
+            or message_id.startswith("action_kfc_reply")
+        )
+        if is_bot:
+            collected.append((timestamp, f"[{clock}] 你回复：{text}"))
+        else:
+            sender = message.sender_name or "用户"
+            collected.append((timestamp, f"[{clock}] {sender}说：{text}"))
+
+    collected.extend(_collect_thoughts(session.mental_log, since_ts))
+    return collected
+
+
+def _collect_thoughts(
+    mental_log: MentalLog | None,
+    since_ts: float,
+) -> list[tuple[float, str]]:
+    """收集窗口内的内心独白。"""
+    if mental_log is None:
+        return []
+
+    collected: list[tuple[float, str]] = []
+    for entry in mental_log.entries:
+        if entry.timestamp < since_ts:
+            continue
+        if entry.event_type != KFCEventType.BOT_PLANNING or not entry.thought:
+            continue
+        clock = _format_clock(entry.timestamp)
+        if clock is None:
+            continue
+        collected.append((entry.timestamp, f"[{clock}] （你的内心：{entry.thought}）"))
+    return collected
+
+
+def _render_by_day(collected: list[tuple[float, str]]) -> str:
+    """把时间线按自然天分组渲染。
+
+    每天一个标题 ``=== YYYY-MM-DD（周X，相对时间）===``，段内每行只保留
+    ``[HH:MM:SS]``。模型据此即可分辨同日内与跨日的时间关系。
+    """
+    today = datetime.date.today()
+    grouped: dict[datetime.date, list[str]] = {}
+
+    for timestamp, line in collected:
+        try:
+            day = datetime.datetime.fromtimestamp(timestamp).date()
+        except (OSError, ValueError, OverflowError):
+            continue
+        grouped.setdefault(day, []).append(line)
+
+    sections: list[str] = []
+    for day in sorted(grouped):
+        header = (
+            f"=== {day.isoformat()}"
+            f"（{_WEEKDAY_ZH[day.weekday()]}，{_describe_relative_day(today, day)}）==="
+        )
+        sections.append(header + "\n" + "\n".join(grouped[day]))
+    return "\n\n".join(sections)
+
+
+def _describe_relative_day(today: datetime.date, day: datetime.date) -> str:
+    """把日期描述为相对今天的自然语言。"""
+    delta_days = (today - day).days
+    if delta_days == 0:
+        return "今天"
+    if delta_days == 1:
+        return "昨天"
+    if delta_days == 2:
+        return "前天"
+    if delta_days > 0:
+        return f"{delta_days} 天前"
+    # 系统时钟漂移导致消息时间晚于今天时的降级描述
+    return f"{-delta_days} 天后"
+
+
+# ── LLM 调用 ──────────────────────────────────────────────
+
+
+def _build_compress_instruction(
+    chat_stream: ChatStream,
+    config: KFCConfig,
+    days: float,
+    history_text: str,
+) -> str:
+    """构建压缩指令。"""
+    now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    user_name = chat_stream.stream_name or "对方"
+
+    min_chars = max(0, config.prompt.compress_min_chars)
+    max_chars = max(min_chars, config.prompt.compress_max_chars)
+
+    return (
+        f"当前时间：{now_text}\n\n"
         f"以下是你与{user_name}之间最近 {days:.0f} 天的对话记录，"
         "已按自然天分组：每个 `=== 日期（星期，相对时间）===` 标题之下，"
         "都是当天的消息与你当时的内心活动，行首 `[HH:MM:SS]` 是当天的时间。\n\n"
         f"【近期对话记录】\n{history_text}\n\n"
         "请你以第一人称（'我'）写一段近期记忆摘要（Memory Stream），要求：\n"
-        "1. 【按重要性分配篇幅】：不要把笔墨平均分配给每天。对于关键情感节点、重要的约定、影响关系的事件、对方吐露的心声，应分配较大篇幅详细记录（甚至保留核心原话）；对于日常寒暄、琐碎水文、流水账，一笔带过或直接忽略。\n"
-        "2. 【保留时间感】：直接使用'今天下午'、'昨天深夜'、'前天'、'三天前'这类相对描述（对应分组标题里的相对时间），不要写出具体数字日期。\n"
-        "3. 【主观真实感】：这是你脑海中流淌的真实记忆，用感性且符合你人设的自然语言叙述，体现你对这些事的感受与想法。\n"
+        "1. 【按重要性分配篇幅】：不要把笔墨平均分配给每天。对于关键情感节点、"
+        "重要的约定、影响关系的事件、对方吐露的心声，应分配较大篇幅详细记录"
+        "（甚至保留核心原话）；对于日常寒暄、琐碎水文、流水账，一笔带过或直接忽略。\n"
+        "2. 【保留时间感】：直接使用'今天下午'、'昨天深夜'、'前天'、'三天前'这类"
+        "相对描述（对应分组标题里的相对时间），不要写出具体数字日期。\n"
+        "3. 【主观真实感】：这是你脑海中流淌的真实记忆，用感性且符合你人设的"
+        "自然语言叙述，体现你对这些事的感受与想法。\n"
         f"4. 【字数限制】：总字数控制在 {min_chars}-{max_chars} 字。\n"
-        '5. 【输出格式】：以 JSON 格式输出，只包含一个 `content` 字段，值为记忆正文字符串。示例：\n'
+        "5. 【输出格式】：以 JSON 格式输出，只包含一个 `content` 字段，"
+        "值为记忆正文字符串。示例：\n"
         '```json\n{"content": "你的记忆正文..."}\n```'
     )
 
-    # 注入 actor_reminder（如有）
-    from src.app.plugin_system.api.prompt_api import get_system_reminder
-    actor_reminder = get_system_reminder("actor")
 
-    # 使用独立的压缩模型任务，避免继承对话 model_set 的 max_tokens 限制
+async def _request_summary(
+    stream_id: str,
+    config: KFCConfig,
+    system_prompt: str,
+    instruction: str,
+) -> str:
+    """调用 LLM 生成摘要，带重试。
+
+    Returns:
+        str: 摘要正文；全部尝试失败时返回空串。
+    """
     model_set = get_model_set_by_task(config.prompt.compress_model_task)
     llm_request = create_llm_request(model_set, f"kfc_compress_{stream_id}")
     llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+
+    actor_reminder = get_system_reminder(_ACTOR_REMINDER_BUCKET)
     if actor_reminder:
         llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(actor_reminder)))
-    llm_request.add_payload(LLMPayload(ROLE.USER, Text(compress_instruction)))
+    llm_request.add_payload(LLMPayload(ROLE.USER, Text(instruction)))
 
-    # ── 4. 调用 LLM（非流式收集全文）带重试 ──
-    max_retries = 3
-    summary = ""
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, _MAX_RETRIES + 1):
         try:
             llm_response = await llm_request.send()
             raw_summary = (await llm_response or "").strip()
-        except Exception as exc:
-            logger.warning(f"[KFC] 压缩：LLM 调用失败（尝试 {attempt}/{max_retries}）：{exc}")
-            if attempt >= max_retries:
-                return
+        except Exception as error:
+            logger.warning(f"压缩：LLM 调用失败（{attempt}/{_MAX_RETRIES}）：{error}")
             continue
 
         if not raw_summary:
-            logger.warning(f"[KFC] 压缩：LLM 返回空（尝试 {attempt}/{max_retries}），重试")
-            if attempt >= max_retries:
-                return
+            logger.warning(f"压缩：LLM 返回空（{attempt}/{_MAX_RETRIES}）")
             continue
 
-        # 从 JSON 输出中提取 content 字段
-        summary, is_valid_json = _extract_summary_content(raw_summary)
-        
-        # 验证 JSON 完整性
-        if is_valid_json and summary:
-            # JSON 完整且有内容，成功
-            break
-        
-        if not is_valid_json:
-            logger.warning(
-                f"[KFC] 压缩：JSON 格式不完整（尝试 {attempt}/{max_retries}），重试"
-            )
-        else:
-            logger.warning(
-                f"[KFC] 压缩：摘要为空（尝试 {attempt}/{max_retries}），重试"
-            )
-        
-        if attempt >= max_retries:
-            logger.warning("[KFC] 压缩：达到最大重试次数，跳过")
-            return
+        summary = _extract_summary_content(raw_summary)
+        if summary:
+            return summary
+        logger.warning(f"压缩：摘要内容解析后为空（{attempt}/{_MAX_RETRIES}）")
 
-    if not summary:
-        logger.warning("[KFC] 压缩：所有尝试均失败，跳过")
-        return
-
-    # ── 5. 更新 session（直接替换）并持久化 ──
-    session.history_summary = summary
-    session.last_compress_at = time.time()
-    session.compress_round_count = 0
-    logger.info(
-        f"[KFC] 近期记忆压缩完成：流 {stream_id}，"
-        f"覆盖 {len(collected)} 条消息，"
-        f"摘要 {len(summary)} 字"
-    )
-
-    # 立即持久化，避免进程重启前摘要丢失
-    if session_store is not None:
-        try:
-            async with session_store.lock(stream_id):
-                await session_store.save(session)
-            logger.debug(f"[KFC] 近期记忆摘要已持久化：流 {stream_id}")
-        except Exception as exc:
-            logger.warning(f"[KFC] 近期记忆摘要持久化失败：{exc}")
+    logger.warning("压缩：达到最大重试次数仍未取得有效摘要，跳过")
+    return ""
 
 
-def should_compress(session: "KFCSession", config: "KFCConfig") -> bool:
-    """判断是否应触发压缩。
+def _extract_summary_content(raw: str) -> str:
+    """从 LLM 输出中提取摘要正文。
+
+    期望格式为 ``{"content": "..."}``。JSON 解析失败时回退使用清理过
+    markdown 围栏的原始文本——摘要本身是自然语言，即便格式不合规，
+    正文通常仍然可用。
 
     Args:
-        session: 当前 KFCSession
-        config: KFC 配置
+        raw: LLM 返回的原始文本。
 
     Returns:
-        bool: 是否应触发压缩
+        str: 提取出的摘要正文。
     """
-    every_n = config.prompt.compress_every_n_rounds
-    if every_n <= 0:
-        return False
-
-    if session.compress_round_count < every_n:
-        return False
-
-    # 最短间隔检查
-    min_interval = config.prompt.min_compress_interval_minutes * 60
-    if time.time() - session.last_compress_at < min_interval:
-        return False
-
-    return True
-
-
-# ── JSON 解析 ─────────────────────────────────────────────
-
-
-def _extract_summary_content(raw: str) -> tuple[str, bool]:
-    """从 LLM 返回的 JSON 输出中提取 content 字段。
-
-    期望格式为 ``{"content": "..."}``。如果 JSON 解析失败，
-    回退使用原始文本（去除可能的 markdown 代码围栏）。
-
-    Args:
-        raw: LLM 返回的原始文本
-
-    Returns:
-        tuple[str, bool]: (提取出的摘要正文, JSON 是否完整有效)
-    """
-    # 去除 markdown 代码围栏（```json ... ```）
     cleaned = raw.strip()
     if cleaned.startswith("```"):
-        # 去掉首行 ```json 和末尾 ```
         lines = cleaned.split("\n")
         if lines[0].strip().startswith("```"):
             lines = lines[1:]
@@ -277,107 +347,17 @@ def _extract_summary_content(raw: str) -> tuple[str, bool]:
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
 
-    # 尝试找到 JSON 对象
     brace_start = cleaned.find("{")
     brace_end = cleaned.rfind("}")
     if brace_start >= 0 and brace_end > brace_start:
-        json_str = cleaned[brace_start : brace_end + 1]
         try:
-            data = json.loads(json_str)
-            content = data.get("content", "")
-            if isinstance(content, list):
-                extracted = "\n".join(str(item) for item in content if str(item).strip())
-            else:
-                extracted = str(content).strip()
-            # 返回提取的内容和 JSON 有效标志
-            return extracted, True
-        except (json.JSONDecodeError, TypeError, AttributeError):
-            logger.debug("[KFC] 压缩：JSON 解析失败，回退使用原始文本")
-
-    # JSON 解析失败，回退使用原始文本
-    return cleaned, False
-
-
-# ── 私有辅助函数 ──────────────────────────────────────────
-
-def _msg_time(msg: Any) -> float:
-    """从消息对象中提取时间戳，不存在或类型错误时返回 0.0。"""
-    # msg 可能来自 DB 层原始记录不一定是 Message 实例，这里保留 getattr。
-    t = getattr(msg, "time", None)
-    return float(t) if isinstance(t, (int, float)) else 0.0
-
-
-def _merge_mental_log(
-    collected: list[tuple[float, str]],
-    session: "KFCSession",
-    since_ts: float,
-) -> None:
-    """将 mental_log 中的 BOT_PLANNING thought 以 (ts, line) 元组合并入列表。"""
-    mental_log = session.mental_log
-    if not mental_log:
-        return
-
-    for entry in mental_log.entries:
-        if entry.timestamp < since_ts:
-            continue
-        if entry.event_type != KFCEventType.BOT_PLANNING or not entry.thought:
-            continue
-        try:
-            time_str = datetime.datetime.fromtimestamp(entry.timestamp).strftime(
-                "%H:%M:%S"
-            )
-        except (OSError, ValueError, OverflowError):
-            continue
-        collected.append(
-            (entry.timestamp, f"[{time_str}] （你的内心：{entry.thought}）")
-        )
-
-
-# 中文星期，下标从 weekday() 直接取
-_WEEKDAY_ZH: tuple[str, ...] = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-
-
-def _render_by_day(collected: list[tuple[float, str]]) -> str:
-    """将 (时间戳, 行) 序列按"自然天"分组渲染。
-
-    每天一个小标题：``=== YYYY-MM-DD（周X，N 天前 / 今天 / 昨天）===``，
-    段内每行只保留 ``[HH:MM:SS]``。
-    LLM 据此即可分辨同一天内与跨天的时间关系。
-    """
-    if not collected:
-        return ""
-
-    today = datetime.date.today()
-    grouped: dict[datetime.date, list[str]] = {}
-    order: list[datetime.date] = []
-
-    for ts, line in collected:
-        try:
-            day = datetime.datetime.fromtimestamp(ts).date()
-        except (OSError, ValueError, OverflowError):
-            continue
-        if day not in grouped:
-            grouped[day] = []
-            order.append(day)
-        grouped[day].append(line)
-
-    sections: list[str] = []
-    for day in sorted(order):
-        delta_days = (today - day).days
-        if delta_days == 0:
-            relative = "今天"
-        elif delta_days == 1:
-            relative = "昨天"
-        elif delta_days == 2:
-            relative = "前天"
-        elif delta_days > 0:
-            relative = f"{delta_days} 天前"
+            data: Any = json.loads(cleaned[brace_start : brace_end + 1])
+        except (json.JSONDecodeError, TypeError):
+            logger.debug("压缩：JSON 解析失败，回退使用原始文本")
         else:
-            # 极端情况：消息时间晚于今天（系统时钟漂移），降级为日期描述
-            relative = f"{-delta_days} 天后"
-        weekday = _WEEKDAY_ZH[day.weekday()]
-        header = f"=== {day.isoformat()}（{weekday}，{relative}）==="
-        body = "\n".join(grouped[day])
-        sections.append(f"{header}\n{body}")
+            content = data.get("content", "") if isinstance(data, dict) else ""
+            if isinstance(content, list):
+                return "\n".join(str(item) for item in content if str(item).strip())
+            return str(content).strip()
 
-    return "\n\n".join(sections)
+    return cleaned

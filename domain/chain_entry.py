@@ -56,21 +56,24 @@ class ChainEntry:
             text = _BRIDGE_PLACEHOLDER
         return cls(role="assistant", text=text, tool_calls=calls)
 
-    # ---- predicates ------------------------------------------------
+    # ---- 语义判定 ---------------------------------------------------
 
     @property
     def is_user(self) -> bool:
+        """是否为 USER 条目。"""
         return self.role == "user"
 
     @property
     def is_assistant(self) -> bool:
+        """是否为 ASSISTANT 条目。"""
         return self.role == "assistant"
 
     @property
     def has_tool_calls(self) -> bool:
+        """是否为携带工具调用审计数据的 ASSISTANT 条目。"""
         return self.is_assistant and bool(self.tool_calls)
 
-    # ---- (de)serialization ----------------------------------------
+    # ---- 序列化 -----------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 JSON 友好的 dict（仅写入非默认字段）。"""

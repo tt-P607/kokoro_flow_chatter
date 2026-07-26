@@ -1,77 +1,112 @@
-"""KFC 上下文规划器。"""
+"""KFC 上下文规划。
+
+规划阶段只决定"本轮上下文由哪些内容组成"，产出纯数据的
+``ContextPlan`` / ``InitialContextPlan``；具体的 payload 组装由
+``context.renderer`` 完成。
+"""
 
 from __future__ import annotations
 
-from typing import Any
-
-from src.app.plugin_system.api.log_api import get_logger
+from typing import TYPE_CHECKING
 
 from .sources.initial_source import build_initial_context_plan
 from .sources.memo_source import build_memo_contribution
 from .sources.plugin_source import collect_plugin_turn_contributions
 from .types import ContextPlan, InitialContextPlan
 
-logger = get_logger("kfc_context_planner")
+if TYPE_CHECKING:
+    from src.app.plugin_system.types import ChatStream
+
+    from ..config import KFCConfig
+    from ..session import KFCSession
+
+USER_PROMPT_NAME = "kfc_user_prompt"
+"""``on_prompt_build`` 事件中标识 KFC 用户提示词的模板名。"""
+
+_LAST_MILE_INSTRUCTIONS = (
+    "请基于上述信息决定接下来你要调用的工具或动作。\n"
+    "重申：请务必使用工具来实现你的任何行为，不要直接在文本里写出你想说的话。\n"
+    "请务必保持你的回复符合你的人设和表达风格，\n"
+    "同时请确保你的回复有理有据，禁止无根据地编造信息或胡乱回复。"
+)
+"""追加在用户提示词末尾的行为强调指令。仅进入本轮请求，不入对话链。"""
 
 
-class ContextPlanner:
-    """负责把单轮输入转换成结构化上下文计划。"""
+def plan_initial_context(
+    *,
+    chat_stream: ChatStream,
+    config: KFCConfig,
+    session: KFCSession,
+) -> InitialContextPlan:
+    """规划 ``execute()`` 启动时所需的初始上下文。
 
-    def plan_initial_context(
-        self,
-        *,
-        chat_stream: Any,
-        config: Any,
-        session: Any,
-    ) -> InitialContextPlan:
-        """规划 execute 启动时所需的初始上下文数据。"""
-        return build_initial_context_plan(
-            chat_stream=chat_stream,
-            config=config,
-            session=session,
-        )
+    Args:
+        chat_stream: 当前聊天流。
+        config: KFC 配置。
+        session: 当前会话。
 
-    @staticmethod
-    def _build_last_mile_instructions() -> str:
-        """构建 user 消息末尾的行为强调指令。"""
-        return (
-            "请基于上述信息决定接下来你要调用的工具或动作。\n"
-            "重申：请务必使用工具来实现你的任何行为，不要直接在文本里写出你想说的话。\n"
-            "请务必保持你的回复符合你的人设和表达风格，\n"
-            "同时请确保你的回复有理有据，禁止无根据地编造信息或胡乱回复。"
-        )
+    Returns:
+        InitialContextPlan: 系统模板变量、摘要与叙事截断点。
+    """
+    return build_initial_context_plan(
+        chat_stream=chat_stream,
+        config=config,
+        session=session,
+    )
 
-    async def plan_user_turn(
-        self,
-        *,
-        formatted_unreads: str,
-        stream_id: str = "",
-        chat_stream: Any = None,
-        session: Any = None,
-    ) -> ContextPlan:
-        """规划本轮用户输入和 turn 级上下文贡献。
 
-        Args:
-            formatted_unreads: 格式化后的未读消息文本
-            stream_id: 当前聊天流 ID（供 on_prompt_build 事件读取）
-            chat_stream: 当前聊天流（保留接口）
-            session: KFCSession，用于注入备忘录块；为 None 时跳过备忘录注入
-        """
-        _ = chat_stream
-        last_mile = self._build_last_mile_instructions()
-        chain_text = f"[新消息]\n{formatted_unreads}"
-        user_text = f"{chain_text}\n\n---\n{last_mile}"
+async def plan_user_turn(
+    *,
+    formatted_unreads: str,
+    stream_id: str = "",
+    session: KFCSession | None = None,
+) -> ContextPlan:
+    """规划本轮用户输入及 turn 级上下文贡献。
 
-        contributions = await collect_plugin_turn_contributions(
-            prompt_name="kfc_user_prompt",
-            content=user_text,
-            stream_id=stream_id,
-        )
+    Args:
+        formatted_unreads: 已格式化的未读消息文本。
+        stream_id: 当前聊天流 ID，供 ``on_prompt_build`` 订阅者读取。
+        session: 当前会话；为 ``None`` 时跳过备忘录注入。
 
-        # 备忘录注入（懒清理：先清掉过期再渲染；过期事件由调用方负责追加）
-        if session is not None and getattr(session, "memos", None):
-            memo_contribution = build_memo_contribution(session.memos)
-            if memo_contribution is not None:
-                contributions.append(memo_contribution)
+    Returns:
+        ContextPlan: 用户提示词、链文本与上下文贡献列表。
+    """
+    chain_text = f"[新消息]\n{formatted_unreads}"
+    user_text = f"{chain_text}\n\n---\n{_LAST_MILE_INSTRUCTIONS}"
 
-        return ContextPlan(user_text=user_text, contributions=contributions, chain_text=chain_text)
+    contributions = await collect_plugin_turn_contributions(
+        prompt_name=USER_PROMPT_NAME,
+        content=user_text,
+        stream_id=stream_id,
+    )
+
+    if session is not None and session.memos:
+        memo_contribution = build_memo_contribution(session.memos)
+        if memo_contribution is not None:
+            contributions.append(memo_contribution)
+
+    return ContextPlan(
+        user_text=user_text,
+        chain_text=chain_text,
+        contributions=contributions,
+    )
+
+
+async def plan_followup_contributions(stream_id: str) -> ContextPlan:
+    """规划续轮/超时路径的 turn 级上下文贡献。
+
+    这两条路径不新增用户消息，但仍需收集第三方注入——否则
+    ``prompt_injector`` 等插件提供的内容会在续轮中丢失。
+
+    Args:
+        stream_id: 当前聊天流 ID。
+
+    Returns:
+        ContextPlan: 仅含贡献列表，文本字段为空。
+    """
+    contributions = await collect_plugin_turn_contributions(
+        prompt_name=USER_PROMPT_NAME,
+        content="",
+        stream_id=stream_id,
+    )
+    return ContextPlan(user_text="", chain_text="", contributions=contributions)

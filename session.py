@@ -1,96 +1,103 @@
-"""KFC 会话状态管理。
+"""KFC 会话状态与持久化存储。
 
-维护每个用户/流的 KFCSession，通过 KFCSessionStore 持久化。
-KFCSession 包含等待配置、连续超时计数、心理活动流等状态。
+``KFCSession`` 保存单个聊天流的全部跨轮状态：等待配置、心理活动流、
+持久化对话链、近期记忆摘要、备忘录与主动发起预约。
+``KFCSessionStore`` 负责按 ``stream_id`` 索引这些会话，并通过
+``JSONStore`` 落盘到 ``data/kokoro_flow_chatter/sessions/``。
+
+所有跨协程的读写都应通过 ``async with store.lock(stream_id)`` 串行化，
+避免 Scheduler 回调与 ``execute()`` 主循环竞态。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from .domain.scene_state import SceneState
 from .mental_log import MentalLog, MentalLogEntry
-from .models import (
-    MEMO_MAX_ENTRIES,
-    KFCEventType,
-    Memo,
-    WaitingConfig,
-)
+from .models import MEMO_MAX_ENTRIES, KFCEventType, Memo, WaitingConfig
 
 logger = get_logger("kfc_session")
+
+_STORAGE_DIR = "data/kokoro_flow_chatter/sessions"
+"""会话文件所在目录，按 ``stream_id`` 分文件存放。"""
+
+_INDEX_FILENAME = "_index.json"
+"""可读索引文件名，维护 ``stream_id`` → 平台/用户 的映射便于人工排查。"""
+
+_LOCK_CLEANUP_THRESHOLD = 100
+"""锁字典超过此规模时触发一次不活跃锁清理。"""
 
 
 @dataclass
 class KFCSession:
-    """KFC 会话状态数据。"""
+    """单个聊天流的 KFC 会话状态。"""
 
     user_id: str
     stream_id: str
     platform: str = ""
 
-    # 等待状态
     waiting_config: WaitingConfig = field(default_factory=WaitingConfig)
     consecutive_timeout_count: int = 0
+    """等待状态与连续超时计数。"""
 
-    # 时间戳
     created_at: float = field(default_factory=time.time)
     last_activity_at: float = field(default_factory=time.time)
     last_user_message_at: float | None = None
     last_proactive_at: float | None = None
+    """各类时间戳，供主动发起的沉默判定使用。"""
 
-    # 模型预约的下一次主动思考时间（Unix 时间戳）
-    # 若存在，条件主动发起逻辑不生效，直到预约时间到来或被清除
     scheduled_proactive_at: float | None = None
-    scheduled_proactive_reason: str = ""  # 预约时给出的理由，触发时注入提示词
+    scheduled_proactive_reason: str = ""
+    """模型预约的下次主动思考时间与理由。存在预约时，条件主动发起逻辑
+    暂停，直到预约到期或被显式清除。"""
 
-    # 心理活动流
     mental_log: MentalLog = field(default_factory=MentalLog)
+    """心理活动流。"""
 
-    # 持久化对话链：序列化的 USER/ASSISTANT payload 列表，跨 execute() 重启保留上下文。
-    # 每条条目格式：{"role": "user"|"assistant", "text": "...", "ts": <float，仅 user>}
-    # chain_cutoff_ts 为链头第一个 user 条目的时间戳，供 build_fused_narrative 做截断。
     chain_payloads: list[dict[str, Any]] = field(default_factory=list)
     chain_cutoff_ts: float = 0.0
+    """持久化对话链。每条形如 ``{"role", "text", "ts"?, "tool_calls"?}``；
+    ``chain_cutoff_ts`` 记录链头首个 user 条目的时间戳，供融合叙事截断，
+    避免叙事与链内容重叠。"""
 
-    # 近期记忆摘要（滚动压缩，替换式）：覆盖最近 compress_days_window 天的对话。
-    # 由主聊天模型异步生成，以第一人称书写，重启后持久保留。
     history_summary: str = ""
-    last_compress_at: float = 0.0     # 上次触发压缩的时间戳
-    compress_round_count: int = 0     # 距上次压缩已完成的对话轮次数
+    last_compress_at: float = 0.0
+    compress_round_count: int = 0
+    """近期记忆摘要（替换式滚动压缩）及其触发计数。"""
 
-    # 显式场景状态只记录有证据支撑的信息；当前无场景来源时保持 unknown。
-    scene_state: SceneState = field(default_factory=SceneState)
-
-    # 私人备忘录：LLM 显式记录的、带过期时间的中短期关键事项。
-    # 与 mental_log（自动事件流）和 history_summary（叙事压缩）互补，
-    # 渲染时作为 turn 级 ContextContribution 注入用户提示词末尾，不进 chain。
     memos: list[Memo] = field(default_factory=list)
+    """私人备忘录。渲染为 turn 级上下文注入用户提示词末尾，不进对话链。"""
 
-    # 统计
     total_interactions: int = 0
+    """累计 Bot 决策次数。"""
+
+    # ── 等待状态 ──────────────────────────────────────────
 
     def set_waiting(self, config: WaitingConfig) -> None:
-        """设置等待状态。"""
+        """设置等待状态；``max_wait_seconds <= 0`` 时等价于清除。"""
         if config.max_wait_seconds <= 0:
             self.clear_waiting()
             return
         self.waiting_config = config
 
     def clear_waiting(self) -> None:
-        """清除等待状态。"""
+        """清除等待状态并刷新活跃时间。"""
         self.waiting_config.reset()
         self.last_activity_at = time.time()
 
     def is_waiting(self) -> bool:
-        """是否处于等待状态。"""
+        """是否处于等待对方回复的状态。"""
         return self.waiting_config.is_active()
+
+    # ── 心理活动流写入 ────────────────────────────────────
 
     def add_user_message(
         self,
@@ -100,7 +107,7 @@ class KFCSession:
         timestamp: float | None = None,
         message_id: str = "",
     ) -> MentalLogEntry:
-        """记录用户消息到活动流。"""
+        """记录一条用户消息到活动流，并顺带标注回复时效。"""
         msg_time = timestamp or time.time()
         entry = MentalLogEntry(
             event_type=KFCEventType.USER_MESSAGE,
@@ -111,14 +118,12 @@ class KFCSession:
             message_id=message_id,
         )
 
-        # 标记回复时效
         if self.waiting_config.is_active():
             elapsed = self.waiting_config.get_elapsed_seconds()
             max_wait = self.waiting_config.max_wait_seconds
-            if elapsed <= max_wait:
-                entry.metadata["reply_status"] = "in_time"
-            else:
-                entry.metadata["reply_status"] = "late"
+            entry.metadata["reply_status"] = (
+                "in_time" if elapsed <= max_wait else "late"
+            )
             entry.metadata["elapsed_seconds"] = elapsed
             entry.metadata["max_wait_seconds"] = max_wait
 
@@ -136,7 +141,7 @@ class KFCSession:
         max_wait_seconds: float = 0.0,
         raw_response: str = "",
     ) -> MentalLogEntry:
-        """记录 Bot 规划到活动流。"""
+        """记录一次 Bot 决策到活动流。"""
         entry = MentalLogEntry(
             event_type=KFCEventType.BOT_PLANNING,
             timestamp=time.time(),
@@ -152,44 +157,71 @@ class KFCSession:
         self.last_activity_at = time.time()
         return entry
 
-    def set_scheduled_proactive(self, at: float | None, reason: str = "") -> None:
-        """设置（或清除）模型预约的主动思考时间。
+    def add_interrupt_event(self, interrupt_msgs: list[Any]) -> MentalLogEntry:
+        """记录一次"生成期间被新消息打断"事件。
+
+        让模型在下一轮上下文中感知到"我刚才的回复是在没看到这些消息的
+        情况下做出的"，从而做出更自然的衔接。
 
         Args:
-            at: Unix 时间戳，None 表示清除预约
-            reason: 预约理由，触发时注入提示词
+            interrupt_msgs: 打断时到达的消息列表。
+
+        Returns:
+            MentalLogEntry: 已写入活动流的条目。
+        """
+        senders = {
+            (msg.sender_name or msg.sender_id or "未知") for msg in interrupt_msgs
+        }
+        entry = MentalLogEntry(
+            event_type=KFCEventType.USER_INTERRUPTED,
+            timestamp=time.time(),
+            content=(
+                f"我正在思考时，{'、'.join(sorted(senders))} 发来了 "
+                f"{len(interrupt_msgs)} 条新消息，"
+                "我的回复是在没看到这些消息的情况下做出的。"
+            ),
+        )
+        self.mental_log.add(entry)
+        return entry
+
+    # ── 主动发起预约 ──────────────────────────────────────
+
+    def set_scheduled_proactive(self, at: float | None, reason: str = "") -> None:
+        """设置或清除模型预约的主动思考时间。
+
+        Args:
+            at: Unix 时间戳；``None`` 表示清除预约。
+            reason: 预约理由，触发时注入提示词；清除时一并置空。
         """
         self.scheduled_proactive_at = at
         self.scheduled_proactive_reason = reason if at is not None else ""
 
+    # ── 持久化对话链 ──────────────────────────────────────
+
     def update_chain(
-        self, new_entries: list[dict[str, Any]], max_payloads: int
+        self,
+        new_entries: list[dict[str, Any]],
+        max_payloads: int,
     ) -> None:
-        """追加新的对话条目到持久化链，并裁剪至 max_payloads 条目。
+        """追加对话条目到持久化链并裁剪至上限。
 
-        对 user 条目按 ``(text, ts)`` 做幂等去重：若链中已存在与新 user 条目
-        ``text`` 与 ``ts`` 完全相同的记录，则跳过该条。防止 LLM 失败后
-        下一 Tick 重新消费同一批 unread 时，同一条用户消息被反复 append。
-
-        ASSISTANT 条目不参与去重——正常路径下每次 commit 都对应一次新的
-        LLM 输出，即便文本恰好相同也应保留时序结构。
+        user 条目按 ``(text, ts)`` 幂等去重：LLM 失败后下一 Tick 会重新
+        消费同一批未读，不去重会导致同一条消息被反复 append。assistant
+        条目不去重——每次 commit 对应一次真实的模型输出，即便文本相同
+        也应保留时序结构。
 
         Args:
-            new_entries: 要追加的条目列表，每条格式为
-                ``{"role": "user"|"assistant", "text": "...", "ts": float}``。
-                USER 条目应携带 ``ts``（第一条未读消息的时间戳），
-                ASSISTANT 条目无需携带 ``ts``。
-            max_payloads: 链最大条目数，超出时删除最老的条目。
+            new_entries: 待追加的条目，形如
+                ``{"role": "user"|"assistant", "text": str, "ts"?: float}``。
+            max_payloads: 链最大条目数，超出时从头裁剪。
         """
         filtered: list[dict[str, Any]] = []
         for entry in new_entries:
             if entry.get("role") == "user":
-                new_text = entry.get("text", "")
-                new_ts = entry.get("ts", 0.0)
                 duplicated = any(
                     existing.get("role") == "user"
-                    and existing.get("text", "") == new_text
-                    and existing.get("ts", 0.0) == new_ts
+                    and existing.get("text", "") == entry.get("text", "")
+                    and existing.get("ts", 0.0) == entry.get("ts", 0.0)
                     for existing in self.chain_payloads
                 )
                 if duplicated:
@@ -202,10 +234,10 @@ class KFCSession:
         self.chain_payloads.extend(filtered)
         if len(self.chain_payloads) > max_payloads:
             self.chain_payloads = self.chain_payloads[-max_payloads:]
-            # 确保裁剪后首条是 user，避免孤立的 assistant 导致上下文非法
+            # 裁剪后链头必须是 user，否则孤立的 assistant 会让上下文非法
             while self.chain_payloads and self.chain_payloads[0].get("role") != "user":
                 self.chain_payloads.pop(0)
-        # 更新截止时间戳为链头第一个 user 条目的时间
+
         self.chain_cutoff_ts = 0.0
         for entry in self.chain_payloads:
             if entry.get("role") == "user":
@@ -214,71 +246,33 @@ class KFCSession:
                     self.chain_cutoff_ts = float(ts)
                 break
 
-    def clear_chain(self) -> None:
-        """清空持久化对话链（重置上下文）。"""
-        self.chain_payloads = []
-        self.chain_cutoff_ts = 0.0
-
-    def add_interrupt_event(self, interrupt_msgs: list[Any]) -> MentalLogEntry:
-        """记录用户打断事件到活动流。
-
-        当 LLM 生成期间检测到新消息时调用，让模型在下一轮上下文
-        中感知到"我正在思考时被打断"这一事实，从而做出更自然的响应。
-
-        Args:
-            interrupt_msgs: 打断时到达的消息列表
-
-        Returns:
-            MentalLogEntry: 写入活动流的条目
-        """
-        count = len(interrupt_msgs)
-        senders = {
-            (m.sender_name or m.sender_id or "未知")
-            for m in interrupt_msgs
-        }
-        sender_str = "、".join(sorted(senders))
-        entry = MentalLogEntry(
-            event_type=KFCEventType.USER_INTERRUPTED,
-            timestamp=time.time(),
-            content=(
-                f"我正在思考时，{sender_str} 发来了 {count} 条新消息，"
-                "我的回复是在没看到这些消息的情况下做出的。"
-            ),
-        )
-        self.mental_log.add(entry)
-        return entry
-
     # ── 备忘录管理 ────────────────────────────────────────
 
     def prune_expired_memos(self) -> list[Memo]:
-        """删除已过期的备忘并返回被删除的列表（懒清理入口）。
+        """删除已过期备忘并返回被删除的列表（懒清理入口）。
 
-        返回值供调用方决定是否往 mental_log 写 MEMO_EXPIRED 事件。
+        返回值供调用方决定是否补写 ``MEMO_EXPIRED`` 事件。
         """
         if not self.memos:
             return []
         now = time.time()
         expired = [memo for memo in self.memos if memo.is_expired(now)]
-        if not expired:
-            return []
-        self.memos = [memo for memo in self.memos if not memo.is_expired(now)]
+        if expired:
+            self.memos = [memo for memo in self.memos if not memo.is_expired(now)]
         return expired
 
     def upsert_memo(self, memo: Memo) -> tuple[Memo, bool]:
         """写入或刷新一条备忘。
 
-        若存在 ``content`` 完全相同的有效备忘，则只刷新它的过期时间和
-        intent（保留 created_at），返回 ``(刷新后的备忘, False)``；
-        否则按 ``created_at`` 升序在到达上限时淘汰最早的，再追加新备忘，
-        返回 ``(新备忘, True)``。
+        若已存在 ``content`` 完全相同的有效备忘，只刷新其过期时间和
+        intent（保留原 ``created_at``）；否则在必要时淘汰最早的一条后追加。
 
         Args:
             memo: 待写入的备忘。
 
         Returns:
-            tuple: ``(最终落盘的备忘对象, is_new_created)``
+            tuple: ``(最终落盘的备忘, 是否为新建)``。
         """
-        # 先做懒清理
         self.prune_expired_memos()
 
         normalized_content = memo.content.strip()
@@ -290,33 +284,33 @@ class KFCSession:
                         existing.intent = memo.intent
                     return existing, False
 
-        # 数量上限：超过则按 created_at 升序淘汰最早的
         while len(self.memos) >= MEMO_MAX_ENTRIES:
-            oldest_idx = min(
+            oldest_index = min(
                 range(len(self.memos)),
-                key=lambda i: self.memos[i].created_at,
+                key=lambda index: self.memos[index].created_at,
             )
-            self.memos.pop(oldest_idx)
+            self.memos.pop(oldest_index)
 
         self.memos.append(memo)
         return memo, True
 
     def delete_memos(self, memo_ids: list[str]) -> list[Memo]:
-        """按 id 删除备忘并返回被删除的列表。
+        """按 id 删除备忘。
 
         Args:
             memo_ids: 待删除的备忘 id 列表。
 
         Returns:
-            list[Memo]: 实际被删除的备忘列表（用于落盘 mental_log 事件）。
+            list[Memo]: 实际被删除的备忘，供调用方补写活动流事件。
         """
         if not memo_ids or not self.memos:
             return []
         target_ids = set(memo_ids)
         deleted = [memo for memo in self.memos if memo.memo_id in target_ids]
-        if not deleted:
-            return []
-        self.memos = [memo for memo in self.memos if memo.memo_id not in target_ids]
+        if deleted:
+            self.memos = [
+                memo for memo in self.memos if memo.memo_id not in target_ids
+            ]
         return deleted
 
     def add_memo_event(
@@ -327,8 +321,8 @@ class KFCSession:
         """把备忘相关事件写入心理活动流。
 
         Args:
-            event_type: 必须是 MEMO_WRITTEN / MEMO_DELETED / MEMO_EXPIRED 之一。
-            memo: 关联的备忘对象（用于在叙事中展示内容）。
+            event_type: ``MEMO_WRITTEN`` / ``MEMO_DELETED`` / ``MEMO_EXPIRED`` 之一。
+            memo: 关联的备忘对象。
         """
         entry = MentalLogEntry(
             event_type=event_type,
@@ -366,17 +360,20 @@ class KFCSession:
             "history_summary": self.history_summary,
             "last_compress_at": self.last_compress_at,
             "compress_round_count": self.compress_round_count,
-            "scene_state": self.scene_state.to_dict(),
             "memos": [memo.to_dict() for memo in self.memos],
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], max_log_entries: int = 50) -> KFCSession:
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        max_log_entries: int = 50,
+    ) -> KFCSession:
         """从字典反序列化。
 
         Args:
-            data: 序列化的字典数据
-            max_log_entries: 活动流最大条目数（来自配置）
+            data: 序列化字典。
+            max_log_entries: 活动流最大条目数（来自配置）。
         """
         session = cls(
             user_id=data.get("user_id", ""),
@@ -394,21 +391,19 @@ class KFCSession:
         session.last_user_message_at = data.get("last_user_message_at")
         session.last_proactive_at = data.get("last_proactive_at")
         session.scheduled_proactive_at = data.get("scheduled_proactive_at")
-        session.scheduled_proactive_reason = data.get("scheduled_proactive_reason", "")
+        session.scheduled_proactive_reason = data.get(
+            "scheduled_proactive_reason", ""
+        )
         session.mental_log = MentalLog.from_list(
             data.get("mental_log", []),
             max_entries=max_log_entries,
         )
         session.total_interactions = int(data.get("total_interactions", 0))
-        # 持久化对话链
         session.chain_payloads = data.get("chain_payloads", [])
         session.chain_cutoff_ts = float(data.get("chain_cutoff_ts", 0.0))
-        # 近期记忆摘要
         session.history_summary = data.get("history_summary", "")
         session.last_compress_at = float(data.get("last_compress_at", 0.0))
         session.compress_round_count = int(data.get("compress_round_count", 0))
-        session.scene_state = SceneState.from_dict(data.get("scene_state", {}))
-        # 备忘录列表（每条都是独立 Memo 对象）
         session.memos = [
             Memo.from_dict(item)
             for item in data.get("memos", []) or []
@@ -418,88 +413,102 @@ class KFCSession:
 
 
 class KFCSessionStore:
-    """KFC 会话持久化存储。
+    """按 ``stream_id`` 索引的 KFC 会话存储。
 
-    使用 JSONStore 进行简单 JSON 文件持久化。
-    Session 按 stream_id 索引。
+    内存缓存 + ``JSONStore`` 落盘，并为每个流提供独立的 asyncio 锁。
     """
 
     def __init__(self, max_log_entries: int = 50) -> None:
+        """初始化存储。
+
+        Args:
+            max_log_entries: 反序列化会话时使用的活动流上限。
+        """
         self._sessions: dict[str, KFCSession] = {}
-        self._store_initialized = False
         self._locks: dict[str, asyncio.Lock] = {}
         self._max_log_entries = max_log_entries
+        self._json_store: Any = None
+        self._store_initialized = False
 
-    def _get_lock(self, stream_id: str) -> asyncio.Lock:
-        """获取指定 stream_id 的锁（惰性创建）。"""
-        if stream_id not in self._locks:
-            self._locks[stream_id] = asyncio.Lock()
-        return self._locks[stream_id]
+    # ── 并发控制 ──────────────────────────────────────────
 
     @asynccontextmanager
     async def lock(self, stream_id: str) -> AsyncIterator[None]:
-        """获取指定 stream_id 的互斥锁上下文。
+        """获取指定流的互斥锁上下文。
 
-        确保同一 stream 的 Session 读写串行化，
-        防止 Scheduler 回调与 execute() 并发读写同一 Session。
+        确保同一流的会话读写串行化，防止 Scheduler 回调与主循环竞态。
 
         Args:
-            stream_id: 流 ID
+            stream_id: 流 ID。
 
         Yields:
             None
         """
-        async with self._get_lock(stream_id):
+        if stream_id not in self._locks:
+            self._locks[stream_id] = asyncio.Lock()
+        async with self._locks[stream_id]:
             yield
 
-    async def _ensure_store(self) -> None:
-        """延迟初始化 JSONStore。"""
-        if self._store_initialized:
-            return
-        try:
-            from src.app.plugin_system.api.storage_api import JSONStore
+    def cleanup_inactive_locks(self) -> int:
+        """清理不在缓存中且未被持有的锁，返回清理数量。"""
+        stale = [
+            stream_id
+            for stream_id, lock in self._locks.items()
+            if stream_id not in self._sessions and not lock.locked()
+        ]
+        for stream_id in stale:
+            del self._locks[stream_id]
+        return len(stale)
 
-            self._json_store = JSONStore(
-                storage_dir="data/kokoro_flow_chatter/sessions"
-            )
-            self._store_initialized = True
-        except ImportError:
-            self._json_store = None
-            self._store_initialized = True
+    # ── 读写 ──────────────────────────────────────────────
 
     async def get_or_create(self, stream_id: str) -> KFCSession:
-        """获取或创建 Session。
+        """获取会话，不存在时创建新会话。
 
-        注意：此方法不持有 per-stream 锁。调用方应使用 ``async with store.lock(stream_id)``
-        包裹完整的读写周期以避免并发竞态。
+        注意：本方法不持有锁，调用方应用 ``async with store.lock(...)``
+        包裹完整的读-改-写周期。
         """
-        if stream_id in self._sessions:
-            return self._sessions[stream_id]
+        cached = self._sessions.get(stream_id)
+        if cached is not None:
+            return cached
 
-        await self._ensure_store()
+        loaded = await self._load_from_disk(stream_id)
+        if loaded is not None:
+            self._sessions[stream_id] = loaded
+            return loaded
 
-        # 尝试从持久化加载
-        if self._json_store is not None:
-            try:
-                data = await self._json_store.load(stream_id)
-                if data and isinstance(data, dict):
-                    session = KFCSession.from_dict(data, max_log_entries=self._max_log_entries)
-                    self._sessions[stream_id] = session
-                    return session
-            except Exception as e:
-                logger.warning(f"Session 加载失败 (stream={stream_id[:8]}): {e}")
-
-        # 创建新 Session
-        session = KFCSession(user_id="", stream_id=stream_id, platform="")
+        session = KFCSession(user_id="", stream_id=stream_id)
         session.mental_log = MentalLog(max_entries=self._max_log_entries)
         self._sessions[stream_id] = session
         return session
 
-    async def save(self, session: KFCSession) -> None:
-        """保存 Session 到持久化存储。
+    async def get(self, stream_id: str) -> KFCSession | None:
+        """获取会话，不存在时返回 ``None``（会写入内存缓存）。"""
+        cached = self._sessions.get(stream_id)
+        if cached is not None:
+            return cached
 
-        注意：此方法不持有 per-stream 锁。调用方应使用 ``async with store.lock(stream_id)``
-        包裹完整的读写周期以避免并发竞态。
+        loaded = await self._load_from_disk(stream_id)
+        if loaded is not None:
+            self._sessions[stream_id] = loaded
+        return loaded
+
+    async def peek(self, stream_id: str) -> KFCSession | None:
+        """读取会话但不写入内存缓存。
+
+        适用于只需查看持久化字段、不希望污染缓存的批量扫描场景
+        （如主动发起对磁盘会话的预约检查）。
+        """
+        cached = self._sessions.get(stream_id)
+        if cached is not None:
+            return cached
+        return await self._load_from_disk(stream_id)
+
+    async def save(self, session: KFCSession) -> None:
+        """保存会话到内存缓存与磁盘。
+
+        注意：本方法不持有锁，调用方应用 ``async with store.lock(...)``
+        包裹完整的读-改-写周期。
         """
         self._sessions[session.stream_id] = session
         await self._ensure_store()
@@ -507,130 +516,80 @@ class KFCSessionStore:
         if self._json_store is not None:
             try:
                 await self._json_store.save(session.stream_id, session.to_dict())
-                # 同步更新可读索引（stream_id → user_id + platform 的映射）
                 await self._update_index(session)
-            except Exception as e:
+            except Exception as error:
                 logger.warning(
-                    f"Session 持久化失败 (stream={session.stream_id[:8]}): {e}"
+                    f"会话持久化失败 (stream={session.stream_id[:8]}): {error}"
                 )
 
-        # 锁字典膨胀时定期清理不活跃的锁
-        if len(self._locks) > 100:
+        if len(self._locks) > _LOCK_CLEANUP_THRESHOLD:
             cleaned = self.cleanup_inactive_locks()
             if cleaned:
-                logger.debug(f"清理了 {cleaned} 个不活跃的锁")
-
-    async def get(self, stream_id: str) -> KFCSession | None:
-        """获取 Session（不创建）。"""
-        if stream_id in self._sessions:
-            return self._sessions[stream_id]
-
-        await self._ensure_store()
-        if self._json_store is not None:
-            try:
-                data = await self._json_store.load(stream_id)
-                if data and isinstance(data, dict):
-                    session = KFCSession.from_dict(data, max_log_entries=self._max_log_entries)
-                    self._sessions[stream_id] = session
-                    return session
-            except Exception as e:
-                logger.warning(f"Session 加载失败 (stream={stream_id[:8]}): {e}")
-        return None
-
-    async def peek(self, stream_id: str) -> KFCSession | None:
-        """从磁盘读取 Session 但不加入内存缓存。
-
-        适用于只需查看持久化字段、不希望副作用地污染内存缓存的场景。
-        若 session 已在内存中则直接返回（不重复加载）。
-
-        Args:
-            stream_id: 目标流 ID
-
-        Returns:
-            KFCSession 实例，或 None（文件不存在/解析失败）
-        """
-        if stream_id in self._sessions:
-            return self._sessions[stream_id]
-
-        await self._ensure_store()
-        if self._json_store is not None:
-            try:
-                data = await self._json_store.load(stream_id)
-                if data and isinstance(data, dict):
-                    return KFCSession.from_dict(data, max_log_entries=self._max_log_entries)
-            except Exception as e:
-                logger.warning(f"Session peek 失败 (stream={stream_id[:8]}): {e}")
-        return None
+                logger.debug(f"清理了 {cleaned} 个不活跃的会话锁")
 
     def get_all_cached(self) -> dict[str, KFCSession]:
-        """获取所有缓存中的 Session（不触发 IO）。"""
+        """返回所有内存缓存中的会话副本（不触发 IO）。"""
         return dict(self._sessions)
 
-    def cleanup_inactive_locks(self) -> int:
-        """清理不活跃 stream 的锁，释放内存。
-
-        移除不在缓存中且当前未被持有的锁。
-
-        Returns:
-            int: 被清理的锁数量
-        """
-        stale = [
-            sid for sid, lock in self._locks.items()
-            if sid not in self._sessions and not lock.locked()
-        ]
-        for sid in stale:
-            del self._locks[sid]
-        return len(stale)
-
     async def list_all_stream_ids(self) -> list[str]:
-        """列出所有已持久化的 stream_id。
-
-        从 JSON 存储中读取所有会话文件名，
-        用于在插件启动时预注册 VLM 跳过等批量操作。
-
-        Returns:
-            list[str]: 所有已知的 stream_id 列表
-        """
+        """列出所有已持久化的 ``stream_id``（跳过 ``_`` 开头的辅助文件）。"""
         await self._ensure_store()
-        if self._json_store is not None:
-            try:
-                all_ids = await self._json_store.list_all()
-                # 过滤掉非 stream_id 的辅助文件（如 _index）
-                return [sid for sid in all_ids if not sid.startswith("_")]
-            except Exception as e:
-                logger.warning(f"Session 列举失败: {e}")
-                return []
-        return []
+        if self._json_store is None:
+            return []
+        try:
+            all_ids = await self._json_store.list_all()
+        except Exception as error:
+            logger.warning(f"会话列举失败: {error}")
+            return []
+        return [sid for sid in all_ids if not sid.startswith("_")]
+
+    # ── 内部实现 ──────────────────────────────────────────
+
+    async def _ensure_store(self) -> None:
+        """延迟初始化 ``JSONStore``。"""
+        if self._store_initialized:
+            return
+        self._store_initialized = True
+        try:
+            from src.app.plugin_system.api.storage_api import JSONStore
+
+            self._json_store = JSONStore(storage_dir=_STORAGE_DIR)
+        except ImportError:
+            self._json_store = None
+
+    async def _load_from_disk(self, stream_id: str) -> KFCSession | None:
+        """从磁盘读取并反序列化会话；不存在或损坏时返回 ``None``。"""
+        await self._ensure_store()
+        if self._json_store is None:
+            return None
+        try:
+            data = await self._json_store.load(stream_id)
+        except Exception as error:
+            logger.warning(f"会话加载失败 (stream={stream_id[:8]}): {error}")
+            return None
+        if not data or not isinstance(data, dict):
+            return None
+        return KFCSession.from_dict(data, max_log_entries=self._max_log_entries)
 
     async def _update_index(self, session: KFCSession) -> None:
-        """更新 _index.json 索引文件（stream_id → 可读标识映射）。
-
-        每次 save() 后自动调用，让用户可通过 _index.json 对照文件名与 QQ 号。
-        """
-        import json as _json
-
+        """刷新可读索引文件，便于人工对照文件名与账号。"""
         if self._json_store is None:
             return
 
-        index_path = self._json_store.get_storage_dir() / "_index.json"
-
-        # 读取现有索引
+        index_path = self._json_store.get_storage_dir() / _INDEX_FILENAME
         try:
             raw = await asyncio.to_thread(index_path.read_bytes)
-            index: dict[str, dict[str, str]] = _json.loads(raw)
-        except (FileNotFoundError, _json.JSONDecodeError):
+            index: dict[str, dict[str, str]] = json.loads(raw)
+        except (FileNotFoundError, json.JSONDecodeError):
             index = {}
 
-        # 更新当前 session 的条目
-        entry: dict[str, str] = {
+        index[session.stream_id] = {
             "platform": session.platform,
             "user_id": session.user_id,
         }
-        index[session.stream_id] = entry
 
-        # 写回
         try:
-            data_bytes = _json.dumps(index, ensure_ascii=False, indent=2).encode("utf-8")
-            await asyncio.to_thread(index_path.write_bytes, data_bytes)
-        except Exception as e:
-            logger.debug(f"索引文件写入失败: {e}")
+            payload = json.dumps(index, ensure_ascii=False, indent=2).encode("utf-8")
+            await asyncio.to_thread(index_path.write_bytes, payload)
+        except Exception as error:
+            logger.debug(f"会话索引写入失败: {error}")

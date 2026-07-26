@@ -1,9 +1,11 @@
-"""KFC 原生多模态辅助模块。
+"""KFC 原生多模态支持。
 
-提供与 DFC 多模态相同语义的图片提取与 LLM 内容拼装能力。
-表情包仍交由框架 VLM 走文字描述路径，以利用其哈希缓存。
+原生多模态模式下，图片以原始数据直接进入 LLM payload，由主模型在对话
+上下文中理解——比框架 VLM 管线的"转述为文字"保留更多信息。
 
-模块保持纯函数形态，不依赖运行时单例，便于单测覆盖。
+表情包仍走 VLM 文字描述路径，以复用其哈希缓存，因此这里显式排除。
+
+本模块保持纯函数形态，不依赖运行时单例，便于单测覆盖。
 """
 
 from __future__ import annotations
@@ -12,69 +14,70 @@ from typing import Any
 
 from src.app.plugin_system.types import Content, Image, Text
 
+_IMAGE_MEDIA_TYPE = "image"
 
-def _extract_dict_list(raw: Any) -> list[dict[str, Any]] | None:
-    """将原始值转换为仅含 dict 元素的列表；非列表或空列表返回 None。"""
-    if isinstance(raw, list) and raw:
-        return [item for item in raw if isinstance(item, dict)]
-    return None
+
+def _extract_dict_items(raw: Any) -> list[dict[str, Any]]:
+    """把原始值转换为仅含 dict 元素的列表。"""
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
 
 
 def _read_raw_media(msg: Any) -> list[dict[str, Any]]:
-    """读取消息中尚未被剥离 base64 的原始 media 列表。
+    """读取消息中尚未被剥离原始数据的 media 列表。
 
-    按优先级依次检查三个候选位置：
-    1. ``msg.content["media"]`` — 要求至少一项含 ``data`` 字段（完整媒体）
-    2. ``msg.extra["media"]`` — 非空列表即可
-    3. ``msg.media`` 属性 — 非空列表即可
+    按优先级检查两个候选位置：
 
-    stream_manager 持久化时会剔除超大 ``data``，此处仅在 Chatter 运行期
-    内使用，因此能拿到完整字节。
+    1. ``msg.content["media"]``——要求至少一项含 ``data``（完整媒体）；
+    2. ``msg.extra["media"]``——非空即可。
+
+    流管理器在持久化时会剔除超大的 ``data`` 字段，但本函数仅在 Chatter
+    运行期内调用，因此能拿到完整字节。
     """
     content = msg.content
     if isinstance(content, dict):
-        items = _extract_dict_list(content.get("media"))
+        items = _extract_dict_items(content.get("media"))
         if items and any(item.get("data") for item in items):
             return items
 
     extra = msg.extra
     if isinstance(extra, dict):
-        items = _extract_dict_list(extra.get("media"))
+        items = _extract_dict_items(extra.get("media"))
         if items:
             return items
-
-    media = getattr(msg, "media", None)
-    if isinstance(media, list) and media:
-        return [item for item in media if isinstance(item, dict)]
 
     return []
 
 
 def get_image_media_list(msg: Any) -> list[dict[str, Any]]:
-    """从消息中提取仅包含 ``image`` 类型的媒体列表。
-
-    表情包继续走 VLM 文字描述（受益于哈希缓存），
-    因此这里显式过滤掉 ``emoji`` / ``voice`` 等非图片类型。
-    """
-    media = _read_raw_media(msg)
-    return [item for item in media if item.get("type") == "image" and item.get("data")]
-
-
-def extract_images_from_messages(
-    messages: list[Any],
-) -> list[dict[str, Any]]:
-    """按顺序从消息列表中提取全部图片。
+    """提取消息中的图片媒体项。
 
     Args:
-        messages: 待扫描的消息（可为未读消息或历史消息子集）
+        msg: 待检查的消息。
 
     Returns:
-        提取到的媒体字典列表，保持原始消息顺序
+        list[dict[str, Any]]: 含有效数据的 ``image`` 类型媒体项。
+    """
+    return [
+        item
+        for item in _read_raw_media(msg)
+        if item.get("type") == _IMAGE_MEDIA_TYPE and item.get("data")
+    ]
+
+
+def extract_images_from_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """按消息顺序提取全部图片。
+
+    Args:
+        messages: 待扫描的消息列表。
+
+    Returns:
+        list[dict[str, Any]]: 保持原始时序的图片媒体项列表。
     """
     items: list[dict[str, Any]] = []
     for msg in messages:
-        for media in get_image_media_list(msg):
-            items.append(media)
+        items.extend(get_image_media_list(msg))
     return items
 
 
@@ -82,16 +85,15 @@ def build_multimodal_content(
     text: str,
     media_items: list[dict[str, Any]],
 ) -> list[Content]:
-    """将文本与图片打包为 LLMPayload 可接受的 content 列表。
+    """把文本与图片打包为 payload 可接受的内容列表。
 
     Args:
-        text: 文本主体
-        media_items: 按消息时序排列的图片媒体字典列表
+        text: 文本主体。
+        media_items: 按时序排列的图片媒体项。
 
     Returns:
-        ``[Text(text), Image(data1), Image(data2), ...]`` 格式的内容列表
+        list[Content]: ``[Text, Image, Image, ...]`` 形式的内容列表。
     """
     content_list: list[Content] = [Text(text)]
-    for item in media_items:
-        content_list.append(Image(str(item["data"])))
+    content_list.extend(Image(str(item["data"])) for item in media_items)
     return content_list

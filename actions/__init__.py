@@ -1,19 +1,16 @@
-"""KFC 动作组件模块。
+"""KFC 专属动作。
 
-提供核心动作：
-- KFCReplyAction: 发送消息
-- DoNothingAction: 选择不回复
-- PassAndWaitAction: 完成当前动作后等待
-- KFCMemoAction: 写入或刷新一条带过期时间的私人备忘录
-- KFCMemoDeleteAction: 按 id 主动删除已不再需要的备忘录
+``kfc_reply`` / ``do_nothing`` / ``pass_and_wait`` 是控制动作——它们由
+执行层直接解释，``execute()`` 仅作为 schema 的形式入口存在；
+``kfc_memo`` / ``kfc_memo_delete`` / ``schedule_proactive`` 则是常规动作，
+执行体内含真实副作用。
 """
-
-from __future__ import annotations
 
 from .do_nothing import DoNothingAction
 from .memo import KFCMemoAction, KFCMemoDeleteAction
 from .pass_and_wait import PassAndWaitAction
 from .reply import KFCReplyAction
+from .schedule_proactive import ScheduleProactiveAction
 
 __all__ = [
     "DoNothingAction",
@@ -21,4 +18,5 @@ __all__ = [
     "KFCMemoDeleteAction",
     "KFCReplyAction",
     "PassAndWaitAction",
+    "ScheduleProactiveAction",
 ]

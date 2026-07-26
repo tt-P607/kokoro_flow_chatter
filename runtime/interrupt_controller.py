@@ -1,4 +1,12 @@
-"""KFC 打断控制运行时。"""
+"""KFC 可打断的 LLM 调用。
+
+生成期间若对方发来新消息，继续用过时的上下文把话说完会显得答非所问。
+本模块在后台轮询未读队列，一旦发现真实新消息就取消当前请求，交由主
+循环合并消息后重新发起。
+
+只有真实用户消息才能打断；KFC 自身的主动发起触发消息不应取消正在
+进行的输出，否则定时任务与正常回复撞车时会"吃掉"模型响应。
+"""
 
 from __future__ import annotations
 
@@ -6,16 +14,18 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.kernel.concurrency import get_task_manager
+from src.kernel.concurrency import get_task_manager, get_watchdog
 
+from ..protocol.response_normalizer import normalize_response
 from .unread_policy import filter_interrupt_messages
 
 if TYPE_CHECKING:
     from ..chatter import KokoroFlowChatter
     from ..config import KFCConfig
 
+logger = get_logger("kfc_interrupt")
 
-logger = get_logger("kfc_chatter")
+_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 async def send_interruptable_response(
@@ -26,17 +36,18 @@ async def send_interruptable_response(
 ) -> tuple[Any | None, list[Any]]:
     """以可打断方式发送 LLM 请求。
 
-    通过 ``send_target``（通常为 :class:`RequestView`）发送，
-    支持 transient payloads 场景下的打断检测。
+    Args:
+        chatter: 当前 chatter 实例。
+        send_target: 发送目标，通常是 ``RequestView``。
+        config: KFC 配置，提供轮询间隔。
+        known_unread_ids: 已纳入本轮上下文的消息 ID，不触发打断。
 
-    只有真实用户消息可以打断正在生成的 LLM 响应；KFC 内部主动触发消息
-    不应取消当前输出，否则定时任务与正常回复撞车时会"卡掉"模型返回。
+    Returns:
+        tuple: 正常完成时为 ``(响应, [])``；被打断时为 ``(None, 打断消息列表)``。
     """
 
-    async def _llm_work() -> Any:
-        from src.kernel.concurrency import get_watchdog
-        from ..protocol.response_normalizer import normalize_response
-
+    async def llm_work() -> Any:
+        """执行实际的 LLM 调用，并在首尾喂看门狗。"""
         watchdog = get_watchdog()
         watchdog.feed_dog(chatter.stream_id)
         result = await send_target.send(auto_append_response=True, stream=False)
@@ -44,15 +55,14 @@ async def send_interruptable_response(
         normalize_response(result)
         return result
 
-    tm = get_task_manager()
-    task_handle = tm.create_task(
-        _llm_work(),
+    task_handle = get_task_manager().create_task(
+        llm_work(),
         name=f"kfc_llm_{chatter.stream_id[:8]}",
     )
-    if task_handle.task is None:  # pragma: no cover
+    if task_handle.task is None:  # pragma: no cover - 任务管理器契约保证非空
         raise RuntimeError("task_manager 未返回有效的 Task")
-    llm_task: asyncio.Task[Any] = task_handle.task
 
+    llm_task: asyncio.Task[Any] = task_handle.task
     poll_interval = config.buffer.interrupt_poll_seconds
 
     try:
@@ -61,24 +71,18 @@ async def send_interruptable_response(
             if llm_task.done():
                 break
 
-            _, current_msgs = await chatter.fetch_unreads(
-                time_format="%Y-%m-%d %H:%M:%S"
-            )
-            interrupt_msgs = filter_interrupt_messages(
-                current_msgs,
-                known_unread_ids,
-            )
-            if interrupt_msgs:
-                llm_task.cancel()
-                try:
-                    await llm_task
-                except asyncio.CancelledError:
-                    pass
-                logger.info(
-                    f"[打断] LLM 被取消，检测到 {len(interrupt_msgs)} 条新消息"
-                )
-                return None, interrupt_msgs
+            _, current_msgs = await chatter.fetch_unreads(time_format=_TIME_FORMAT)
+            interrupt_msgs = filter_interrupt_messages(current_msgs, known_unread_ids)
+            if not interrupt_msgs:
+                continue
 
+            llm_task.cancel()
+            try:
+                await llm_task
+            except asyncio.CancelledError:
+                pass
+            logger.info(f"LLM 被取消，检测到 {len(interrupt_msgs)} 条新消息")
+            return None, interrupt_msgs
     except asyncio.CancelledError:
         llm_task.cancel()
         raise

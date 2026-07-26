@@ -1,7 +1,12 @@
-"""KFC LLM 请求发送视图。
+"""KFC 一次性发送视图。
 
-发送视图用于在本轮 LLM 调用中临时加入 transient payload，
-但不把这些 payload 写入长期 response 链，避免直接 append/pop 修改主链。
+主循环需要在某轮请求中临时加入 payload（如第三方注入的附加上下文），
+但这些内容不应污染长期维持的 ``response`` 链。``RequestView`` 以视图
+方式承载「主链 + 临时 payload」，发送后只把持久部分回写主链。
+
+之所以不能简单地 append/pop：框架的 context manager 会在发送时向 USER
+payload 注入 system_reminder 前缀，按索引切掉临时项并不能还原被修改的
+持久 payload，必须用发送前的快照覆盖回去。
 """
 
 from __future__ import annotations
@@ -18,22 +23,44 @@ class RequestView:
     """一次 LLM 调用的临时发送视图。"""
 
     source: Any
-    payloads: list[LLMPayload] = field(default_factory=list)
+    """被视图包装的原始 response / request 对象。"""
 
-    async def send(self, *, auto_append_response: bool = True, stream: bool = False) -> Any:
-        """用视图 payloads 发送请求，并将非 transient 结果回写到 source。"""
-        source_payloads = list(getattr(self.source, "payloads", []))
+    payloads: list[LLMPayload] = field(default_factory=list)
+    """本次实际发送的完整 payload 列表（主链 + 临时项）。"""
+
+    async def send(
+        self,
+        *,
+        auto_append_response: bool = True,
+        stream: bool = False,
+    ) -> Any:
+        """发送请求并把持久结果回写 source。
+
+        Args:
+            auto_append_response: 是否自动把模型输出追加进上下文。
+            stream: 是否使用流式响应。
+
+        Returns:
+            Any: source 支持回写时返回 source 本身，否则返回新结果对象。
+        """
+        source_payloads = list(self.source.payloads)
         transient_count = max(len(self.payloads) - len(source_payloads), 0)
-        upper = getattr(self.source, "_upper", self.source)
-        req = LLMRequest(
+
+        # LLMResponse 把请求元信息挂在 _upper 上；source 若本身就是
+        # LLMRequest，则元信息直接位于自身。
+        upper = self.source._upper if hasattr(self.source, "_upper") else self.source
+        request = LLMRequest(
             self.source.model_set,
-            request_name=getattr(upper, "request_name", ""),
-            meta_data=dict(getattr(upper, "meta_data", {})),
-            context_manager=getattr(self.source, "context_manager", None),
+            request_name=upper.request_name,
+            meta_data=dict(upper.meta_data),
+            context_manager=self.source.context_manager,
         )
-        req.payloads = list(self.payloads)
-        result = await req.send(auto_append_response=auto_append_response, stream=stream)
-        if not getattr(result, "_consumed", False):
+        request.payloads = list(self.payloads)
+
+        result = await request.send(
+            auto_append_response=auto_append_response, stream=stream
+        )
+        if not result._consumed:
             await result
 
         persistent_payloads = _without_transient_payloads(
@@ -52,15 +79,28 @@ class RequestView:
         self.source.call_list = result.call_list
         self.source.tool_call_compat = result.tool_call_compat
         self.source.payloads = persistent_payloads
-        if hasattr(self.source, "_consumed"):
-            self.source._consumed = getattr(result, "_consumed", True)
-        if hasattr(self.source, "_appended_to_context"):
-            self.source._appended_to_context = getattr(
-                result,
-                "_appended_to_context",
-                auto_append_response,
-            )
+        self.source._consumed = result._consumed
+        self.source._appended_to_context = result._appended_to_context
         return self.source
+
+
+def build_request_view(
+    response: Any,
+    transient_payloads: list[LLMPayload] | None = None,
+) -> RequestView:
+    """基于 response 构造一次性发送视图。
+
+    Args:
+        response: 主链对象。
+        transient_payloads: 仅本次发送生效的临时 payload。
+
+    Returns:
+        RequestView: 发送视图。
+    """
+    payloads = list(response.payloads)
+    if transient_payloads:
+        payloads.extend(transient_payloads)
+    return RequestView(source=response, payloads=payloads)
 
 
 def _without_transient_payloads(
@@ -69,11 +109,15 @@ def _without_transient_payloads(
     source_payloads: list[LLMPayload],
     transient_count: int,
 ) -> list[LLMPayload]:
-    """移除发送视图追加的 transient payload 和其触发的 reminder 前缀。
+    """剔除临时 payload，并还原被 reminder 修改过的持久 USER payload。
 
-    ``LLMContextManager`` 会在发送时把 system_reminder 前缀注入 USER payload，
-    因此仅按索引切掉 extra payload 不够；还必须用发送前的 source payload
-    覆盖同位置的持久 payload，避免 actor/dynamic reminder 被回写到主链。
+    Args:
+        payloads: 发送后的完整 payload 列表。
+        source_payloads: 发送前的主链快照。
+        transient_count: 本次追加的临时 payload 数量。
+
+    Returns:
+        list[LLMPayload]: 应回写主链的持久 payload 列表。
     """
     base_count = len(source_payloads)
     if transient_count <= 0:
@@ -90,11 +134,3 @@ def _without_transient_payloads(
         if source_payload.role == ROLE.USER:
             persistent_payloads[index] = source_payload
     return persistent_payloads
-
-
-def build_request_view(response: Any, transient_payloads: list[LLMPayload] | None = None) -> RequestView:
-    """基于 response 构造只用于发送的一次性视图。"""
-    payloads = list(getattr(response, "payloads", []))
-    if transient_payloads:
-        payloads.extend(transient_payloads)
-    return RequestView(source=response, payloads=payloads)

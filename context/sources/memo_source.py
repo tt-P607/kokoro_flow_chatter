@@ -1,27 +1,23 @@
 """KFC 备忘录上下文 source。
 
-把 ``KFCSession.memos`` 渲染成一个 turn 级 ContextContribution，
-由 ContextRenderer 自动注入到本轮的 extra_payload（临时 USER payload，
-发送后撤销，不进入持久化对话链）。
-
-定位：让备忘录在每次发请求时都出现在用户提示词末尾，模型可以
-"看到自己脑门上贴着的便签"，但不污染前缀缓存基础。
+把 ``KFCSession.memos`` 渲染成一条 turn 级上下文贡献，注入本轮用户
+提示词末尾——让模型"看到自己脑门上贴的便签"，同时不污染系统前缀缓存，
+也不进入持久化对话链。
 """
 
 from __future__ import annotations
 
 import datetime
 import time
-from typing import TYPE_CHECKING
 
 from ...models import Memo
 from ..types import ContextContribution
 
-if TYPE_CHECKING:
-    pass
+_MEMO_SOURCE = "kfc.memo"
 
+_MEMO_PRIORITY = 80
+"""高于一般 notice，使备忘录紧贴提示词末尾。"""
 
-# 备忘录引导段（写死，不暴露为配置）
 _MEMO_GUIDANCE = (
     "## 关于这些备忘\n"
     "这些是你给自己留下的备忘录，记着接下来一段时间需要意识到的事。"
@@ -37,54 +33,45 @@ _MEMO_GUIDANCE = (
 )
 
 
-def _format_datetime(ts: float) -> str:
-    """把时间戳格式化为人类可读字符串（年-月-日 时:分）。"""
+def _format_datetime(timestamp: float) -> str:
+    """把时间戳格式化为「年-月-日 时:分」。"""
     try:
-        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        return datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
     except (OSError, ValueError, OverflowError):
         return "未知时间"
 
 
-def _format_remaining_text(memo: Memo, now: float) -> str:
-    """把备忘剩余时间格式化为人类可读文本。
+def _format_remaining(memo: Memo, now: float) -> str:
+    """把剩余时间格式化为人类可读文本。
 
-    粒度按小时取整（短于 1 小时显示 "剩余不到 1 小时"），
-    避免每秒变化导致 prompt 不断变动、影响调试可读性。
+    按小时取整，避免每次渲染都产生细微差异而干扰调试与缓存。
     """
-    remaining_sec = memo.remaining_seconds(now)
-    if remaining_sec <= 0:
+    remaining_seconds = memo.remaining_seconds(now)
+    if remaining_seconds <= 0:
         return "已过期"
-    remaining_hours = remaining_sec / 3600.0
+
+    remaining_hours = remaining_seconds / 3600.0
     if remaining_hours < 1:
         return "剩余不到 1 小时"
-    if remaining_hours < 24:
+    if remaining_hours < 48:
         return f"剩余约 {int(remaining_hours)} 小时"
-    days = remaining_hours / 24.0
-    if days < 2:
-        return f"剩余约 {int(days * 24)} 小时"
-    return f"剩余约 {int(days)} 天"
+    return f"剩余约 {int(remaining_hours / 24)} 天"
 
 
-def _format_memo_block(memos: list[Memo], now: float | None = None) -> str:
-    """把备忘列表渲染成完整文本块（含引导段 + 条目列表）。
+def _format_memo_block(memos: list[Memo], now: float) -> str:
+    """渲染完整备忘录文本块；无有效备忘时返回空串。
 
-    无有效备忘时返回空串。条目格式把关键字段拆成独立行，
-    在窄面板/小宽度终端中也能保持可读，同时方便 LLM 抓取字段。
+    条目字段拆成独立行，在窄面板中也能保持可读，同时便于模型抓取 id。
     """
-    current = now if now is not None else time.time()
-    valid_memos = [memo for memo in memos if not memo.is_expired(current)]
+    valid_memos = [memo for memo in memos if not memo.is_expired(now)]
     if not valid_memos:
         return ""
 
-    # 按 created_at 升序展示（先记的在前），让模型读起来时序自然
-    sorted_memos = sorted(valid_memos, key=lambda memo: memo.created_at)
-
     lines: list[str] = ["## 我的备忘录", _MEMO_GUIDANCE, "", "### 当前条目"]
-    for index, memo in enumerate(sorted_memos, start=1):
-        created_str = _format_datetime(memo.created_at)
-        expires_str = _format_datetime(memo.expires_at)
-        remaining_str = _format_remaining_text(memo, current)
-
+    # 按创建时间升序展示，让模型读到的时序自然
+    for index, memo in enumerate(
+        sorted(valid_memos, key=lambda item: item.created_at), start=1
+    ):
         entry_lines = [
             f"#{index}",
             f"- id: {memo.memo_id}",
@@ -92,11 +79,10 @@ def _format_memo_block(memos: list[Memo], now: float | None = None) -> str:
         ]
         if memo.intent.strip():
             entry_lines.append(f"- 动机: {memo.intent.strip()}")
-        entry_lines.extend(
-            [
-                f"- 创建时间: {created_str}",
-                f"- 过期时间: {expires_str}（{remaining_str}）",
-            ]
+        entry_lines.append(f"- 创建时间: {_format_datetime(memo.created_at)}")
+        entry_lines.append(
+            f"- 过期时间: {_format_datetime(memo.expires_at)}"
+            f"（{_format_remaining(memo, now)}）"
         )
         lines.append("\n".join(entry_lines))
 
@@ -104,18 +90,20 @@ def _format_memo_block(memos: list[Memo], now: float | None = None) -> str:
 
 
 def build_memo_contribution(memos: list[Memo]) -> ContextContribution | None:
-    """把备忘列表打包为一个 turn 级 ContextContribution。
+    """把备忘列表打包为一条 turn 级上下文贡献。
 
-    返回值为 None 时表示无内容可注入（无有效备忘）。
+    Args:
+        memos: 会话中的全部备忘。
+
+    Returns:
+        ContextContribution | None: 渲染结果；无有效备忘时返回 ``None``。
     """
-    text = _format_memo_block(memos)
+    text = _format_memo_block(memos, time.time())
     if not text:
         return None
     return ContextContribution(
-        source="kfc.memo",
+        source=_MEMO_SOURCE,
         owner="notice",
-        scope="turn",
-        priority=80,  # 高于一般 notice，紧贴最末尾
-        ttl_turns=1,
+        priority=_MEMO_PRIORITY,
         content=text,
     )

@@ -1,18 +1,14 @@
-"""KFC 备忘录动作。
+"""KFC 私人备忘录动作。
 
-包含两个工具：
-- ``kfc_memo``：写入或刷新一条带过期时间的私人备忘录。
-- ``kfc_memo_delete``：按 id 主动删除已不再需要的备忘录。
+提供 ``kfc_memo``（写入或刷新）与 ``kfc_memo_delete``（按 id 删除）
+两个工具。
 
-备忘录定位：LLM 显式标记的、带过期时间的中短期关键事项，
-覆盖"接下来一段时间需要明确意识到的事"这一语义层。
-不是长期记忆（那是 history_summary 的职责）；
-不是自动事件流（那是 mental_log 的职责）。
+备忘录定位为 LLM 显式标记的中短期关键事项，覆盖"接下来一段时间需要
+明确意识到的事"——既不是长期记忆（那是 ``history_summary`` 的职责），
+也不是自动事件流（那是 ``mental_log`` 的职责）。
 
-数据落地：直接写入 ``KFCSession.memos`` 字段，跟随 session 一起
-持久化到 ``data/kokoro_flow_chatter/sessions/<stream_id>.json``。
-渲染：作为 turn 级 ContextContribution 注入到用户提示词末尾，
-不进入持久化对话链，不破坏 LLM provider 的前缀缓存。
+数据随会话一起持久化；渲染时作为 turn 级上下文注入用户提示词末尾，
+不进入对话链，因而不影响 provider 的前缀缓存。
 """
 
 from __future__ import annotations
@@ -34,46 +30,18 @@ from ..models import (
 )
 
 if TYPE_CHECKING:
-    from ..session import KFCSession, KFCSessionStore
+    from ..session import KFCSessionStore
 
-logger = get_logger("kfc_memo_action")
+logger = get_logger("kfc_memo")
 
+_SECONDS_PER_HOUR = 3600.0
 
-# ── 私有辅助：访问 session_store ─────────────────────────
-
-
-def _resolve_session_store(plugin_instance: object) -> "KFCSessionStore | None":
-    """从 plugin 实例上取出 KFCSessionStore。
-
-    访问 ``plugin._session_store`` 属性；不可用时返回 None。
-    """
-    from ..plugin import KFCPlugin
-
-    if isinstance(plugin_instance, KFCPlugin):
-        return plugin_instance._session_store  # type: ignore[attr-defined]
-    return None
-
-
-async def _load_session(
-    plugin_instance: object,
-    stream_id: str,
-) -> "KFCSession | None":
-    """读取或创建指定流的 KFCSession（未持有锁）。"""
-    store = _resolve_session_store(plugin_instance)
-    if store is None or not stream_id:
-        return None
-    return await store.get_or_create(stream_id)
-
-
-# ── 写入工具 ─────────────────────────────────────────────
-
-
-_KFC_MEMO_DESCRIPTION = (
+_MEMO_DESCRIPTION = (
     "记录一条带过期时间的私人备忘录。"
     "备忘条目会自动渲染到提示词末尾，让你保持对它的意识，"
     "但不需要时刻提起或反复念叨——只在恰当的时机自然地用上。\n\n"
-    f"`expire_hours` 范围：{MEMO_MIN_EXPIRE_HOURS:g}~{MEMO_MAX_EXPIRE_HOURS:g}（"
-    f"{MEMO_MIN_EXPIRE_HOURS:g} 小时至 {int(MEMO_MAX_EXPIRE_HOURS / 24)} 天）；"
+    f"`expire_hours` 范围：{MEMO_MIN_EXPIRE_HOURS:g}~{MEMO_MAX_EXPIRE_HOURS:g}"
+    f"（{MEMO_MIN_EXPIRE_HOURS:g} 小时至 {int(MEMO_MAX_EXPIRE_HOURS / 24)} 天）；"
     f"超出会自动夹到边界。默认 {MEMO_DEFAULT_EXPIRE_HOURS:g} 小时。\n"
     f"同时最多保留 {MEMO_MAX_ENTRIES} 条；超过会自动淘汰创建最早的。\n"
     "已有 content 完全相同的备忘会自动刷新过期时间，不会重复创建。\n\n"
@@ -88,13 +56,29 @@ _KFC_MEMO_DESCRIPTION = (
     "过期时间只是兜底，不要依赖它。"
 )
 
+_MEMO_DELETE_DESCRIPTION = (
+    "删除一条或多条已不再需要的备忘录。\n"
+    "**典型场景：你看到备忘录里某条事情你刚刚已经做了/兑现了/不再相关了，"
+    "就主动调用此工具删掉它，避免脑门便签和实际状态对不上。**\n"
+    "`memo_ids`：从备忘录显示中读取的 id 列表（每条备忘渲染时都会显示其 id）。"
+)
+
+
+def _resolve_session_store(plugin_instance: object) -> KFCSessionStore | None:
+    """从插件实例取出会话存储；上下文不可用时返回 ``None``。"""
+    from ..plugin import KFCPlugin
+
+    if isinstance(plugin_instance, KFCPlugin):
+        return plugin_instance.session_store
+    return None
+
 
 class KFCMemoAction(BaseAction):
     """写入或刷新一条私人备忘录。"""
 
     name: str = "kfc_memo"
     associated_types: list[str] = ["text"]
-    description: str = _KFC_MEMO_DESCRIPTION
+    description: str = _MEMO_DESCRIPTION
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 
     async def execute(
@@ -119,34 +103,37 @@ class KFCMemoAction(BaseAction):
             "此刻你想记下这条备忘的真实想法（可留空）。仅用于审计，不参与渲染。",
         ] = "",
     ) -> tuple[bool, str]:
-        """写入或刷新一条备忘录。"""
+        """写入或刷新一条备忘录。
+
+        Args:
+            content: 备忘正文。
+            intent: 记录动机。
+            expire_hours: 存活时长（小时）。
+            reason: 审计用的调用理由。
+
+        Returns:
+            tuple: ``(是否成功, 回执描述)``。
+        """
         _ = reason
-        normalized_content = (content or "").strip()
+        normalized_content = content.strip()
         if not normalized_content:
             return False, "content 不能为空"
 
-        normalized_intent = (intent or "").strip()
-        clamped_hours = clamp_expire_hours(expire_hours)
-        if abs(clamped_hours - float(expire_hours or 0.0)) > 1e-6:
-            logger.debug(
-                f"[KFC-Memo] expire_hours 被夹到 {clamped_hours}（"
-                f"原值 {expire_hours}）"
-            )
+        store = _resolve_session_store(self.plugin)
+        if store is None:
+            logger.warning("无法访问会话存储，备忘写入失败")
+            return False, "插件未就绪，无法写入备忘"
 
+        clamped_hours = clamp_expire_hours(expire_hours)
         now = time.time()
         new_memo = Memo(
             content=normalized_content,
-            intent=normalized_intent,
+            intent=intent.strip(),
             created_at=now,
-            expires_at=now + clamped_hours * 3600.0,
+            expires_at=now + clamped_hours * _SECONDS_PER_HOUR,
         )
 
         stream_id = self.chat_stream.stream_id if self.chat_stream else ""
-        store = _resolve_session_store(self.plugin)
-        if store is None:
-            logger.warning("[KFC-Memo] 无法访问 session_store，写入失败")
-            return False, "插件未就绪，无法写入备忘"
-
         async with store.lock(stream_id):
             session = await store.get_or_create(stream_id)
             saved_memo, is_new = session.upsert_memo(new_memo)
@@ -155,7 +142,7 @@ class KFCMemoAction(BaseAction):
 
         action_word = "已记下" if is_new else "已刷新"
         logger.info(
-            f"[KFC-Memo] {action_word} 备忘 id={saved_memo.memo_id}，"
+            f"{action_word}备忘 id={saved_memo.memo_id}，"
             f"过期={clamped_hours:g}h，content={saved_memo.content[:40]}"
         )
         return True, (
@@ -164,23 +151,12 @@ class KFCMemoAction(BaseAction):
         )
 
 
-# ── 删除工具 ─────────────────────────────────────────────
-
-
-_KFC_MEMO_DELETE_DESCRIPTION = (
-    "删除一条或多条已不再需要的备忘录。\n"
-    "**典型场景：你看到备忘录里某条事情你刚刚已经做了/兑现了/不再相关了，"
-    "就主动调用此工具删掉它，避免脑门便签和实际状态对不上。**\n"
-    "`memo_ids`：从备忘录显示中读取的 id 列表（每条备忘渲染时都会显示其 id）。"
-)
-
-
 class KFCMemoDeleteAction(BaseAction):
     """按 id 删除一条或多条备忘录。"""
 
     name: str = "kfc_memo_delete"
     associated_types: list[str] = ["text"]
-    description: str = _KFC_MEMO_DELETE_DESCRIPTION
+    description: str = _MEMO_DELETE_DESCRIPTION
     chatter_allow: list[str] = ["kokoro_flow_chatter"]
 
     async def execute(
@@ -194,26 +170,33 @@ class KFCMemoDeleteAction(BaseAction):
             "此刻删除这些备忘的真实想法（可留空）。仅用于审计，不参与渲染。",
         ] = "",
     ) -> tuple[bool, str]:
-        """删除指定 id 的备忘。"""
+        """删除指定 id 的备忘。
+
+        Args:
+            memo_ids: 待删除的备忘 id 列表。
+            reason: 审计用的调用理由。
+
+        Returns:
+            tuple: ``(是否成功, 回执描述)``。
+        """
         _ = reason
         if not memo_ids:
             return False, "memo_ids 不能为空"
 
-        # 兼容 LLM 偶尔传单字符串
+        # 模型偶尔会传单个字符串而非列表
         if isinstance(memo_ids, str):
-            target_ids = [memo_ids.strip()]
+            target_ids = [memo_ids.strip()] if memo_ids.strip() else []
         else:
             target_ids = [str(item).strip() for item in memo_ids if str(item).strip()]
-
         if not target_ids:
             return False, "memo_ids 解析后为空"
 
-        stream_id = self.chat_stream.stream_id if self.chat_stream else ""
         store = _resolve_session_store(self.plugin)
         if store is None:
-            logger.warning("[KFC-Memo] 无法访问 session_store，删除失败")
+            logger.warning("无法访问会话存储，备忘删除失败")
             return False, "插件未就绪，无法删除备忘"
 
+        stream_id = self.chat_stream.stream_id if self.chat_stream else ""
         async with store.lock(stream_id):
             session = await store.get_or_create(stream_id)
             deleted = session.delete_memos(target_ids)
@@ -222,13 +205,10 @@ class KFCMemoDeleteAction(BaseAction):
             await store.save(session)
 
         if not deleted:
-            logger.debug(
-                f"[KFC-Memo] 未找到匹配的备忘 ids={target_ids}"
-            )
+            logger.debug(f"未找到匹配的备忘 ids={target_ids}")
             return True, f"未找到匹配的备忘（请求 ids={target_ids}）"
 
         logger.info(
-            f"[KFC-Memo] 删除了 {len(deleted)} 条备忘 ids="
-            f"{[m.memo_id for m in deleted]}"
+            f"删除了 {len(deleted)} 条备忘 ids={[memo.memo_id for memo in deleted]}"
         )
         return True, f"已删除 {len(deleted)} 条备忘"

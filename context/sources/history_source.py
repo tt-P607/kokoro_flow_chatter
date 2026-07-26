@@ -1,181 +1,241 @@
-"""KFC 历史上下文 source 辅助。"""
+"""KFC 历史上下文 source。
+
+负责把聊天记录、心理活动流与存档对话链渲染成上下文文本／payload。
+核心产物是 ``build_fused_narrative()``——把"说了什么"和"当时在想什么"
+按时间线交织成统一叙事，这是 KFC 与普通聊天器的关键差异。
+"""
 
 from __future__ import annotations
 
 import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
 from ...domain.chain_entry import ChainEntry
 from ...models import KFCEventType
 
-# mental_log 回溯的对话消息条数：取最近 N 条消息的时间戳作为剪切点，
-# 使 mental_log 中的思考记录仅覆盖近期对话窗口。
+if TYPE_CHECKING:
+    from src.app.plugin_system.types import ChatStream, Message
+
+    from ...mental_log import MentalLog
+
 _MENTAL_LOG_LOOKBACK = 7
+"""心理活动流的回溯窗口：取最近 N 条消息的时间戳为剪切点，
+使内心独白只覆盖近期对话，避免久远的想法混入叙事。"""
+
+_BOT_ACTION_MESSAGE_PREFIX = "action_kfc_reply"
+"""KFC 自身发出的消息 ID 前缀，用于在 ``sender_id`` 缺失时识别 bot 消息。"""
+
+_NARRATIVE_HEADER = "以下为融合了聊天记录与你内心活动的时间线："
+
+_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _resolve_partner_name(chat_stream: ChatStream) -> str:
+    """解析当前私聊对象的展示名。
+
+    ``ChatStream.stream_name`` 在私聊场景下即为对方昵称；未设置时回退
+    为中性称呼，避免提示词里出现空字符串。
+    """
+    return chat_stream.stream_name or "对方"
+
+
+def _format_timestamp(timestamp: float) -> str | None:
+    """格式化时间戳；越界或非法时返回 ``None``。"""
+    try:
+        return datetime.datetime.fromtimestamp(timestamp).strftime(_TIME_FORMAT)
+    except (OSError, ValueError, OverflowError):
+        return None
 
 
 def build_history_summary_payload(
-    chat_stream: Any,
+    chat_stream: ChatStream,
     history_summary: str,
 ) -> LLMPayload | None:
-    """将 session.history_summary 渲染为 SYSTEM payload。"""
+    """把近期记忆摘要渲染为 payload；摘要为空时返回 ``None``。"""
     summary = history_summary.strip()
     if not summary:
         return None
-
-    user_name = (
-        getattr(chat_stream, "partner_name", None)
-        or getattr(chat_stream, "stream_name", None)
-        or "对方"
-    )
     return LLMPayload(
         ROLE.SYSTEM,
-        Text(f"【你对{user_name}的近期记忆】\n{summary}"),
+        Text(f"【你对{_resolve_partner_name(chat_stream)}的近期记忆】\n{summary}"),
     )
 
 
 def build_current_time_payload(
     now: datetime.datetime | None = None,
 ) -> LLMPayload:
-    """在动态 USER 上下文中渲染当前时间 payload。"""
+    """渲染当前时间 payload，作为无历史时的兜底上下文。"""
     current = now or datetime.datetime.now()
     return LLMPayload(
         ROLE.USER,
-        Text(f"当前时间：{current.strftime('%Y-%m-%d %H:%M')}")
+        Text(f"当前时间：{current.strftime('%Y-%m-%d %H:%M')}"),
     )
 
 
-def build_channel_payload(chat_stream: Any) -> LLMPayload:
-    """在动态 USER 上下文中渲染平台与通道参数。"""
-    platform = str(getattr(chat_stream, "platform", "") or "unknown")
-    chat_type = str(getattr(chat_stream, "chat_type", "") or "unknown")
-    bot_id = str(getattr(chat_stream, "bot_id", "") or "")
-    bot_nickname = str(getattr(chat_stream, "bot_nickname", "") or "")
-    
-    stream_name = str(getattr(chat_stream, "stream_name", "") or "")
-    partner_name = str(getattr(chat_stream, "partner_name", "") or "")
-    
-    target_name = partner_name or stream_name or "对方"
-    
+def build_channel_payload(chat_stream: ChatStream) -> LLMPayload:
+    """渲染当前通道参数 payload。
+
+    明确告知模型平台、聊天类型与对话对象，同时声明这些只是通道参数，
+    抑制其据此脑补物理场景。
+    """
+    platform = chat_stream.platform or "unknown"
+    chat_type = str(chat_stream.chat_type or "unknown")
+    bot_id = chat_stream.bot_id or ""
+    bot_nickname = chat_stream.bot_nickname or ""
+    target_name = _resolve_partner_name(chat_stream)
+
     lines = [
         "[当前通道参数]",
         f"聊天平台：{platform}",
         f"聊天类型：{chat_type}",
     ]
     if bot_nickname or bot_id:
-        lines.append(f"你的通道身份：昵称 {bot_nickname or '未知'}，ID {bot_id or '未知'}")
-        
+        lines.append(
+            f"你的通道身份：昵称 {bot_nickname or '未知'}，ID {bot_id or '未知'}"
+        )
     lines.append(f"当前私聊对象：{target_name}")
-        
-    lines.extend(
-        [
-            "- 上述平台/聊天类型/ID 只是通道参数。除非有明确证据，否则不要自行脑补手机、屏幕、房间等物理场景细节。",
-            "- 进行角色扮演时，应优先依据双方关系、语境和时间来组织描写。",
-            f"- 当前是一对一私聊，正在与你对话的是你与{target_name}。",
-        ]
-    )
+    lines.append(f"- 当前是一对一私聊，正在与你对话的是{target_name}。")
     return LLMPayload(ROLE.USER, Text("\n".join(lines)))
 
 
 def restore_chain_payloads(
     serialized_chain_payloads: list[dict[str, Any]],
 ) -> list[LLMPayload]:
-    """从序列化的 USER/ASSISTANT pair 恢复可读历史 payload。
+    """从存档对话链还原可读历史 payload。
 
-    ``chain_payloads`` 中的 ``tool_calls`` 只作为审计/调试数据持久化，
-    不再还原为 ``ASSISTANT(tool_calls) -> TOOL_RESULT -> ASSISTANT(text)``。
-    原还原方式会把 ``kfc_reply.content`` 暴露在 tool call 参数中，同时又把
-    同一回复作为 assistant 文本放入上下文，造成模型输入层面的重复。
+    存档中的 ``tool_calls`` 仅作审计数据保留，不再还原成
+    ``ASSISTANT(tool_calls) → TOOL_RESULT → ASSISTANT(text)`` 三段式——
+    那样会让同一条回复既出现在工具参数里、又出现在文本里，造成重复输入。
+    运行期未完成的工具链由 ``response.payloads`` 自行维持。
 
-    运行期尚未完成的 tool-call 链仍由 ``response.payloads`` 保持；跨 execute
-    重载的历史链只需要保留用户可读对话文本，动作细节由 ``mental_log`` 提供。
+    Args:
+        serialized_chain_payloads: 存档中的链条目。
+
+    Returns:
+        list[LLMPayload]: 还原后的 USER / ASSISTANT payload 序列，
+        且保证首条为 USER（孤立的开头 ASSISTANT 会被丢弃）。
     """
-    entries: list[ChainEntry] = []
+    payloads: list[LLMPayload] = []
     for raw in serialized_chain_payloads:
         entry = ChainEntry.from_dict(raw)
-        if entry is not None:
-            entries.append(entry)
-
-    payloads: list[LLMPayload] = []
-    for entry in entries:
-        if entry.is_user:
-            payloads.append(LLMPayload(ROLE.USER, Text(entry.text)))
+        if entry is None:
             continue
-        payloads.append(LLMPayload(ROLE.ASSISTANT, Text(entry.text)))
+        role = ROLE.USER if entry.is_user else ROLE.ASSISTANT
+        payloads.append(LLMPayload(role, Text(entry.text)))
 
     while payloads and payloads[0].role == ROLE.ASSISTANT:
         payloads.pop(0)
     return payloads
 
 
-def build_fused_narrative(
-    chat_stream: Any,
-    mental_log: Any,
-    before_ts: float | None = None,
-) -> str:
-    """构建聊天历史与内心独白的融合叙事。"""
-    msgs: list[Any] = list(chat_stream.context.history_messages)
-    bot_id = str(chat_stream.bot_id or "")
+def _is_bot_message(message: Message, bot_id: str) -> bool:
+    """判断消息是否由 bot 自己发出。"""
+    if bot_id and message.sender_id == bot_id:
+        return True
+    return bool(
+        message.message_id
+        and message.message_id.startswith(_BOT_ACTION_MESSAGE_PREFIX)
+    )
+
+
+def _collect_message_timeline(
+    chat_stream: ChatStream,
+    before_ts: float | None,
+) -> list[tuple[float, str]]:
+    """把聊天记录收集为 ``(时间戳, 渲染行)`` 序列。"""
+    bot_id = chat_stream.bot_id or ""
     timeline: list[tuple[float, str]] = []
 
-    for msg in msgs:
-        raw_time = msg.time
+    for message in chat_stream.context.history_messages:
+        raw_time = message.time
         if not isinstance(raw_time, (int, float)):
             continue
-        ts = float(raw_time)
-        try:
-            time_str = datetime.datetime.fromtimestamp(ts).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        except (OSError, ValueError, OverflowError):
+        timestamp = float(raw_time)
+        if before_ts is not None and timestamp >= before_ts:
             continue
 
-        sender = msg.sender_name or "未知"
-        sender_id = msg.sender_id or ""
-        message_id = msg.message_id or ""
-        text = msg.processed_plain_text or ""
-        if not text or not text.strip():
+        text = (message.processed_plain_text or "").strip()
+        if not text:
             continue
 
-        if before_ts is not None and ts >= before_ts:
+        time_str = _format_timestamp(timestamp)
+        if time_str is None:
             continue
 
-        is_bot = bool(
-            (bot_id and sender_id == bot_id)
-            or message_id.startswith("action_kfc_reply")
-        )
-        if is_bot:
-            timeline.append((ts, f"[{time_str}] 你回复：{text}"))
-        else:
-            msg_id_part = f" [消息id:{message_id}]" if message_id else ""
-            timeline.append((ts, f"[{time_str}] {sender}{msg_id_part}说：{text}"))
+        if _is_bot_message(message, bot_id):
+            timeline.append((timestamp, f"[{time_str}] 你回复：{text}"))
+            continue
 
-    chat_timestamps = [ts for ts, _ in timeline]
-    mental_cutoff = chat_timestamps[-_MENTAL_LOG_LOOKBACK] if len(chat_timestamps) >= _MENTAL_LOG_LOOKBACK else 0.0
+        sender = message.sender_name or "未知"
+        message_id = message.message_id or ""
+        id_part = f" [消息id:{message_id}]" if message_id else ""
+        timeline.append((timestamp, f"[{time_str}] {sender}{id_part}说：{text}"))
 
-    for entry in (mental_log.entries if mental_log else []):
+    return timeline
+
+
+def _collect_thought_timeline(
+    mental_log: MentalLog | None,
+    cutoff_ts: float,
+    before_ts: float | None,
+) -> list[tuple[float, str]]:
+    """把心理活动流中的内心独白收集为 ``(时间戳, 渲染行)`` 序列。"""
+    if mental_log is None:
+        return []
+
+    timeline: list[tuple[float, str]] = []
+    for entry in mental_log.entries:
+        if entry.event_type != KFCEventType.BOT_PLANNING or not entry.thought:
+            continue
         if not isinstance(entry.timestamp, (int, float)):
             continue
-        if entry.timestamp < mental_cutoff:
+        if entry.timestamp < cutoff_ts:
             continue
-        ts = entry.timestamp
-        try:
-            time_str = datetime.datetime.fromtimestamp(ts).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        except (OSError, ValueError, OverflowError):
-            continue
-
         if before_ts is not None and entry.timestamp >= before_ts:
             continue
 
-        if entry.event_type == KFCEventType.BOT_PLANNING and entry.thought:
-            timeline.append((ts, f"[{time_str}] （你的内心：{entry.thought}）"))
+        time_str = _format_timestamp(entry.timestamp)
+        if time_str is None:
+            continue
+        timeline.append((entry.timestamp, f"[{time_str}] （你的内心：{entry.thought}）"))
 
+    return timeline
+
+
+def build_fused_narrative(
+    chat_stream: ChatStream,
+    mental_log: MentalLog | None,
+    before_ts: float | None = None,
+) -> str:
+    """构建聊天记录与内心独白的融合叙事。
+
+    消息来源为 ``context.history_messages``（受核心配置的上下文长度管控）；
+    存档对话链直接追加到请求中、不占此配额，二者通过 ``before_ts``
+    分界互不重叠。
+
+    Args:
+        chat_stream: 当前聊天流。
+        mental_log: 心理活动流；``None`` 时只渲染聊天记录。
+        before_ts: 只包含时间戳严格小于该值的内容，用于与对话链分界。
+
+    Returns:
+        str: 融合叙事文本；无内容时返回空串。
+    """
+    message_timeline = _collect_message_timeline(chat_stream, before_ts)
+
+    message_timestamps = [timestamp for timestamp, _ in message_timeline]
+    cutoff_ts = (
+        message_timestamps[-_MENTAL_LOG_LOOKBACK]
+        if len(message_timestamps) >= _MENTAL_LOG_LOOKBACK
+        else 0.0
+    )
+    timeline = message_timeline + _collect_thought_timeline(
+        mental_log, cutoff_ts, before_ts
+    )
     if not timeline:
         return ""
 
     timeline.sort(key=lambda item: item[0])
-    lines = [item[1] for item in timeline]
-    return "以下为融合了聊天记录与你内心活动的时间线：\n" + "\n".join(lines)
+    return _NARRATIVE_HEADER + "\n" + "\n".join(line for _, line in timeline)

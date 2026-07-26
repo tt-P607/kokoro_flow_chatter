@@ -1,718 +1,407 @@
-"""KFC 运行时总控。"""
+"""KFC 对话主循环编排。
+
+本模块只负责"按什么顺序做什么"，具体工作全部委托给同层的专职模块：
+
+- ``model_setup``：解析模型集
+- ``context_builder``：构建初始请求
+- ``turn_controller``：准备回合输入、提交回合决策
+- ``payload_hygiene``：发送前清理上下文链
+- ``summary_sync``：热更新后台生成的记忆摘要
+- ``input_status``：上报「正在输入」
+- ``interrupt_controller``：可打断的 LLM 调用
+
+一次 ``execute()`` 内的循环会持续到模型收口（Stop）或需要等待新消息
+（Wait），期间维持同一条 ``response`` 链以累积上下文。
+"""
 
 from __future__ import annotations
 
 import asyncio
-import time
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING, Any
 
-from src.app.plugin_system.api.llm_api import (
-    get_model_set_by_name,
-    get_model_set_by_task,
-)
+from src.app.plugin_system.api.chat_api import restore_stream_to_default
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.stream_api import activate_stream
 from src.app.plugin_system.base import Failure, Stop, Success, Wait
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
 from src.kernel.concurrency import get_watchdog
-from src.app.plugin_system.types import ChatStream, LLMPayload, ROLE, Text
 
 from ..debug.log_formatter import log_kfc_result
 from ..domain.chain_entry import ChainEntry
-from ..protocol.compat_adapter import prepare_kfc_model_set
-from ..protocol.decision_parser import parse_response_decision
+from ..execution import run_decision
 from ..protocol.response_normalizer import normalize_response
-from .phase_machine import (
-    ConversationPhase,
-    phase_for_model_result,
-    phase_for_turn_start,
-)
+from ..services import ProactiveService, TimeoutService
+from .context_builder import build_initial_request
+from .input_status import InputStatusReporter
+from .model_setup import resolve_model_set
+from .payload_hygiene import heal_orphan_tool_results, strip_stale_reminder_prefixes
 from .request_view import build_request_view
-from ..services import (
-    ProactiveService,
-    TimeoutService,
-)
+from .summary_sync import SummarySynchronizer
 from .turn_controller import commit_turn_decision, prepare_turn_input
 
 if TYPE_CHECKING:
     from ..chatter import KokoroFlowChatter
 
+logger = get_logger("kfc_orchestrator")
 
-def _heal_orphan_tool_results(response: Any, *, where: str) -> int:
-    """扫描 response.payloads，丢弃孤立的 TOOL_RESULT。
-
-    "孤立" 的判定：一个 TOOL_RESULT 之前必须紧跟 ASSISTANT(含 tool_calls)
-    或另一个连续的 TOOL_RESULT；否则视为非法链路状态，就地移除并打 ERROR 日志。
-
-    Args:
-        response: 拥有 payloads 列表的响应对象。
-        where: 调用位置标识（用于日志），例如 "loop-top"。
-
-    Returns:
-        int: 被丢弃的孤立 TOOL_RESULT 数量。
-    """
-    payloads = getattr(response, "payloads", None)
-    if not isinstance(payloads, list) or not payloads:
-        return 0
-
-    pinned_roles = {ROLE.SYSTEM, ROLE.TOOL}
-    healed = 0
-    idx = 0
-    while idx < len(payloads):
-        payload = payloads[idx]
-        if payload.role != ROLE.TOOL_RESULT or payload.role in pinned_roles:
-            idx += 1
-            continue
-
-        prev_idx = idx - 1
-        while prev_idx >= 0 and payloads[prev_idx].role in pinned_roles:
-            prev_idx -= 1
-
-        prev_payload = payloads[prev_idx] if prev_idx >= 0 else None
-        prev_role = prev_payload.role if prev_payload is not None else None
-
-        valid_prev = prev_role == ROLE.TOOL_RESULT or (
-            prev_role == ROLE.ASSISTANT
-            and prev_payload is not None
-            and _assistant_has_tool_calls(prev_payload)
-        )
-        if valid_prev:
-            idx += 1
-            continue
-
-        snapshot_start = max(0, idx - 5)
-        snapshot_end = min(len(payloads), idx + 6)
-        snapshot = [
-            f"[{s_idx}] {payloads[s_idx].role.value}: {_preview_payload(payloads[s_idx])}"
-            for s_idx in range(snapshot_start, snapshot_end)
-        ]
-        logger.error(
-            f"孤立 TOOL_RESULT 自愈（{where}）：丢弃 idx={idx}，"
-            f"prev_role={prev_role.value if prev_role else None}\n"
-            + "\n".join(snapshot)
-        )
-        payloads.pop(idx)
-        healed += 1
-
-    return healed
-
-
-def _assistant_has_tool_calls(payload: LLMPayload) -> bool:
-    """判断 ASSISTANT payload 是否包含 tool_calls。"""
-    content = payload.content
-    if not isinstance(content, list):
-        return False
-    return any(type(item).__name__ == "ToolCall" for item in content)
-
-
-def _preview_payload(payload: LLMPayload) -> str:
-    """将 payload 内容压成短预览字符串（最多 80 字符）。"""
-    content = payload.content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            type_name = type(item).__name__
-            text_attr = getattr(item, "text", None)
-            if isinstance(text_attr, str):
-                parts.append(f"{type_name}({text_attr[:30]!r})")
-            else:
-                parts.append(f"{type_name}(name={getattr(item, 'name', None)!r})")
-        return " | ".join(parts)[:80]
-    text_attr = getattr(content, "text", None)
-    return (repr(text_attr)[:80] if isinstance(text_attr, str) else repr(content)[:80])
-
-
-_REMINDER_OPEN_TAG = "<system_reminder>"
-_REMINDER_CLOSE_TAG = "</system_reminder>"
-
-
-def _strip_stale_reminder_prefixes(response: Any) -> None:
-    """剥离 response.payloads 中所有非首非尾 USER payload 上残留的旧 reminder 前缀。
-
-    框架 ``_apply_reminders`` 只处理 first_user 和 last_user，中间 USER 上
-    的旧 reminder 前缀不会被自动清理。KFC orchestrator 的 while 循环每轮
-    通过 ``response.add_payload(USER)`` 追加新消息时，上一轮的 last_user
-    变成中间 USER，其 reminder 前缀永久残留并累积，最终导致上下文中堆积
-    大量带 ``<system_reminder>`` 前缀的 USER payload。
-
-    本函数在每次发送 LLM 请求前扫描所有 USER payload，对非首非尾的 USER
-    剥离其 content 开头的 ``<system_reminder>...</system_reminder>`` 块，
-    确保 reminder 只出现在框架管线管理的首尾位置。
-
-    Args:
-        response: 拥有 payloads 列表的响应对象。
-    """
-
-    payloads = getattr(response, "payloads", None)
-    if not isinstance(payloads, list) or not payloads:
-        return
-
-    user_indices = [
-        idx
-        for idx, payload in enumerate(payloads)
-        if payload.role == ROLE.USER
-    ]
-    if len(user_indices) <= 2:
-        return
-
-    middle_user_indices = user_indices[1:-1]
-
-    for idx in middle_user_indices:
-        payload = payloads[idx]
-        content = payload.content
-        if not isinstance(content, list):
-            continue
-        new_content: list[Any] = []
-        skipped = True
-        for item in content:
-            text = getattr(item, "text", None)
-            if (
-                skipped
-                and isinstance(text, str)
-                and text.startswith(_REMINDER_OPEN_TAG)
-            ):
-                continue
-            skipped = False
-            new_content.append(item)
-        if len(new_content) != len(content):
-            payloads[idx] = LLMPayload(ROLE.USER, new_content)
-
-
-logger = get_logger("kfc_chatter")
-
-# 重试时注入的提醒文本
 _PLAIN_TEXT_RETRY_REMINDER = (
     "（系统提示：你刚才返回了纯文本而非工具调用。"
-    "请务必通过 action-kfc_reply 或 action-do_nothing 工具调用来完成响应，不要直接输出文字。）"
+    "请务必通过 action-kfc_reply 或 action-do_nothing 工具调用来完成响应，"
+    "不要直接输出文字。）"
 )
+"""模型只输出正文、未调用任何工具时注入的纠正提示。"""
 
+_INTERRUPT_COOLDOWN_GROWTH = 0.5
+"""连续打断时冷却窗口的递增系数：第 N 次冷却为基准值的 ``1 + (N-1) * 0.5`` 倍。"""
 
-# 摘要标记前缀（用于在动态 USER payload 中定位摘要段落）
-_SUMMARY_MARKER_PREFIX = "【你对"
-_SUMMARY_MARKER_SUFFIX = "的近期记忆】"
-_SECTION_SEPARATOR = "\n\n---\n\n"
-
-# SnowLuma 适配器签名，用于查找 adapter 实例
-_SNOWLUMA_ADAPTER_SIGN = "snowluma_adapter:adapter:snowluma_adapter"
-
-
-async def _set_input_status(user_id: str, event_type: int) -> None:
-    """向 SnowLuma 上报「正在输入」状态（fire-and-forget）。
-
-    通过 adapter_api 获取 SnowLuma 适配器实例，调用其 ``send_snowluma_api``
-    方法发送 ``set_input_status`` API。任何异常都静默吞掉，不影响对话主流程。
-
-    Args:
-        user_id: 目标好友的 QQ 号
-        event_type: 1=正在输入, 0=停止输入
-    """
-    if not user_id or not user_id.isdigit():
-        logger.debug(f"set_input_status 跳过：user_id 无效 '{user_id}'")
-        return
-    try:
-        from src.app.plugin_system.api.adapter_api import get_adapter
-
-        adapter = get_adapter(_SNOWLUMA_ADAPTER_SIGN)
-        if adapter is None:
-            logger.debug("set_input_status 跳过：SnowLuma 适配器未启动")
-            return
-        send_fn = getattr(adapter, "send_snowluma_api", None)
-        if send_fn is None:
-            logger.debug("set_input_status 跳过：适配器无 send_snowluma_api 方法")
-            return
-        resp = await send_fn(
-            "set_input_status",
-            {"user_id": int(user_id), "event_type": event_type},
-            timeout=5.0,
-        )
-        logger.debug(
-            f"set_input_status 已发送: user_id={user_id}, event_type={event_type}, resp={resp}"
-        )
-    except Exception as e:
-        logger.warning(f"set_input_status 调用失败: {e}")
-
-
-def _cancel_input_status_refresh(handle: Any) -> None:
-    """取消「正在输入」刷新后台任务。
-
-    Args:
-        handle: ``task_manager.create_task()`` 返回的句柄，为 None 时跳过
-    """
-    if handle is None:
-        return
-    try:
-        from src.kernel.concurrency import get_task_manager
-
-        get_task_manager().cancel_task(handle.task_id)
-    except Exception:
-        pass
-
-
-def _hot_update_summary(
-    response: Any,
-    chat_stream: ChatStream,
-    session: Any,
-    prompt_builder: Any,
-) -> None:
-    """在 response 的动态 USER payload 中热替换摘要段落。
-
-    动态 USER payload 的结构为 channel_info + summary + history，
-    各部分以 ``\\n\\n---\\n\\n`` 分隔。本函数通过定位摘要标记前缀
-    ``【你对...的近期记忆】`` 来找到并替换摘要段落。
-    如果原始 payload 中不存在摘要（首次生成），则在适当位置插入。
-    """
-    from ..context.sources.history_source import build_history_summary_payload
-
-    new_summary = session.history_summary or ""
-    if not new_summary:
-        return
-
-    # 构建新的摘要文本
-    summary_payload = build_history_summary_payload(chat_stream, new_summary)
-    if summary_payload is None:
-        return
-    new_summary_text = ""
-    for item in summary_payload.content:
-        if hasattr(item, "text"):
-            new_summary_text += item.text  # type: ignore[attr-defined]
-    if not new_summary_text:
-        return
-
-    # 定位第一个 USER payload（动态上下文 payload）
-    payloads = getattr(response, "payloads", [])
-    dynamic_idx = -1
-    for idx, payload in enumerate(payloads):
-        if payload.role == ROLE.USER:
-            dynamic_idx = idx
-            break
-
-    if dynamic_idx < 0:
-        return
-
-    dynamic_payload = payloads[dynamic_idx]
-    # 提取当前文本
-    if isinstance(dynamic_payload.content, list):
-        old_text = ""
-        for item in dynamic_payload.content:
-            if hasattr(item, "text"):
-                old_text += item.text  # type: ignore[attr-defined]
-    elif hasattr(dynamic_payload.content, "text"):
-        old_text = dynamic_payload.content.text  # type: ignore[attr-defined]
-    else:
-        return
-
-    # 按段落分割并替换/插入摘要
-    sections = old_text.split(_SECTION_SEPARATOR)
-    summary_found = False
-    for i, section in enumerate(sections):
-        if _SUMMARY_MARKER_PREFIX in section and _SUMMARY_MARKER_SUFFIX in section:
-            sections[i] = new_summary_text
-            summary_found = True
-            break
-
-    if not summary_found:
-        # 摘要不存在（首次生成），在第一个段落（通道信息）之后插入
-        if len(sections) >= 2:
-            sections.insert(1, new_summary_text)
-        else:
-            sections.append(new_summary_text)
-
-    new_text = _SECTION_SEPARATOR.join(sections)
-
-    # 替换 payload 内容
-    if isinstance(dynamic_payload.content, list):
-        dynamic_payload.content[:] = [Text(new_text)]
-    else:
-        dynamic_payload.content = Text(new_text)
+_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 async def execute_orchestrator(
     chatter: KokoroFlowChatter,
 ) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
-    """执行 KFC 对话主循环。"""
-    from src.app.plugin_system.api.stream_api import activate_stream
+    """执行 KFC 对话主循环。
 
-    self = chatter
+    Args:
+        chatter: 当前 chatter 实例。
 
-    chat_stream = await activate_stream(self.stream_id)
+    Yields:
+        Wait | Success | Failure | Stop: 交还给框架的循环控制信号。
+    """
+    chat_stream = await activate_stream(chatter.stream_id)
     if chat_stream is None:
-        logger.error(f"无法激活聊天流: {self.stream_id}")
+        logger.error(f"无法激活聊天流: {chatter.stream_id}")
         yield Failure("聊天流激活失败")
         return
-    config = self._get_config()
 
+    config = chatter.get_config()
     if not config.general.enabled:
         logger.info("KFC 插件已禁用，解除 chatter 绑定以允许框架重新选择")
-        from src.app.plugin_system.api.chat_api import restore_stream_to_default
-
-        restore_stream_to_default(self.stream_id)
+        restore_stream_to_default(chatter.stream_id)
         yield Success("KFC 插件已禁用")
         return
 
-    session = await self._get_session()
+    model_set = resolve_model_set(config)
+    if not model_set:
+        logger.error("未找到有效的模型配置")
+        yield Failure("模型配置错误：未找到有效的模型配置")
+        return
+
+    session = await chatter.load_session()
     timeout_service = TimeoutService(config)
 
     if config.general.native_multimodal:
-        self._register_vlm_skip()
+        chatter.register_vlm_skip()
 
     try:
-        model_set = None
-        temperature = config.general.temperature
-        max_tokens = config.general.max_tokens
-        if config.general.models:
-            parts = [
-                get_model_set_by_name(
-                    model_name,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                for model_name in config.general.models
-            ]
-            valid_parts = [part for part in parts if part]
-            if valid_parts:
-                model_set = valid_parts[0]
-                for part in valid_parts[1:]:
-                    model_set = model_set + part
-            if not model_set:
-                logger.warning(
-                    f"models 中的模型均未注册: {config.general.models}，"
-                    f"回退到任务模型 '{config.general.model_task}'"
-                )
-
-        if not model_set:
-            model_set = get_model_set_by_task(config.general.model_task)
-
-        if not model_set:
-            logger.error("无法获取模型配置")
-            yield Failure("模型配置错误：未找到有效的模型配置")
-            return
-
-        model_set = prepare_kfc_model_set(model_set)
-
-        (
-            response,
-            usable_map,
-            prompt_builder,
-            has_history,
-        ) = await self._build_initial_context(
-            chat_stream,
-            config,
-            session,
-            model_set,
+        response, usable_map = await build_initial_request(
+            chatter, chat_stream, config, session, model_set
         )
-
-        has_pending_tool_results = False
-        is_final_timeout = False
-        pre_send_user_text = ""
-        last_user_ts = 0.0
-        chain_user_pre_saved = False
-        extra_payload: LLMPayload | None = None
-        phase = ConversationPhase.WAIT_INPUT
-        plain_text_retry_count = 0
-        follow_up_count = 0
-        consecutive_interrupt_count = 0
-        # 记录当前"烧入"初始上下文的摘要，用于检测后台压缩任务的更新
-        _baked_summary = session.history_summary or ""
+        state = _LoopState(summary=SummarySynchronizer(session.history_summary))
 
         while True:
-            # ── 摘要热更新 ──
-            # 后台压缩任务可能已更新 session.history_summary，
-            # 如果发生变化，立即替换 response 中的动态上下文 payload。
-            current_summary = session.history_summary or ""
-            if current_summary != _baked_summary:
-                _hot_update_summary(
-                    response, chat_stream, session, prompt_builder,
-                )
-                _baked_summary = current_summary
-                logger.info("[KFC] 近期记忆摘要已热更新到 LLM 上下文")
+            state.summary.sync_if_changed(response, chat_stream, session.history_summary)
+            heal_orphan_tool_results(response, where="loop-top")
 
-            _heal_orphan_tool_results(response, where="loop-top")
-            phase = phase_for_turn_start(
-                response,
-                has_pending_tool_results=has_pending_tool_results,
-            )
-            if phase is ConversationPhase.FOLLOW_UP:
-                logger.debug("[KFC] role-phase=FOLLOW_UP，跳过新增 USER 输入并续轮")
             turn_input = await prepare_turn_input(
-                self,
+                chatter,
                 response,
                 chat_stream,
                 config,
                 session,
-                prompt_builder,
                 timeout_service,
-                has_pending_tool_results,
+                state.has_pending_tool_results,
             )
             response = turn_input.response
-            unread_msgs = turn_input.unread_msgs
-            extra_payload = turn_input.extra_payload
-            # 新消息到来时（has_pending_tool_results 由 True 变 False），重置续轮计数
-            if has_pending_tool_results and not turn_input.has_pending_tool_results:
-                follow_up_count = 0
-            has_pending_tool_results = turn_input.has_pending_tool_results
-            is_final_timeout = turn_input.is_final_timeout
+            # 新消息到来意味着上一串工具续轮已结束，重置失败计数
+            if state.has_pending_tool_results and not turn_input.has_pending_tool_results:
+                state.follow_up_count = 0
+            state.has_pending_tool_results = turn_input.has_pending_tool_results
+            state.is_final_timeout = turn_input.is_final_timeout
 
             if turn_input.next_signal is not None:
                 yield turn_input.next_signal
             if turn_input.continue_loop:
                 continue
 
+            unread_msgs = turn_input.unread_msgs
             if unread_msgs:
-                last_user_ts = min(
-                    (self._extract_timestamp(message) for message in unread_msgs),
-                    default=time.time(),
+                state.last_user_ts = min(
+                    chatter.extract_timestamp(message) for message in unread_msgs
                 )
 
-            # wrapped_user_text 是 chain_text（仅含原始消息内容），
-            # 不含末尾强调指令/平台信息/system_reminder，避免这些临时提示词被持久化进链。
-            if turn_input.wrapped_user_text:
-                new_user_text = turn_input.wrapped_user_text
-                if new_user_text != pre_send_user_text:
-                    pre_send_user_text = new_user_text
-                    chain_user_pre_saved = False
-
-            if pre_send_user_text and not chain_user_pre_saved:
+            _stage_user_chain_entry(state, turn_input.chain_text)
+            if state.pending_user_text and not state.chain_user_saved:
                 session.update_chain(
-                    [ChainEntry.user(pre_send_user_text, ts=last_user_ts).to_dict()],
+                    [
+                        ChainEntry.user(
+                            state.pending_user_text, ts=state.last_user_ts
+                        ).to_dict()
+                    ],
                     config.prompt.max_context_payloads,
                 )
-                await self._save_session(session)
-                chain_user_pre_saved = True
+                await chatter.save_session(session)
+                state.chain_user_saved = True
 
-            transient_payloads: list[LLMPayload] = []
-            if extra_payload is not None:
-                # 框架已允许 TOOL_RESULT → USER，extra_payload（USER 类型）可直接追加。
-                transient_payloads.append(extra_payload)
-            # 发送前清理中间 USER payload 上残留的旧 reminder 前缀，
-            # 避免多轮循环中 reminder 在中间 USER 上永久累积。
-            _strip_stale_reminder_prefixes(response)
+            strip_stale_reminder_prefixes(response)
+            transient_payloads = (
+                [turn_input.extra_payload] if turn_input.extra_payload else []
+            )
             send_target = build_request_view(response, transient_payloads)
             if config.debug.show_prompt:
-                self._log_prompt(send_target, chain_payloads=session.chain_payloads)
+                chatter.log_prompt(send_target, session.chain_payloads)
 
-            if unread_msgs:
-                known_ids: frozenset[str] = frozenset(
-                    message.message_id
-                    for message in unread_msgs
-                    if message.message_id
-                )
-            else:
-                _, current_snapshot = await self.fetch_unreads(
-                    time_format="%Y-%m-%d %H:%M:%S"
-                )
-                known_ids = frozenset(
-                    message.message_id
-                    for message in current_snapshot
-                    if message.message_id
-                )
-
-            # 「正在输入」状态：LLM 请求前上报，请求后撤下
-            # event_type=1 只持续 2-3 秒，需要在 LLM 生成期间每 2 秒刷新
-            _input_status_on = config.general.enable_input_status and bool(session.user_id)
-            _input_refresh_handle: Any = None
-            if _input_status_on:
-                await _set_input_status(session.user_id, 1)
-
-                async def _input_status_loop() -> None:
-                    """以 2.5 秒为基础间隔加随机抖动刷新「正在输入」状态。"""
-                    import random
-
-                    while True:
-                        await asyncio.sleep(2.5 + random.uniform(0.5, 1.5))
-                        await _set_input_status(session.user_id, 1)
-
-                from src.kernel.concurrency import get_task_manager
-
-                _input_refresh_handle = get_task_manager().create_task(
-                    _input_status_loop(),
-                    name=f"kfc_input_status_{self.stream_id[:8]}",
-                    daemon=True,
-                    metadata={
-                        "plugin": "kokoro_flow_chatter",
-                        "purpose": "input_status",
-                        "stream_id": self.stream_id,
-                    },
-                )
+            known_ids = await _resolve_known_message_ids(chatter, unread_msgs)
+            reporter = InputStatusReporter(chatter.stream_id, session.user_id)
+            should_report = config.general.enable_input_status
 
             try:
-                phase = ConversationPhase.MODEL_TURN
-                max_interrupts = config.buffer.max_consecutive_interrupts
-                if config.buffer.interrupt_enabled and consecutive_interrupt_count < max_interrupts:
-                    new_response, interrupt_msgs = await self._send_interruptable(
-                        send_target,
-                        config,
-                        known_ids,
-                    )
-                    if interrupt_msgs:
-                        consecutive_interrupt_count += 1
-                        extra_payload = None
-                        await self.flush_unreads(unread_msgs or [])
-                        session.add_interrupt_event(interrupt_msgs)
-                        await self._save_session(session)
-                        # 打断冷却窗口：每次打断叠加原值的 1/2，递增等待时间
-                        # 第 1 次: base, 第 2 次: base * 1.5, 第 3 次: base * 2.0, ...
-                        base_cooldown = config.buffer.interrupt_cooldown
-                        cooldown = base_cooldown * (1.0 + (consecutive_interrupt_count - 1) * 0.5)
-                        if cooldown > 0:
-                            logger.debug(
-                                f"[KFC] 打断后冷却 {cooldown:.1f}s "
-                                f"(连续打断 {consecutive_interrupt_count}/{max_interrupts})"
-                            )
-                            await asyncio.sleep(cooldown)
-                        continue
-                    # LLM 正常完成，重置打断计数
-                    consecutive_interrupt_count = 0
-                    assert new_response is not None
-                    response = new_response
-                else:
-                    if consecutive_interrupt_count >= max_interrupts:
-                        logger.warning(
-                            f"[KFC] 连续打断已达上限 {max_interrupts}，"
-                            "本次不再打断，等待 LLM 正常完成后统一处理"
-                        )
-                    watchdog = get_watchdog()
-                    watchdog.feed_dog(self.stream_id)
-                    response = await send_target.send(auto_append_response=True, stream=False)
-                    watchdog.feed_dog(self.stream_id)
-                    normalize_response(response)
-                    # 不可打断路径正常完成后也重置打断计数
-                    consecutive_interrupt_count = 0
-                await self.flush_unreads(unread_msgs if unread_msgs else [])
-            except Exception as exc:
-                logger.error(f"LLM 请求失败: {exc}", exc_info=True)
-                extra_payload = None
-                # 失败路径必须与成功路径保持同样的 unread 消费契约：
-                # 框架 LLM 层已在内部跑完 policy 重试与多模型 fallback，
-                # 异常穿透到这里说明这批消息当下确实无法处理。若不消费 unread，
-                # 框架下一 Tick 仍会拿同一批未读再次拉起 execute()，叠加
-                # KFC 的"先持久化、后发送"时序，sessions/xxx.json 会被
-                # 同一条触发消息反复 append 到 mental_log / chain_payloads。
-                # 这里把 user 条目对应的 unread 搬入 history（已通过
-                # update_chain 写入持久化链，仍可在下次上下文中被还原），
-                # 把决定权交还给框架的正常 Tick 调度。
-                if unread_msgs:
-                    try:
-                        await self.flush_unreads(unread_msgs)
-                    except Exception as flush_exc:
-                        logger.warning(
-                            f"LLM 失败后 flush_unreads 失败（不影响主流程）: {flush_exc}"
-                        )
-                await self._save_session(session)
-                yield Failure("LLM 请求失败", exc)
-                break
+                if should_report:
+                    await reporter.start()
+
+                sent_response, interrupt_msgs = await _send_llm_request(
+                    chatter, send_target, config, known_ids, state
+                )
+                if interrupt_msgs:
+                    await chatter.flush_unreads(unread_msgs)
+                    session.add_interrupt_event(interrupt_msgs)
+                    await chatter.save_session(session)
+                    await _wait_interrupt_cooldown(config, state)
+                    continue
+
+                response = sent_response
+                await chatter.flush_unreads(unread_msgs)
+            except Exception as error:
+                logger.error(f"LLM 请求失败: {error}", exc_info=True)
+                # 失败路径必须与成功路径保持相同的 unread 消费契约：框架 LLM
+                # 层已跑完重试与多模型 fallback，异常穿透至此说明这批消息当下
+                # 确实无法处理。不消费就会在下一 Tick 拿到同一批未读重新拉起
+                # execute()，叠加"先持久化后发送"的时序，同一条消息会被反复
+                # 写入活动流与对话链。
+                await chatter.flush_unreads(unread_msgs)
+                await chatter.save_session(session)
+                yield Failure("LLM 请求失败", error)
+                return
             finally:
-                if _input_status_on:
-                    _cancel_input_status_refresh(_input_refresh_handle)
-                    await _set_input_status(session.user_id, 0)
+                if should_report:
+                    await reporter.stop()
 
-            extra_payload = None
-            phase = phase_for_model_result(response)
+            heal_orphan_tool_results(response, where="post-send")
 
-            _heal_orphan_tool_results(response, where="post-send")
-
-            call_list = response.call_list or []
-
-            # ── 纯文本/空响应重试机制 ──
-            # 当 LLM 没有返回工具调用时，注入提醒并重试
-            # 框架层只在异常时重试；API 返回 HTTP 200 但内容为空时不会触发，
-            # 因此 KFC 需要兜底处理空响应，避免直接进入 Stop 状态。
-            if not call_list and plain_text_retry_count < config.general.max_follow_up_retries:
-                raw_message = (response.message or "").strip()
-                plain_text_retry_count += 1
-
-                if raw_message:
-                    logger.info(
-                        f"[KFC] LLM 返回纯文本（第 {plain_text_retry_count} 次），"
-                        f"注入提醒后重试: {raw_message[:80]}"
+            if not response.call_list:
+                if state.plain_text_retry_count < config.general.max_follow_up_retries:
+                    _log_missing_tool_call(response, state)
+                    state.plain_text_retry_count += 1
+                    response.add_payload(
+                        LLMPayload(ROLE.USER, Text(_PLAIN_TEXT_RETRY_REMINDER))
                     )
-                else:
-                    logger.warning(
-                        f"[KFC] LLM 返回空响应（第 {plain_text_retry_count} 次），"
-                        "注入提醒后重试"
-                    )
-
-                response.add_payload(
-                    LLMPayload(ROLE.USER, Text(_PLAIN_TEXT_RETRY_REMINDER))
-                )
-                has_pending_tool_results = True
-                continue
-
-            # 成功获得 tool call 时重置重试计数
-            if call_list:
-                plain_text_retry_count = 0
-                logger.info(f"本轮调用列表：{[call.name for call in call_list]}")
-            elif response.message:
-                logger.debug("[KFC] 本轮无 tool call，进入决策判定")
-            else:
+                    state.has_pending_tool_results = True
+                    continue
                 logger.warning(
-                    f"[KFC] LLM 经过 {plain_text_retry_count} 次重试仍未返回有效工具调用或有效文本，本轮响应将被强制收口"
+                    f"经过 {state.plain_text_retry_count} 次重试仍未取得有效工具调用，"
+                    "本轮强制收口"
                 )
+            else:
+                state.plain_text_retry_count = 0
+                logger.info(f"本轮调用列表：{[call.name for call in response.call_list]}")
 
             trigger_msg = unread_msgs[-1] if unread_msgs else None
             if trigger_msg is None:
-                trigger_msg = await self._get_virtual_trigger_message()
-            phase = ConversationPhase.TOOL_EXEC if call_list else ConversationPhase.COMMIT
-            decision = await parse_response_decision(
+                trigger_msg = await chatter.build_virtual_trigger_message()
+
+            decision = await run_decision(
                 response,
                 usable_map,
                 trigger_msg,
                 config,
-                execute_reply_fn=self._execute_reply,
-                run_tool_call_fn=self.run_tool_call,
+                execute_reply_fn=chatter.send_reply,
+                run_tool_call_fn=chatter.run_tool_call,
                 pre_execute_hook=lambda result: log_kfc_result(result, config),
             )
-
             if decision.proactive_schedule is not None:
-                try:
-                    ProactiveService.apply_schedule(
-                        session,
-                        decision.proactive_schedule,
-                    )
-                except Exception as exc:
-                    logger.warning(f"[KFC] action-schedule_proactive 参数解析失败: {exc}")
+                ProactiveService.apply_schedule(session, decision.proactive_schedule)
 
-            phase = ConversationPhase.COMMIT
             turn_control = await commit_turn_decision(
-                self,
+                chatter,
                 decision,
                 response,
                 session,
                 config,
-                prompt_builder,
                 chat_stream,
-                pre_send_user_text,
-                last_user_ts,
-                chain_user_pre_saved,
-                is_final_timeout,
+                pending_user_text=state.pending_user_text,
+                last_user_ts=state.last_user_ts,
+                chain_user_saved=state.chain_user_saved,
+                is_final_timeout=state.is_final_timeout,
             )
-            is_final_timeout = turn_control.is_final_timeout
+            state.is_final_timeout = turn_control.is_final_timeout
 
             if turn_control.has_pending_tool_results:
-                # 只有工具失败时才计入重试次数，正常的工具链不受影响
-                if decision.has_failed_tool:
-                    follow_up_count += 1
-                    max_retries = config.general.max_follow_up_retries
-                    if max_retries > 0 and follow_up_count > max_retries:
-                        logger.warning(
-                            f"[KFC] 工具失败重试次数已达上限 {max_retries}，"
-                            "强制停止续轮（防止工具调用格式错误导致无限重试）"
-                        )
-                        follow_up_count = 0
-                        has_pending_tool_results = False
-                        yield Stop(0)
-                        return
-                has_pending_tool_results = True
+                if decision.has_failed_tool and _exceeded_retry_limit(config, state):
+                    yield Stop(0)
+                    return
+                state.has_pending_tool_results = True
 
-            # assistant entry 已写入链，清空 pre_send_user_text 防止下一轮续轮重复持久化
             if turn_control.chain_assistant_saved:
-                chain_user_pre_saved = True
-                pre_send_user_text = ""
+                # assistant 已入链，清空暂存避免续轮时重复持久化 user 条目
+                state.chain_user_saved = True
+                state.pending_user_text = ""
 
             if turn_control.next_signal is not None:
                 yield turn_control.next_signal
             if turn_control.return_after_yield:
                 return
-            if turn_control.continue_loop:
-                continue
-
     finally:
         if config.general.native_multimodal:
-            self._unregister_vlm_skip()
+            chatter.unregister_vlm_skip()
+
+
+class _LoopState:
+    """主循环的可变状态。
+
+    集中承载跨轮次传递的计数与暂存文本，避免在循环体内散落大量
+    同生命周期的局部变量。
+    """
+
+    __slots__ = (
+        "chain_user_saved",
+        "consecutive_interrupt_count",
+        "follow_up_count",
+        "has_pending_tool_results",
+        "is_final_timeout",
+        "last_user_ts",
+        "pending_user_text",
+        "plain_text_retry_count",
+        "summary",
+    )
+
+    def __init__(self, summary: SummarySynchronizer) -> None:
+        """初始化循环状态。"""
+        self.summary = summary
+        self.has_pending_tool_results = False
+        self.is_final_timeout = False
+        self.pending_user_text = ""
+        self.last_user_ts = 0.0
+        self.chain_user_saved = False
+        self.plain_text_retry_count = 0
+        self.follow_up_count = 0
+        self.consecutive_interrupt_count = 0
+
+
+def _stage_user_chain_entry(state: _LoopState, chain_text: str) -> None:
+    """暂存本轮待入链的用户文本。
+
+    ``chain_text`` 只含原始消息内容，不含末尾强调指令与临时注入，
+    避免这些每轮变化的提示词被固化进持久化对话链。
+    """
+    if not chain_text or chain_text == state.pending_user_text:
+        return
+    state.pending_user_text = chain_text
+    state.chain_user_saved = False
+
+
+async def _resolve_known_message_ids(
+    chatter: KokoroFlowChatter,
+    unread_msgs: list[Any],
+) -> frozenset[str]:
+    """确定打断检测的基线消息 ID 集合。
+
+    本轮已纳入上下文的消息不应触发打断；无未读时需要重新快照当前
+    未读队列，否则打断检测会把既有消息误判为新消息。
+    """
+    if unread_msgs:
+        return frozenset(
+            message.message_id for message in unread_msgs if message.message_id
+        )
+    _, snapshot = await chatter.fetch_unreads(time_format=_TIME_FORMAT)
+    return frozenset(message.message_id for message in snapshot if message.message_id)
+
+
+async def _send_llm_request(
+    chatter: KokoroFlowChatter,
+    send_target: Any,
+    config: Any,
+    known_ids: frozenset[str],
+    state: _LoopState,
+) -> tuple[Any, list[Any]]:
+    """发送 LLM 请求，按配置决定是否允许打断。
+
+    Returns:
+        tuple: ``(响应, 打断消息列表)``；被打断时响应为 ``None``。
+    """
+    max_interrupts = config.buffer.max_consecutive_interrupts
+    interrupt_allowed = (
+        config.buffer.interrupt_enabled
+        and state.consecutive_interrupt_count < max_interrupts
+    )
+
+    if interrupt_allowed:
+        response, interrupt_msgs = await chatter.send_interruptable(
+            send_target, config, known_ids
+        )
+        if interrupt_msgs:
+            state.consecutive_interrupt_count += 1
+            return None, interrupt_msgs
+        state.consecutive_interrupt_count = 0
+        return response, []
+
+    if state.consecutive_interrupt_count >= max_interrupts:
+        logger.warning(
+            f"连续打断已达上限 {max_interrupts}，本次不再打断，"
+            "等待 LLM 正常完成后统一处理"
+        )
+
+    watchdog = get_watchdog()
+    watchdog.feed_dog(chatter.stream_id)
+    response = await send_target.send(auto_append_response=True, stream=False)
+    watchdog.feed_dog(chatter.stream_id)
+    normalize_response(response)
+    state.consecutive_interrupt_count = 0
+    return response, []
+
+
+async def _wait_interrupt_cooldown(config: Any, state: _LoopState) -> None:
+    """打断后等待冷却窗口，收集可能连发的后续消息。
+
+    连续打断时冷却时间递增，避免高频消息把 LLM 调用拖入无限重启。
+    """
+    base_cooldown = config.buffer.interrupt_cooldown
+    growth = 1.0 + (state.consecutive_interrupt_count - 1) * _INTERRUPT_COOLDOWN_GROWTH
+    cooldown = base_cooldown * growth
+    if cooldown <= 0:
+        return
+    logger.debug(
+        f"打断后冷却 {cooldown:.1f}s"
+        f"（连续打断 {state.consecutive_interrupt_count}/"
+        f"{config.buffer.max_consecutive_interrupts}）"
+    )
+    await asyncio.sleep(cooldown)
+
+
+def _log_missing_tool_call(response: Any, state: _LoopState) -> None:
+    """记录模型未返回工具调用的情形。"""
+    attempt = state.plain_text_retry_count + 1
+    raw_message = (response.message or "").strip()
+    if raw_message:
+        logger.info(f"LLM 返回纯文本（第 {attempt} 次），注入提醒后重试: {raw_message[:80]}")
+    else:
+        logger.warning(f"LLM 返回空响应（第 {attempt} 次），注入提醒后重试")
+
+
+def _exceeded_retry_limit(config: Any, state: _LoopState) -> bool:
+    """累计工具失败次数并判断是否超出续轮上限。
+
+    只有工具执行失败才计数——正常的多轮工具链不应受此限制。
+    """
+    state.follow_up_count += 1
+    max_retries = config.general.max_follow_up_retries
+    if max_retries <= 0 or state.follow_up_count <= max_retries:
+        return False
+
+    logger.warning(
+        f"工具失败重试次数已达上限 {max_retries}，强制停止续轮"
+        "（防止工具调用格式错误导致无限重试）"
+    )
+    state.follow_up_count = 0
+    state.has_pending_tool_results = False
+    return True
