@@ -16,7 +16,13 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.types import LLMPayload, ROLE, ToolRegistry, ToolResult
+from src.app.plugin_system.types import (
+    LLMPayload,
+    ROLE,
+    ToolCall,
+    ToolRegistry,
+    ToolResult,
+)
 
 from ..models import DO_NOTHING, KFC_REPLY, PASS_AND_WAIT, ToolCallResult
 from ..protocol.tool_call_adapter import DecisionDraft, DecisionDraftCall
@@ -138,6 +144,85 @@ def _append_tool_result(
     )
 
 
+def _collect_written_tool_result_ids(response: Any) -> set[str]:
+    """收集响应链中已写回的全部 ToolResult 的 call_id。"""
+    written: set[str] = set()
+    payloads = getattr(response, "payloads", None)
+    if not isinstance(payloads, list):
+        return written
+    for payload in payloads:
+        content = getattr(payload, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, ToolResult) and part.call_id:
+                written.add(str(part.call_id))
+    return written
+
+
+def _collect_assistant_tool_call_ids(response: Any) -> set[str]:
+    """收集响应链中最后一段 ASSISTANT(tool_calls) 声明的全部 call_id。"""
+    declared: set[str] = set()
+    payloads = getattr(response, "payloads", None)
+    if not isinstance(payloads, list):
+        return declared
+    for payload in payloads:
+        content = getattr(payload, "content", None)
+        if not isinstance(content, list):
+            continue
+        declared.update(
+            str(part.id) for part in content if isinstance(part, ToolCall) and part.id
+        )
+    return declared
+
+
+def _reconcile_missing_tool_results(
+    response: Any,
+    draft: DecisionDraft,
+) -> int:
+    """补齐声明过但未写回 TOOL_RESULT 的调用，返回补齐数量。
+
+    外部取消（如 WatchDog 强制重启）可能中断 ``run_tool_call`` 的 TOOL_RESULT
+    写回循环，导致 ``ASSISTANT(tool_calls)`` 失去配对结果，下一次请求会因
+    上下文结构非法而失败。这里把遗漏的调用补写为「执行被中断」占位，保证
+    响应链中每个已声明的工具调用都有配对回执。
+
+    Args:
+        response: 模型响应对象，缺失的 TOOL_RESULT 会追加到其 payloads。
+        draft: 已归一化的调用草稿，提供全部声明的 call_id。
+
+    Returns:
+        int: 本次补齐的 TOOL_RESULT 数量。
+    """
+    if not draft.has_calls:
+        return 0
+    declared_ids = {
+        draft_call.call_id for draft_call in draft.calls if draft_call.call_id
+    }
+    if not declared_ids:
+        return 0
+
+    assistant_declared = _collect_assistant_tool_call_ids(response)
+    if not assistant_declared:
+        return 0
+
+    missing = declared_ids & assistant_declared - _collect_written_tool_result_ids(
+        response
+    )
+    if not missing:
+        return 0
+
+    logger.warning(f"补齐 {len(missing)} 个中断工具的 TOOL_RESULT: {sorted(missing)}")
+    for draft_call in draft.calls:
+        if draft_call.call_id in missing:
+            _append_tool_result(
+                response,
+                draft_call,
+                "执行被中断：工具调用未完成（调用被取消或执行异常）",
+            )
+    return len(missing)
+
+
 def _record_action(
     result: ToolCallResult,
     normalized_name: str,
@@ -234,69 +319,74 @@ async def execute_decision_draft(
                 result.has_failed_tool = True
                 logger.warning(f"工具 {call.name} 执行失败或被跳过")
 
-    # 元数据只取首个控制动作——同一轮内多个控制动作的元数据语义等价。
-    for draft_call in draft.calls:
-        if draft_call.is_kfc_control:
-            extract_metadata(result, draft_call.args)
-            break
+    try:
+        # 元数据只取首个控制动作——同一轮内多个控制动作的元数据语义等价。
+        for draft_call in draft.calls:
+            if draft_call.is_kfc_control:
+                extract_metadata(result, draft_call.args)
+                break
 
-    for draft_call in draft.calls:
-        args = dict(draft_call.args)
-        reason = args.pop("reason", "未提供原因")
-        normalized_name = draft_call.normalized_name
-        logger.info(f"LLM 调用 {draft_call.raw_name}，原因: {reason}")
+        for draft_call in draft.calls:
+            args = dict(draft_call.args)
+            reason = args.pop("reason", "未提供原因")
+            normalized_name = draft_call.normalized_name
+            logger.info(f"LLM 调用 {draft_call.raw_name}，原因: {reason}")
 
-        if normalized_name == KFC_REPLY:
-            if has_processed_reply:
-                logger.warning(f"忽略重复的 kfc_reply 调用: {draft_call.call_id}")
-                _append_tool_result(response, draft_call, _RESULT_REPLY_DUPLICATED)
+            if normalized_name == KFC_REPLY:
+                if has_processed_reply:
+                    logger.warning(f"忽略重复的 kfc_reply 调用: {draft_call.call_id}")
+                    _append_tool_result(response, draft_call, _RESULT_REPLY_DUPLICATED)
+                    continue
+
+                await flush_pending_framework_calls()
+                has_processed_reply = True
+                result.has_reply = True
+
+                segments = parse_content_segments(args.get("content", ""))
+                if not segments:
+                    result.has_failed_tool = True
+                    logger.warning(f"{KFC_REPLY} 的 content 解析后为空，视为工具失败")
+                    _append_tool_result(response, draft_call, _RESULT_REPLY_EMPTY)
+                    continue
+
+                reply_to = str(args.pop("reply_to", "") or "")
+                send_ok = await _send_reply_segments(
+                    segments, reply_to, config, trigger_msg, execute_reply_fn
+                )
+                if not send_ok:
+                    result.has_failed_tool = True
+
+                _record_action(result, normalized_name, args, content_segments=segments)
+                _append_tool_result(
+                    response,
+                    draft_call,
+                    _RESULT_REPLY_SENT if send_ok else _RESULT_REPLY_FAILED,
+                )
                 continue
 
-            await flush_pending_framework_calls()
-            has_processed_reply = True
-            result.has_reply = True
-
-            segments = parse_content_segments(args.get("content", ""))
-            if not segments:
-                result.has_failed_tool = True
-                logger.warning(f"{KFC_REPLY} 的 content 解析后为空，视为工具失败")
-                _append_tool_result(response, draft_call, _RESULT_REPLY_EMPTY)
+            if normalized_name == DO_NOTHING:
+                result.has_do_nothing = True
+                _record_action(result, normalized_name, args)
+                _append_tool_result(response, draft_call, _RESULT_SILENCE)
                 continue
 
-            reply_to = str(args.pop("reply_to", "") or "")
-            send_ok = await _send_reply_segments(
-                segments, reply_to, config, trigger_msg, execute_reply_fn
-            )
-            if not send_ok:
-                result.has_failed_tool = True
+            if normalized_name == PASS_AND_WAIT:
+                result.has_pass_and_wait = True
+                _record_action(result, normalized_name, args)
+                _append_tool_result(response, draft_call, _RESULT_WAIT_REGISTERED)
+                continue
 
-            _record_action(result, normalized_name, args, content_segments=segments)
-            _append_tool_result(
-                response,
-                draft_call,
-                _RESULT_REPLY_SENT if send_ok else _RESULT_REPLY_FAILED,
-            )
-            continue
-
-        if normalized_name == DO_NOTHING:
-            result.has_do_nothing = True
+            result.has_third_party = True
+            if draft_call.is_info_tool:
+                result.has_info_tool = True
             _record_action(result, normalized_name, args)
-            _append_tool_result(response, draft_call, _RESULT_SILENCE)
-            continue
+            pending_framework_calls.append(draft_call.raw_call)
 
-        if normalized_name == PASS_AND_WAIT:
-            result.has_pass_and_wait = True
-            _record_action(result, normalized_name, args)
-            _append_tool_result(response, draft_call, _RESULT_WAIT_REGISTERED)
-            continue
-
-        result.has_third_party = True
-        if draft_call.is_info_tool:
-            result.has_info_tool = True
-        _record_action(result, normalized_name, args)
-        pending_framework_calls.append(draft_call.raw_call)
-
-    await flush_pending_framework_calls()
+        await flush_pending_framework_calls()
+    finally:
+        # 无论正常收口还是中途被取消/异常，都要保证已声明的工具调用有
+        # 配对的 TOOL_RESULT，否则下一次请求会因上下文结构非法而失败。
+        _reconcile_missing_tool_results(response, draft)
 
     if pre_execute_hook is not None:
         pre_execute_hook(result)

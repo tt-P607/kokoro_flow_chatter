@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -966,3 +967,113 @@ def test_control_constants_keep_expected_values() -> None:
     """控制动作名常量必须与提示词、schema 保持一致。"""
     assert KFC_REPLY == "kfc_reply"
     assert DO_NOTHING == "do_nothing"
+
+
+# ── 执行层写回原子性 ──────────────────────────────────────
+
+
+def test_reconcile_backfills_missing_tool_results() -> None:
+    """已声明的工具调用若缺少 TOOL_RESULT，应补写占位回执。"""
+    from plugins.kokoro_flow_chatter.execution.decision_executor import (
+        _reconcile_missing_tool_results,
+    )
+    from plugins.kokoro_flow_chatter.protocol.tool_call_adapter import (
+        build_decision_draft,
+    )
+
+    draft = build_decision_draft(
+        [
+            ToolCall(name="action-draw_image", args={"prompt": "fox"}, id="draw1"),
+            ToolCall(name="action-kfc_reply", args={"content": ["画好了"]}, id="reply1"),
+        ]
+    )
+    # 模拟 auto_append：链里已有 ASSISTANT(tool_calls)，但 draw_image 的
+    # TOOL_RESULT 未写回（kfc_reply 已写回）
+    response = _FakeResponse(
+        [
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [
+                    ToolCall(name="action-draw_image", args={}, id="draw1"),
+                    ToolCall(name="action-kfc_reply", args={}, id="reply1"),
+                ],
+            ),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                ToolResult(value="已发送", call_id="reply1", name="action-kfc_reply"),
+            ),
+        ]
+    )
+
+    healed = _reconcile_missing_tool_results(response, draft)
+
+    assert healed == 1
+    results = [
+        part.call_id
+        for payload in response.payloads
+        if payload.role == ROLE.TOOL_RESULT
+        for part in payload.content
+        if isinstance(part, ToolResult)
+    ]
+    assert set(results) == {"reply1", "draw1"}
+    # 幂等：再次调用不再补写
+    assert _reconcile_missing_tool_results(response, draft) == 0
+
+
+@pytest.mark.asyncio
+async def test_executor_reconciles_on_cancelled_framework_call() -> None:
+    """第三方工具等待被取消时，应补写缺失 TOOL_RESULT 并让异常传播。"""
+    draft = build_decision_draft(
+        [
+            ToolCall(name="action-draw_image", args={"prompt": "fox"}, id="draw1"),
+            ToolCall(name="action-kfc_reply", args={"content": ["画好了"]}, id="reply1"),
+        ]
+    )
+    response = _FakeResponse()
+    # 模拟 auto_append：链里已有 ASSISTANT(tool_calls) 声明两个工具
+    response.payloads.append(
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                ToolCall(name="action-draw_image", args={}, id="draw1"),
+                ToolCall(name="action-kfc_reply", args={}, id="reply1"),
+            ],
+        )
+    )
+
+    async def _execute_reply(
+        content: str,
+        _config: Any,
+        _trigger_msg: Any | None,
+        _reply_to: str,
+    ) -> bool:
+        return True
+
+    async def _cancel_run_tool_call(
+        _pending_calls: list[Any],
+        _target_response: Any,
+        _usable_map: Any,
+        _trigger_msg: Any | None,
+    ) -> list[tuple[bool, bool]]:
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await execute_decision_draft(
+            draft,
+            response,
+            usable_map=cast(Any, {}),
+            trigger_msg=object(),
+            config=cast(Any, _FakeConfig()),
+            execute_reply_fn=_execute_reply,
+            run_tool_call_fn=_cancel_run_tool_call,
+        )
+
+    # 取消后 finally 已补写缺失的两个 TOOL_RESULT
+    results = {
+        part.call_id
+        for payload in response.payloads
+        if payload.role == ROLE.TOOL_RESULT
+        for part in payload.content
+        if isinstance(part, ToolResult)
+    }
+    assert results == {"draw1", "reply1"}
