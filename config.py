@@ -357,6 +357,19 @@ class KFCConfig(BaseConfig):
             description="是否在日志中显示 LLM 响应的美化摘要",
         )
 
+    @config_section("snapshot")
+    class SnapshotSection(SectionBase):
+        """完整上下文快照配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description=(
+                "是否启用完整上下文快照。启用后，每次成功发送 LLM 请求前把完整"
+                "payload 链持久化到磁盘，重启后首次 execute() 启动时恢复，"
+                "消除重启导致的上下文连续性损失。"
+            ),
+        )
+
     general: GeneralSection = Field(default_factory=GeneralSection)
     wait: WaitSection = Field(default_factory=WaitSection)
     proactive: ProactiveSection = Field(default_factory=ProactiveSection)
@@ -364,3 +377,4 @@ class KFCConfig(BaseConfig):
     prompt: PromptSection = Field(default_factory=PromptSection)
     buffer: BufferSection = Field(default_factory=BufferSection)
     debug: DebugSection = Field(default_factory=DebugSection)
+    snapshot: SnapshotSection = Field(default_factory=SnapshotSection)

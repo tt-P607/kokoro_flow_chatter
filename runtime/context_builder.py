@@ -61,6 +61,10 @@ async def build_initial_request(
 ) -> tuple[Any, ToolRegistry]:
     """构建初始 LLM 请求并注册可用工具。
 
+    若启用了完整上下文快照且会话携带上次运行的快照，则以快照还原的
+    多角色历史链为对话链来源；否则回退到 ``session.chain_payloads``
+    的精简还原路径。
+
     Args:
         chatter: 当前 chatter 实例，提供工具注入能力。
         chat_stream: 当前聊天流。
@@ -84,14 +88,36 @@ async def build_initial_request(
         config=config,
         session=session,
     )
-    system_payloads, chain_payloads, _has_history = await render_initial_context(
-        chat_stream=chat_stream,
-        plan=plan,
-        mental_log=session.mental_log,
-        serialized_chain_payloads=list(session.chain_payloads),
-    )
-    for payload in (*system_payloads, *chain_payloads):
-        request.add_payload(payload)
+
+    restored_payloads: list[Any] | None = None
+    snapshot = session.context_snapshot if config.snapshot.enabled else None
+    if snapshot is not None and snapshot.entries:
+        from ..snapshot import deserialize_snapshot, log_snapshot_restored
+
+        restored = deserialize_snapshot(snapshot)
+        if restored:
+            restored_payloads = restored
+            log_snapshot_restored(snapshot, len(restored))
+
+    if restored_payloads is not None:
+        system_payloads, _, _has_history = await render_initial_context(
+            chat_stream=chat_stream,
+            plan=plan,
+            mental_log=session.mental_log,
+            serialized_chain_payloads=[],
+            skip_narrative=True,
+        )
+        for payload in (*system_payloads, *restored_payloads):
+            request.add_payload(payload)
+    else:
+        system_payloads, chain_payloads, _has_history = await render_initial_context(
+            chat_stream=chat_stream,
+            plan=plan,
+            mental_log=session.mental_log,
+            serialized_chain_payloads=list(session.chain_payloads),
+        )
+        for payload in (*system_payloads, *chain_payloads):
+            request.add_payload(payload)
 
     usable_map = await chatter.inject_usables(request)
     return request, usable_map

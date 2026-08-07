@@ -107,6 +107,7 @@ async def render_initial_context(
     plan: InitialContextPlan,
     mental_log: MentalLog | None,
     serialized_chain_payloads: list[dict[str, Any]],
+    skip_narrative: bool = False,
     build_system_prompt_fn: Callable[
         [ChatStream, dict[str, str] | None], Awaitable[str]
     ]
@@ -121,11 +122,16 @@ async def render_initial_context(
     动态 USER payload，以及从存档还原的历史对话链。先说明当前背景、
     再展开过去对话，语义顺序更自然。
 
+    当以完整上下文快照恢复历史链时，应传 ``skip_narrative=True``：快照链
+    本身已是最新最完整的近期对话（含工具调用与结果），此时再生成融合叙事
+    会与快照链重叠（同进程内 ``history_messages`` 仍在内存）。
+
     Args:
         chat_stream: 当前聊天流。
         plan: 初始上下文规划结果。
         mental_log: 心理活动流，供融合叙事使用。
         serialized_chain_payloads: 存档中的对话链条目。
+        skip_narrative: 是否跳过融合叙事（快照恢复历史链时传 True）。
         build_system_prompt_fn: 系统提示词构建器，默认用本模块实现。
         build_fused_narrative_fn: 融合叙事构建器，默认用本模块实现。
 
@@ -146,10 +152,17 @@ async def render_initial_context(
     if summary_payload is not None:
         dynamic_parts.append(_collect_payload_text(summary_payload))
 
-    history_text = narrative_builder(chat_stream, mental_log, plan.history_before_ts)
-    if not history_text:
-        history_text = _collect_payload_text(build_current_time_payload())
-    dynamic_parts.append(history_text)
+    has_history = False
+    if not skip_narrative:
+        history_text = narrative_builder(chat_stream, mental_log, plan.history_before_ts)
+        if not history_text:
+            history_text = _collect_payload_text(build_current_time_payload())
+        dynamic_parts.append(history_text)
+        has_history = bool(history_text)
+    else:
+        # 快照恢复路径跳过融合叙事，但仍需当前时间锚点，
+        # 让恢复后的模型知道"现在"是什么时候。
+        dynamic_parts.append(_collect_payload_text(build_current_time_payload()))
 
     chain_payloads: list[LLMPayload] = [
         LLMPayload(ROLE.USER, Text(SECTION_SEPARATOR.join(dynamic_parts)))
@@ -157,7 +170,11 @@ async def render_initial_context(
     restored_payloads = restore_chain_payloads(serialized_chain_payloads)
     chain_payloads.extend(restored_payloads)
 
-    return system_payloads, chain_payloads, bool(history_text) or bool(restored_payloads)
+    return (
+        system_payloads,
+        chain_payloads,
+        has_history or bool(restored_payloads),
+    )
 
 
 def render_user_payload(

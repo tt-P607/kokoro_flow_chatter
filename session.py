@@ -23,6 +23,7 @@ from src.app.plugin_system.api.log_api import get_logger
 
 from .mental_log import MentalLog, MentalLogEntry
 from .models import MEMO_MAX_ENTRIES, KFCEventType, Memo, WaitingConfig
+from .snapshot import ContextSnapshot
 
 logger = get_logger("kfc_session")
 
@@ -61,6 +62,11 @@ class KFCSession:
 
     mental_log: MentalLog = field(default_factory=MentalLog)
     """心理活动流。"""
+
+    context_snapshot: ContextSnapshot | None = None
+    """完整上下文快照。镜像最近一次发送给模型的完整 payload 链（含工具
+    调用与结果），随会话 JSON 一并持久化；重启后首次 execute() 启动时
+    优先据此恢复上下文，缺失时回退到 ``chain_payloads``。"""
 
     chain_payloads: list[dict[str, Any]] = field(default_factory=list)
     chain_cutoff_ts: float = 0.0
@@ -355,6 +361,9 @@ class KFCSession:
             "scheduled_proactive_reason": self.scheduled_proactive_reason,
             "mental_log": self.mental_log.to_list(),
             "total_interactions": self.total_interactions,
+            "context_snapshot": (
+                self.context_snapshot.to_dict() if self.context_snapshot else None
+            ),
             "chain_payloads": self.chain_payloads,
             "chain_cutoff_ts": self.chain_cutoff_ts,
             "history_summary": self.history_summary,
@@ -399,6 +408,9 @@ class KFCSession:
             max_entries=max_log_entries,
         )
         session.total_interactions = int(data.get("total_interactions", 0))
+        raw_snapshot = data.get("context_snapshot")
+        if isinstance(raw_snapshot, dict):
+            session.context_snapshot = ContextSnapshot.from_dict(raw_snapshot)
         session.chain_payloads = data.get("chain_payloads", [])
         session.chain_cutoff_ts = float(data.get("chain_cutoff_ts", 0.0))
         session.history_summary = data.get("history_summary", "")

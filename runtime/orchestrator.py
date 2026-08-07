@@ -149,6 +149,7 @@ async def execute_orchestrator(
                 [turn_input.extra_payload] if turn_input.extra_payload else []
             )
             send_target = build_request_view(response, transient_payloads)
+            await _save_snapshot(chatter, response, config, session)
             if config.debug.show_prompt:
                 chatter.log_prompt(send_target, session.chain_payloads)
 
@@ -405,3 +406,35 @@ def _exceeded_retry_limit(config: Any, state: _LoopState) -> bool:
     state.follow_up_count = 0
     state.has_pending_tool_results = False
     return True
+
+
+async def _save_snapshot(chatter: Any, response: Any, config: Any, session: Any) -> None:
+    """在发送前把主链上下文持久化为快照（写入会话 JSON）。
+
+    时机对齐 ndfc 的 ``before_llm_request``。保存 ``response.payloads``
+    主链而非含临时注入项的发送视图——第三方附加上下文是 turn 级瞬时内容，
+    固化进历史会造成污染；主链才是真正可持续累积的对话链。快照作为
+    ``session.context_snapshot`` 覆盖式更新并随会话一并落盘，供重启后
+    ``build_initial_request`` 恢复，保证重启前后上下文一致。
+
+    Args:
+        chatter: 当前 chatter 实例，提供会话保存能力。
+        response: 主链对象（``response``）。
+        config: KFC 配置，提供快照开关。
+        session: 当前会话，快照写入其 ``context_snapshot`` 字段。
+    """
+    if not config.snapshot.enabled:
+        return
+    try:
+        from ..snapshot import capture_snapshot_from_payloads
+
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list) or not payloads:
+            return
+        snapshot = capture_snapshot_from_payloads(chatter.stream_id, payloads)
+        if snapshot is None:
+            return
+        session.context_snapshot = snapshot
+        await chatter.save_session(session)
+    except Exception as error:
+        logger.warning(f"保存上下文快照失败 stream={chatter.stream_id[:8]}: {error}")

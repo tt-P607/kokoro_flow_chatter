@@ -14,6 +14,7 @@ KFC 是一个面向私聊场景的 Chatter 插件。与传统聊天器不同，K
 
 - **心理活动流**：每次回复附带内心独白（情绪、期待），形成可回顾的心理时间线
 - **近期记忆压缩**：自动将近期对话压缩为第一人称叙事摘要，长期对话不丢失上下文
+- **完整上下文快照**：每次成功发送 LLM 请求前把完整 payload 链（含工具调用与结果）持久化到会话 JSON，重启后恢复，消除重启导致的上下文连续性损失
 - **私人备忘录**：LLM 可自主记录带过期时间的待办/提醒，自动过期清理
 - **等待与超时**：回复后进入等待状态，超时后智能决定追问、继续或结束
 - **主动发起**：沉默超过阈值后有概率主动发起对话，支持深夜静默和模型预约
@@ -262,6 +263,12 @@ kokoro_flow_chatter/
 | `show_prompt` | `false` | 显示完整提示词 |
 | `show_response` | `true` | 显示响应摘要 |
 
+### `[snapshot]` 完整上下文快照
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `enabled` | `true` | 启用完整上下文快照。每次成功发送 LLM 请求前把主链 payload 持久化到会话 JSON（`data/kokoro_flow_chatter/sessions/<stream_id>.json`）；重启后首次 `execute()` 启动时恢复，保证重启前后上下文一致 |
+
 ---
 
 ## 组件签名
@@ -282,6 +289,7 @@ kokoro_flow_chatter/
 - 主动发起检查使用名为 `kfc_proactive_check` 的周期调度；插件卸载时会移除。
 - 近期摘要按聊天流去重调度；同一流不会并发启动多份压缩任务，卸载时会取消残留任务。
 - 会话状态保存在 `data/kokoro_flow_chatter/sessions/`，按 `stream_id` 隔离；同目录下的 `_index.json` 维护 `stream_id` 与账号的可读映射。
+- **单一 JSON 承载全部会话数据**：`mental_log`（日记）、`history_summary`（近期记忆摘要）、`memos`（备忘录）、`context_snapshot`（完整上下文快照）等所有跨轮状态都在同一个 `<stream_id>.json` 文件里，不设额外存储目录。
 - 禁用 `[general].enabled` 后不注册 Chatter，由框架为私聊流选择其他可用 Chatter。
 
 ## 自动测试
