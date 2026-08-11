@@ -32,6 +32,7 @@ from ..domain.chain_entry import ChainEntry
 from ..execution import run_decision
 from ..protocol.response_normalizer import normalize_response
 from ..services import ProactiveService, TimeoutService
+from ..snapshot import capture_snapshot
 from .context_builder import build_initial_request
 from .input_status import InputStatusReporter
 from .model_setup import resolve_model_set
@@ -190,7 +191,12 @@ async def execute_orchestrator(
             heal_orphan_tool_results(response, where="post-send")
 
             if not response.call_list:
-                if state.plain_text_retry_count < config.general.max_follow_up_retries:
+                # 每次纯文本纠正重试都会重新走完整的多模型 fallback，因此
+                # 上限按"每个模型各 max_follow_up_retries 次"放大，避免多个
+                # 模型共享同一份总重试额度而提前收口。
+                model_count = len(model_set) if isinstance(model_set, list) else 1
+                max_retries = config.general.max_follow_up_retries * model_count
+                if state.plain_text_retry_count < max_retries:
                     _log_missing_tool_call(response, state)
                     state.plain_text_retry_count += 1
                     response.add_payload(
@@ -241,6 +247,16 @@ async def execute_orchestrator(
                     yield Stop(0)
                     return
                 state.has_pending_tool_results = True
+
+            # 回合闭合点：无待消化工具结果时，主链已含本轮完整 bot 输出
+            # （推理 + 正文 + 工具调用 + 回执）且工具段必然闭合，捕获无损快照。
+            if not turn_control.has_pending_tool_results:
+                snapshot = capture_snapshot(
+                    response.payloads, config.prompt.max_context_payloads
+                )
+                if snapshot is not None:
+                    session.context_snapshot = snapshot
+                    await chatter.save_session(session)
 
             if turn_control.chain_assistant_saved:
                 # assistant 已入链，清空暂存避免续轮时重复持久化 user 条目

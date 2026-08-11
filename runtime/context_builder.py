@@ -17,8 +17,12 @@ from src.app.plugin_system.api.llm_api import (
     ReminderSourceSpec,
     create_llm_request,
 )
+from src.app.plugin_system.api.log_api import get_logger
 
 from ..context import plan_initial_context, render_initial_context
+from ..snapshot import deserialize_snapshot
+
+logger = get_logger("kfc_context_builder")
 
 if TYPE_CHECKING:
     from src.app.plugin_system.api.llm_api import ToolRegistry
@@ -90,6 +94,18 @@ async def build_initial_request(
         mental_log=session.mental_log,
         serialized_chain_payloads=list(session.chain_payloads),
     )
+
+    restored_snapshot = deserialize_snapshot(session.context_snapshot)
+    if restored_snapshot:
+        # 快照整链替换动态 USER 与历史链（首条 USER 已含上次的动态上下文
+        # 与首轮新消息），并清空 chain_cutoff_ts 避免融合叙事与快照重叠。
+        chain_payloads = restored_snapshot
+        session.chain_cutoff_ts = 0.0
+        logger.info(
+            f"已从上下文快照恢复 {len(chain_payloads)} 条 payload "
+            f"(stream={chatter.stream_id[:8]})"
+        )
+
     for payload in (*system_payloads, *chain_payloads):
         request.add_payload(payload)
 

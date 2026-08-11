@@ -68,6 +68,10 @@ class KFCSession:
     ``chain_cutoff_ts`` 记录链头首个 user 条目的时间戳，供融合叙事截断，
     避免叙事与链内容重叠。"""
 
+    context_snapshot: list[dict[str, Any]] | None = None
+    """上下文快照（来自主链 ``response.payloads``）。重启后优先恢复为
+    多角色 LLM 原始返回，缺失或校验失败时回退 ``chain_payloads``。"""
+
     history_summary: str = ""
     last_compress_at: float = 0.0
     compress_round_count: int = 0
@@ -357,6 +361,7 @@ class KFCSession:
             "total_interactions": self.total_interactions,
             "chain_payloads": self.chain_payloads,
             "chain_cutoff_ts": self.chain_cutoff_ts,
+            "context_snapshot": self.context_snapshot,
             "history_summary": self.history_summary,
             "last_compress_at": self.last_compress_at,
             "compress_round_count": self.compress_round_count,
@@ -401,6 +406,7 @@ class KFCSession:
         session.total_interactions = int(data.get("total_interactions", 0))
         session.chain_payloads = data.get("chain_payloads", [])
         session.chain_cutoff_ts = float(data.get("chain_cutoff_ts", 0.0))
+        session.context_snapshot = data.get("context_snapshot")
         session.history_summary = data.get("history_summary", "")
         session.last_compress_at = float(data.get("last_compress_at", 0.0))
         session.compress_round_count = int(data.get("compress_round_count", 0))
