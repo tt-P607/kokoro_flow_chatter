@@ -97,12 +97,14 @@ async def build_initial_request(
 
     restored_snapshot = deserialize_snapshot(session.context_snapshot)
     if restored_snapshot:
-        # 快照整链替换动态 USER 与历史链（首条 USER 已含上次的动态上下文
-        # 与首轮新消息），并清空 chain_cutoff_ts 避免融合叙事与快照重叠。
-        chain_payloads = restored_snapshot
+        # 保留最新动态 USER（通道 + 日记总结 + 历史叙事）作为链头，
+        # 快照完整对话历史（含首轮用户消息）接在其后：既保留最新日记
+        # 总结与历史消息，又不丢模型原始返回。清空 chain_cutoff_ts 避免
+        # 融合叙事与快照首条 USER 重叠。
+        chain_payloads = [chain_payloads[0], *restored_snapshot]
         session.chain_cutoff_ts = 0.0
         logger.info(
-            f"已从上下文快照恢复 {len(chain_payloads)} 条 payload "
+            f"已从上下文快照恢复 {len(restored_snapshot)} 条历史 payload "
             f"(stream={chatter.stream_id[:8]})"
         )
 

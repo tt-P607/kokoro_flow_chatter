@@ -220,3 +220,36 @@ def test_capture_snapshot_and_deserialize_round_trip() -> None:
     assert roles[-1] == ROLE.ASSISTANT
     # reminder 已剥离
     assert "system_reminder" not in _text_of(restored[1])
+
+
+def test_restore_chain_keeps_dynamic_user_and_snapshot_history() -> None:
+    """快照恢复拼接：最新动态 USER 为链头，快照完整历史接其后。
+
+    这等价于 ``context_builder`` 的拼接语义（动态 USER 含最新日记总结，
+    快照历史含真实用户消息与 bot 回复），确保两者都不丢失。
+    """
+    snapshot = capture_snapshot(
+        [
+            LLMPayload(ROLE.USER, Text("[新消息]\n你好")),
+            LLMPayload(ROLE.ASSISTANT, Text("回复")),
+        ],
+        30,
+    )
+    restored = deserialize_snapshot(snapshot)
+    assert restored is not None
+
+    dynamic_user = LLMPayload(
+        ROLE.USER,
+        Text("[通道]\n\n---\n\n【日记总结】今天很开心。\n\n---\n\n[历史叙事]"),
+    )
+    final_chain = [dynamic_user, *restored]
+
+    joined = "\n".join(_text_of(p) for p in final_chain)
+    # 最新日记总结在链中（不再被快照覆盖）
+    assert "【日记总结】今天很开心。" in joined
+    # 快照历史完整保留
+    assert "你好" in joined
+    assert "回复" in joined
+    # 首条为 USER，快照首条 USER 也保留（不丢首轮真实消息）
+    assert final_chain[0].role == ROLE.USER
+    assert final_chain[1].role == ROLE.USER
