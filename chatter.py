@@ -156,7 +156,7 @@ class KokoroFlowChatter(BaseChatter):
 
         if not isinstance(self.plugin, KFCPlugin):
             raise RuntimeError("KokoroFlowChatter 未运行在 KFCPlugin 上下文中")
-        return self.plugin.session_store
+        return self.plugin.session_store  # type: ignore[attr-defined]
 
     async def load_session(self) -> KFCSession:
         """读取当前流的会话（持有流级锁）。"""
