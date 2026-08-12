@@ -1,77 +1,86 @@
 {
-    "name": "kokoro_flow_chatter",
-    "api_version": {"adapter_api": "1.0.0", "chat_api": "1.0.0", "event_api": "1.0.0", "llm_api": "1.0.0", "log_api": "1.0.0", "prompt_api": "1.0.0", "send_api": "1.0.0", "storage_api": "1.0.0", "stream_api": "1.0.0"},
-
-    "display_name": "KokoroFlow 对话引擎",
-    "version": "2.4.0",
-    "description": "KokoroFlow 对话引擎 — 基于心理活动流的私聊特化聊天器",
-    "author": "言柒",
-    "license": "AGPL-v3.0",
-    "categories": [
-        "chat"
-    ],
-    "tags": [
-        "chat",
-        "chatter",
-        "kokoro",
-        "flow"
-    ],
-    "dependencies": {
-        "plugins": [],
-        "components": []
+  "name": "kokoro_flow_chatter",
+  "api_version": {
+    "adapter_api": "1.0.0",
+    "chat_api": "1.0.0",
+    "event_api": "1.0.0",
+    "llm_api": "1.0.0",
+    "log_api": "1.0.0",
+    "prompt_api": "1.0.0",
+    "send_api": "1.0.0",
+    "storage_api": "1.0.0",
+    "stream_api": "1.0.0"
+  },
+  "display_name": "KokoroFlow 对话引擎",
+  "version": "2.4.1",
+  "description": "KokoroFlow 对话引擎 — 基于心理活动流的私聊特化聊天器",
+  "author": "言柒",
+  "license": "AGPL-v3.0",
+  "categories": [
+    "chat"
+  ],
+  "tags": [
+    "chat",
+    "chatter",
+    "kokoro",
+    "flow"
+  ],
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "chatter",
+      "component_name": "kokoro_flow_chatter",
+      "dependencies": []
     },
-    "include": [
-        {
-            "component_type": "chatter",
-            "component_name": "kokoro_flow_chatter",
-            "dependencies": []
-        },
-        {
-            "component_type": "action",
-            "component_name": "kfc_reply",
-            "dependencies": []
-        },
-        {
-            "component_type": "action",
-            "component_name": "do_nothing",
-            "dependencies": []
-        },
-        {
-            "component_type": "action",
-            "component_name": "pass_and_wait",
-            "dependencies": []
-        },
-        {
-            "component_type": "action",
-            "component_name": "schedule_proactive",
-            "dependencies": []
-        },
-        {
-            "component_type": "action",
-            "component_name": "kfc_memo",
-            "dependencies": []
-        },
-        {
-            "component_type": "action",
-            "component_name": "kfc_memo_delete",
-            "dependencies": []
-        },
-        {
-            "component_type": "event_handler",
-            "component_name": "kfc_proactive_handler",
-            "dependencies": []
-        },
-        {
-            "component_type": "event_handler",
-            "component_name": "kfc_voice_call_history_handler",
-            "dependencies": []
-        },
-        {
-            "component_type": "config",
-            "component_name": "config",
-            "dependencies": []
-        }
-    ],
-    "entry_point": "plugin.py",
-    "min_core_version": "1.0.0"
+    {
+      "component_type": "action",
+      "component_name": "kfc_reply",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "do_nothing",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "pass_and_wait",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "schedule_proactive",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "kfc_memo",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "kfc_memo_delete",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "kfc_proactive_handler",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "kfc_voice_call_history_handler",
+      "dependencies": []
+    },
+    {
+      "component_type": "config",
+      "component_name": "config",
+      "dependencies": []
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0"
 }

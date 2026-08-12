@@ -46,8 +46,6 @@ class KFCPlugin(BasePlugin):
     """KokoroFlowChatter 插件。"""
 
     plugin_name = "kokoro_flow_chatter"
-    plugin_author = "言柒"
-    plugin_description = "心理活动流聊天器，模拟真实人类的连续心理活动和对话节奏"
     configs = [KFCConfig]
 
     session_store: KFCSessionStore
