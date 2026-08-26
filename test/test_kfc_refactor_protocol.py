@@ -17,6 +17,8 @@ _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from src.app.plugin_system.base import Wait  # noqa: E402
+
 from src.app.plugin_system.types import (  # noqa: E402
     LLMPayload,
     ROLE,
@@ -44,7 +46,11 @@ from plugins.kokoro_flow_chatter.context.types import (  # noqa: E402
     InitialContextPlan,
 )
 from plugins.kokoro_flow_chatter.domain.chain_entry import ChainEntry  # noqa: E402
-from plugins.kokoro_flow_chatter.domain.decision import Decision  # noqa: E402
+from plugins.kokoro_flow_chatter.domain.decision import (  # noqa: E402
+    Decision,
+    ProactiveSchedule,
+    build_experience_snapshot,
+)
 from plugins.kokoro_flow_chatter.domain.turn_trigger import (  # noqa: E402
     TurnTrigger,
     classify_turn_trigger,
@@ -90,6 +96,7 @@ from plugins.kokoro_flow_chatter.runtime.request_view import (  # noqa: E402
     build_request_view,
 )
 from plugins.kokoro_flow_chatter.runtime.turn_controller import (  # noqa: E402
+    _final_signal,
     build_chain_assistant_entry,
 )
 from plugins.kokoro_flow_chatter.runtime.unread_policy import (  # noqa: E402
@@ -365,6 +372,62 @@ def test_build_decision_extracts_replies_and_schedule() -> None:
     assert decision.proactive_schedule is not None
     assert decision.proactive_schedule.delay_minutes == 30.0
     assert decision.proactive_schedule.reason == "想你"
+
+
+def test_experience_snapshot_is_closed_structural_metadata_only() -> None:
+    """闭合回合快照只输出固定结构状态，pending 时不提前输出。"""
+    decision = Decision(
+        thought="internal thought",
+        actions=[
+            {"type": "draw_image", "prompt": "raw prompt"},
+            {"type": "kfc_reply", "content": ["raw reply"]},
+        ],
+        has_reply_action=True,
+        has_meaningful_action=True,
+        has_failed_tool=True,
+        proactive_schedule=ProactiveSchedule(delay_minutes=3.0),
+    )
+
+    snapshot = build_experience_snapshot(
+        decision,
+        result_signal="wait",
+        wait_seconds=12.0,
+    )
+
+    assert snapshot is not None
+    assert set(snapshot) == {
+        "schema_version",
+        "actor_round_closed",
+        "result_signal",
+        "has_meaningful_action",
+        "reply_attempted",
+        "chose_silence",
+        "waiting_after_round",
+        "wait_seconds",
+        "attention_hint",
+        "proactive_plan_exists",
+        "attempted_action_names",
+        "has_failed_action",
+        "pending_tool_results",
+    }
+    assert snapshot["attempted_action_names"] == ["draw_image", "kfc_reply"]
+    serialized = str(snapshot)
+    assert "raw prompt" not in serialized
+    assert "raw reply" not in serialized
+    assert "internal thought" not in serialized
+    assert build_experience_snapshot(
+        decision,
+        result_signal="stop",
+        pending_tool_results=True,
+    ) is None
+    signal = _final_signal(
+        Wait(0),
+        decision,
+        result_signal="wait",
+        wait_seconds=12.0,
+    )
+    assert signal.step_data is not None
+    assert signal.step_data["experience_snapshot"] == snapshot
 
 
 # ── 执行层 ────────────────────────────────────────────────

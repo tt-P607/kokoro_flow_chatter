@@ -78,6 +78,7 @@ async def build_initial_request(
     request = create_llm_request(
         model_set,
         REQUEST_NAME,
+        stream_id=chatter.stream_id,
         context_manager=LLMContextManager(
             reminder_sources=_build_reminder_sources(chatter.stream_id),
         ),

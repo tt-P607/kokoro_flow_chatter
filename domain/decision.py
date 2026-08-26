@@ -71,3 +71,48 @@ class Decision:
     def reply_text(self) -> str:
         """按发送顺序拼接的用户可见回复文本。"""
         return "\n".join(self.visible_reply_segments)
+
+
+def build_experience_snapshot(
+    decision: Decision,
+    *,
+    result_signal: str,
+    wait_seconds: float = 0.0,
+    pending_tool_results: bool = False,
+) -> dict[str, Any] | None:
+    """构造 SCF 可消费的最小结构化回合快照。
+
+    只有无待消化工具结果的最终 Wait/Stop 才代表 actor round 已闭合。
+    输出只包含结构状态与动作名，不携带回复文本、参数或内部推理。
+    """
+    if pending_tool_results or result_signal not in {"wait", "stop"}:
+        return None
+
+    has_proactive_plan = (
+        decision.proactive_schedule is not None
+        and decision.proactive_schedule.delay_minutes > 0
+    )
+    if result_signal == "wait":
+        attention_hint = "waiting_for_user"
+    elif has_proactive_plan:
+        attention_hint = "proactive_scheduled"
+    else:
+        attention_hint = "none"
+
+    return {
+        "schema_version": 1,
+        "actor_round_closed": True,
+        "result_signal": result_signal,
+        "has_meaningful_action": decision.has_meaningful_action,
+        "reply_attempted": decision.has_reply_action,
+        "chose_silence": decision.chose_silence,
+        "waiting_after_round": result_signal == "wait",
+        "wait_seconds": max(0.0, float(wait_seconds)),
+        "attention_hint": attention_hint,
+        "proactive_plan_exists": has_proactive_plan,
+        "attempted_action_names": [
+            str(action.get("type", "")) for action in decision.actions if action.get("type")
+        ],
+        "has_failed_action": decision.has_failed_tool,
+        "pending_tool_results": False,
+    }

@@ -24,6 +24,7 @@ from ..context import (
     render_user_payload,
 )
 from ..domain.chain_entry import ChainEntry
+from ..domain.decision import build_experience_snapshot
 from ..domain.turn_trigger import TurnTrigger, classify_turn_trigger
 from ..models import KFCEventType, WaitingConfig
 from ..services import SummaryService
@@ -326,7 +327,11 @@ async def commit_turn_decision(
             logger.warning("LLM 未返回有效动作且消息为空，强制终止本次对话循环")
         await chatter.save_session(session)
         return TurnControlResult(
-            next_signal=Stop(0),
+            next_signal=_final_signal(
+                Stop(0),
+                decision,
+                result_signal="stop",
+            ),
             return_after_yield=True,
             is_final_timeout=is_final_timeout,
         )
@@ -374,7 +379,12 @@ async def commit_turn_decision(
         )
         await chatter.save_session(session)
         return TurnControlResult(
-            next_signal=Wait(0),
+            next_signal=_final_signal(
+                Wait(0),
+                decision,
+                result_signal="wait",
+                wait_seconds=wait_seconds,
+            ),
             continue_loop=True,
             is_final_timeout=is_final_timeout,
             chain_assistant_saved=chain_assistant_saved,
@@ -383,11 +393,33 @@ async def commit_turn_decision(
     session.clear_waiting()
     await chatter.save_session(session)
     return TurnControlResult(
-        next_signal=Stop(0),
+        next_signal=_final_signal(
+            Stop(0),
+            decision,
+            result_signal="stop",
+        ),
         return_after_yield=True,
         is_final_timeout=is_final_timeout,
         chain_assistant_saved=chain_assistant_saved,
     )
+
+
+def _final_signal(
+    signal: Wait | Stop,
+    decision: Decision,
+    *,
+    result_signal: str,
+    wait_seconds: float = 0.0,
+) -> Wait | Stop:
+    """给已闭合回合的最终控制信号附加结构化 experience snapshot。"""
+    snapshot = build_experience_snapshot(
+        decision,
+        result_signal=result_signal,
+        wait_seconds=wait_seconds,
+    )
+    if snapshot is not None:
+        signal.step_data = {"experience_snapshot": snapshot}
+    return signal
 
 
 async def _save_assistant_chain(
