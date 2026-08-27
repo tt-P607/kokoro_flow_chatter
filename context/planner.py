@@ -113,4 +113,4 @@ def build_last_mile_payload() -> LLMPayload:
         "请务必保持你的回复符合你的人设和表达风格，\n"
         "同时请确保你的回复有理有据，禁止无根据地编造信息或胡乱回复。"
     )
-    return LLMPayload(ROLE.USER, Text(last_mile_instructions))
+    return LLMPayload(ROLE.SYSTEM, Text(last_mile_instructions))

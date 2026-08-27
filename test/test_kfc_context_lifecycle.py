@@ -122,6 +122,7 @@ def test_dynamic_background_and_transients_do_not_enter_snapshot() -> None:
         build_last_mile_payload(),
         LLMPayload(ROLE.USER, Text("重试提醒")),
     ]
+    assert transients[0].role == ROLE.SYSTEM
     result = [
         LLMPayload(ROLE.USER, Text("<system_reminder>提醒</system_reminder>真实用户输入")),
         *transients,
