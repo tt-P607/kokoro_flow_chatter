@@ -1,7 +1,7 @@
 """KFC 会话状态与持久化存储。
 
 ``KFCSession`` 保存单个聊天流的全部跨轮状态：等待配置、心理活动流、
-持久化对话链、近期记忆摘要、备忘录与主动发起预约。
+唯一持久 transcript 快照、近期记忆摘要、备忘录与主动发起预约。
 ``KFCSessionStore`` 负责按 ``stream_id`` 索引这些会话，并通过
 ``JSONStore`` 落盘到 ``data/kokoro_flow_chatter/sessions/``。
 
@@ -21,8 +21,11 @@ from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
+from src.app.plugin_system.types import LLMPayload
+
 from .mental_log import MentalLog, MentalLogEntry
 from .models import MEMO_MAX_ENTRIES, KFCEventType, Memo, WaitingConfig
+from .snapshot import serialize_payloads, trim_snapshot
 
 logger = get_logger("kfc_session")
 
@@ -62,15 +65,9 @@ class KFCSession:
     mental_log: MentalLog = field(default_factory=MentalLog)
     """心理活动流。"""
 
-    chain_payloads: list[dict[str, Any]] = field(default_factory=list)
-    chain_cutoff_ts: float = 0.0
-    """持久化对话链。每条形如 ``{"role", "text", "ts"?, "tool_calls"?}``；
-    ``chain_cutoff_ts`` 记录链头首个 user 条目的时间戳，供融合叙事截断，
-    避免叙事与链内容重叠。"""
-
     context_snapshot: list[dict[str, Any]] | None = None
-    """上下文快照（来自主链 ``response.payloads``）。重启后优先恢复为
-    多角色 LLM 原始返回，缺失或校验失败时回退 ``chain_payloads``。"""
+    """唯一持久对话状态（来自闭合回合的主链快照）。动态背景、备忘录和
+    其他当前请求注入不进入这里。"""
 
     history_summary: str = ""
     last_compress_at: float = 0.0
@@ -78,7 +75,7 @@ class KFCSession:
     """近期记忆摘要（替换式滚动压缩）及其触发计数。"""
 
     memos: list[Memo] = field(default_factory=list)
-    """私人备忘录。渲染为 turn 级上下文注入用户提示词末尾，不进对话链。"""
+    """私人备忘录。仅作为 turn 级 transient 注入，不进入持久 transcript。"""
 
     total_interactions: int = 0
     """累计 Bot 决策次数。"""
@@ -200,55 +197,25 @@ class KFCSession:
         self.scheduled_proactive_at = at
         self.scheduled_proactive_reason = reason if at is not None else ""
 
-    # ── 持久化对话链 ──────────────────────────────────────
+    # ── 持久上下文 ────────────────────────────────────────
 
-    def update_chain(
+    def append_context_entries(
         self,
-        new_entries: list[dict[str, Any]],
+        payloads: list[LLMPayload],
         max_payloads: int,
-    ) -> None:
-        """追加对话条目到持久化链并裁剪至上限。
+    ) -> bool:
+        """把合法的持久 payload 追加进唯一 transcript 快照。
 
-        user 条目按 ``(text, ts)`` 幂等去重：LLM 失败后下一 Tick 会重新
-        消费同一批未读，不去重会导致同一条消息被反复 append。assistant
-        条目不去重——每次 commit 对应一次真实的模型输出，即便文本相同
-        也应保留时序结构。
-
-        Args:
-            new_entries: 待追加的条目，形如
-                ``{"role": "user"|"assistant", "text": str, "ts"?: float}``。
-            max_payloads: 链最大条目数，超出时从头裁剪。
+        调用方必须只传入真实对话状态；动态背景、重试提醒、备忘录等
+        当前请求内容走 RequestView，不能进入本方法。
         """
-        filtered: list[dict[str, Any]] = []
-        for entry in new_entries:
-            if entry.get("role") == "user":
-                duplicated = any(
-                    existing.get("role") == "user"
-                    and existing.get("text", "") == entry.get("text", "")
-                    and existing.get("ts", 0.0) == entry.get("ts", 0.0)
-                    for existing in self.chain_payloads
-                )
-                if duplicated:
-                    continue
-            filtered.append(entry)
-
-        if not filtered:
-            return
-
-        self.chain_payloads.extend(filtered)
-        if len(self.chain_payloads) > max_payloads:
-            self.chain_payloads = self.chain_payloads[-max_payloads:]
-            # 裁剪后链头必须是 user，否则孤立的 assistant 会让上下文非法
-            while self.chain_payloads and self.chain_payloads[0].get("role") != "user":
-                self.chain_payloads.pop(0)
-
-        self.chain_cutoff_ts = 0.0
-        for entry in self.chain_payloads:
-            if entry.get("role") == "user":
-                ts = entry.get("ts", 0.0)
-                if isinstance(ts, (int, float)) and ts > 0:
-                    self.chain_cutoff_ts = float(ts)
-                break
+        entries = list(self.context_snapshot or [])
+        entries.extend(serialize_payloads(payloads))
+        entries = trim_snapshot(entries, max_payloads)
+        if not entries or entries == self.context_snapshot:
+            return False
+        self.context_snapshot = entries
+        return True
 
     # ── 备忘录管理 ────────────────────────────────────────
 
@@ -359,8 +326,6 @@ class KFCSession:
             "scheduled_proactive_reason": self.scheduled_proactive_reason,
             "mental_log": self.mental_log.to_list(),
             "total_interactions": self.total_interactions,
-            "chain_payloads": self.chain_payloads,
-            "chain_cutoff_ts": self.chain_cutoff_ts,
             "context_snapshot": self.context_snapshot,
             "history_summary": self.history_summary,
             "last_compress_at": self.last_compress_at,
@@ -404,8 +369,6 @@ class KFCSession:
             max_entries=max_log_entries,
         )
         session.total_interactions = int(data.get("total_interactions", 0))
-        session.chain_payloads = data.get("chain_payloads", [])
-        session.chain_cutoff_ts = float(data.get("chain_cutoff_ts", 0.0))
         session.context_snapshot = data.get("context_snapshot")
         session.history_summary = data.get("history_summary", "")
         session.last_compress_at = float(data.get("last_compress_at", 0.0))

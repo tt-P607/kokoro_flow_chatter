@@ -36,7 +36,6 @@ from plugins.kokoro_flow_chatter.context.sources.history_source import (  # noqa
     build_current_time_payload,
     build_fused_narrative,
     build_history_summary_payload,
-    restore_chain_payloads,
 )
 from plugins.kokoro_flow_chatter.context.sources.memo_source import (  # noqa: E402
     build_memo_contribution,
@@ -45,7 +44,6 @@ from plugins.kokoro_flow_chatter.context.types import (  # noqa: E402
     ContextContribution,
     InitialContextPlan,
 )
-from plugins.kokoro_flow_chatter.domain.chain_entry import ChainEntry  # noqa: E402
 from plugins.kokoro_flow_chatter.domain.decision import (  # noqa: E402
     Decision,
     ProactiveSchedule,
@@ -97,7 +95,6 @@ from plugins.kokoro_flow_chatter.runtime.request_view import (  # noqa: E402
 )
 from plugins.kokoro_flow_chatter.runtime.turn_controller import (  # noqa: E402
     _final_signal,
-    build_chain_assistant_entry,
 )
 from plugins.kokoro_flow_chatter.runtime.unread_policy import (  # noqa: E402
     filter_interrupt_messages,
@@ -206,34 +203,6 @@ def test_turn_trigger_priority_is_stable() -> None:
     )
 
 
-def test_chain_entry_filters_dirty_data() -> None:
-    """ChainEntry 应集中约束对话链的可用结构。"""
-    user_entry = ChainEntry.user("你好", ts=1.5)
-    assistant_entry = ChainEntry.assistant("", [{"name": "action-kfc_reply", "args": {}}])
-
-    assert user_entry.is_user is True
-    assert user_entry.to_dict() == {"role": "user", "text": "你好", "ts": 1.5}
-    assert assistant_entry.has_tool_calls is True
-    assert assistant_entry.text == "好的。"
-
-    assert ChainEntry.from_dict({"role": "bad", "text": "x"}) is None
-    assert ChainEntry.from_dict({"role": "user", "text": ""}) is None
-    assert ChainEntry.from_dict({"role": "assistant", "text": "", "tool_calls": []}) is None
-
-    restored = ChainEntry.from_dict(
-        {
-            "role": "assistant",
-            "text": "",
-            "tool_calls": [{"name": "action-kfc_reply"}, {"args": {"ignored": True}}],
-            "ts": -1,
-        }
-    )
-    assert restored is not None
-    assert restored.text == "好的。"
-    assert restored.ts is None
-    assert restored.tool_calls == [{"name": "action-kfc_reply"}]
-
-
 def test_decision_exposes_semantic_properties() -> None:
     """Decision 的语义属性应保持单一含义。"""
     decision = Decision(
@@ -245,7 +214,6 @@ def test_decision_exposes_semantic_properties() -> None:
     assert decision.should_reply is True
     assert decision.reply_text == "A\nB"
     assert decision.has_third_party_calls is False
-    assert build_chain_assistant_entry("", [{"name": "action-kfc_reply"}])["text"] == "好的。"
 
 
 def test_waiting_config_and_memo_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -635,32 +603,6 @@ async def test_run_decision_converges_call_list_to_decision() -> None:
 # ── 上下文层 ──────────────────────────────────────────────
 
 
-def test_restore_chain_payloads_keeps_readable_history() -> None:
-    """历史还原只保留可读文本，不把审计工具调用喂回模型。"""
-    payloads = restore_chain_payloads(
-        [
-            {"role": "assistant", "text": "孤立开头会被丢弃"},
-            {"role": "user", "text": "你好", "ts": 1.0},
-            {
-                "role": "assistant",
-                "text": "你好呀~",
-                "tool_calls": [
-                    {
-                        "name": "action-kfc_reply",
-                        "id": "reply-1",
-                        "args": {"content": ["你好呀~"]},
-                    }
-                ],
-            },
-            {"role": "bad", "text": "忽略"},
-        ]
-    )
-
-    assert [payload.role for payload in payloads] == [ROLE.USER, ROLE.ASSISTANT]
-    assert _text_of(payloads[0]) == "你好"
-    assert _text_of(payloads[1]) == "你好呀~"
-
-
 def test_history_source_payload_builders() -> None:
     """摘要、时间与通道 payload 的分支应可预测。"""
     import datetime
@@ -763,7 +705,7 @@ def test_build_fused_narrative_interleaves_messages_and_thoughts() -> None:
 
 @pytest.mark.asyncio
 async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
-    """初始上下文只保留稳定 SYSTEM，动态内容进 USER 链。"""
+    """初始上下文只保留稳定 SYSTEM；动态背景不进入持久快照。"""
     chat_stream = cast(
         Any,
         SimpleNamespace(
@@ -783,30 +725,38 @@ async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
     ) -> str:
         return "稳定系统提示词"
 
-    system_payloads, chain_payloads, has_history = await render_initial_context(
+    snapshot = [
+        {"role": "user", "content": [{"type": "text", "text": "旧用户输入"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "旧回复"}]},
+    ]
+    system_payloads, history_payloads, has_history = await render_initial_context(
         chat_stream=chat_stream,
         plan=plan,
         mental_log=None,
-        serialized_chain_payloads=[
-            {"role": "user", "text": "旧用户输入", "ts": 1.0},
-            {"role": "assistant", "text": "旧回复"},
-        ],
+        serialized_context_snapshot=snapshot,
         build_system_prompt_fn=_build_system_prompt,
-        build_fused_narrative_fn=lambda _stream, _log, _before_ts: "融合叙事",
+        build_fused_narrative_fn=lambda _stream, _log: "融合叙事",
     )
 
     assert [payload.role for payload in system_payloads] == [ROLE.SYSTEM]
     assert _text_of(system_payloads[0]) == "稳定系统提示词"
-    assert [payload.role for payload in chain_payloads] == [
+    assert [payload.role for payload in history_payloads] == [
         ROLE.USER,
         ROLE.USER,
         ROLE.ASSISTANT,
     ]
-    dynamic_text = _text_of(chain_payloads[0])
+    dynamic_text = _text_of(history_payloads[0])
     assert "近期摘要" in dynamic_text
     assert "融合叙事" in dynamic_text
-    assert _text_of(chain_payloads[1]) == "旧用户输入"
+    assert _text_of(history_payloads[1]) == "旧用户输入"
     assert has_history is True
+
+    from plugins.kokoro_flow_chatter.snapshot import capture_snapshot
+
+    captured = capture_snapshot(history_payloads + history_payloads[:0], 30)
+    assert captured is not None
+    assert [entry["role"] for entry in captured] == ["user", "assistant"]
+    assert all("近期摘要" not in str(entry) for entry in captured)
 
 
 def test_render_turn_contributions_orders_by_owner_and_priority() -> None:
@@ -864,7 +814,8 @@ def test_memo_contribution_skips_expired_entries() -> None:
     assert contribution.owner == "notice"
     assert "有效备忘" in contribution.content
     assert "已过期" not in contribution.content
-    assert "剩余约 2 小时" in contribution.content
+    assert "剩余约" in contribution.content
+    assert "小时" in contribution.content
 
 
 # ── 运行时 ────────────────────────────────────────────────

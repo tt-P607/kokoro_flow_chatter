@@ -1,7 +1,7 @@
 """KFC 事件处理器。
 
 - ``ProactiveHandler``：响应主动发起事件，唤醒目标聊天流
-- ``VoiceCallHistoryHandler``：通话结束后把通话内容补回对话链
+- ``VoiceCallHistoryHandler``：通话结束后把通话内容补回 context_snapshot
 """
 
 from .proactive_handler import PROACTIVE_TRIGGER_EVENT, ProactiveHandler

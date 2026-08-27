@@ -28,7 +28,6 @@ from src.app.plugin_system.types import LLMPayload, ROLE, Text
 from src.kernel.concurrency import get_watchdog
 
 from ..debug.log_formatter import log_kfc_result
-from ..domain.chain_entry import ChainEntry
 from ..execution import run_decision
 from ..protocol.response_normalizer import normalize_response
 from ..services import ProactiveService, TimeoutService
@@ -39,6 +38,7 @@ from .model_setup import resolve_model_set
 from .payload_hygiene import heal_orphan_tool_results, strip_stale_reminder_prefixes
 from .request_view import build_request_view
 from .summary_sync import SummarySynchronizer
+from ..context.planner import build_last_mile_payload
 from .turn_controller import commit_turn_decision, prepare_turn_input
 
 if TYPE_CHECKING:
@@ -126,36 +126,29 @@ async def execute_orchestrator(
             if turn_input.continue_loop:
                 continue
 
-            unread_msgs = turn_input.unread_msgs
-            if unread_msgs:
-                state.last_user_ts = min(
-                    chatter.extract_timestamp(message) for message in unread_msgs
-                )
-
-            _stage_user_chain_entry(state, turn_input.chain_text)
-            if state.pending_user_text and not state.chain_user_saved:
-                session.update_chain(
-                    [
-                        ChainEntry.user(
-                            state.pending_user_text, ts=state.last_user_ts
-                        ).to_dict()
-                    ],
+            if turn_input.persistent_user_payload is not None:
+                state.turn_has_new_input = True
+                changed = session.append_context_entries(
+                    [turn_input.persistent_user_payload],
                     config.prompt.max_context_payloads,
                 )
-                await chatter.save_session(session)
-                state.chain_user_saved = True
+                if changed:
+                    await chatter.save_session(session)
 
-            strip_stale_reminder_prefixes(response)
-            transient_payloads: list[LLMPayload] = (
-                [turn_input.extra_payload] if turn_input.extra_payload else []
-            ) + state.plain_text_reminders
+            unread_msgs = turn_input.unread_msgs
+            transient_payloads: list[LLMPayload] = [build_last_mile_payload()]
+            if turn_input.request_only_payload is not None:
+                transient_payloads.append(turn_input.request_only_payload)
+            if turn_input.extra_payload is not None:
+                transient_payloads.append(turn_input.extra_payload)
+            transient_payloads.extend(state.plain_text_reminders)
             # 纯文本重试的提醒随本轮请求临时注入，成功取得工具调用后自动
             # 消失；失败的纯文本 ASSISTANT 输出同样不落主链——发送前记录
             # 基线长度，模型仍只返回正文时直接回滚。
             payload_baseline = len(response.payloads)
             send_target = build_request_view(response, transient_payloads)
             if config.debug.show_prompt:
-                chatter.log_prompt(send_target, session.chain_payloads)
+                chatter.log_prompt(send_target)
 
             known_ids = await _resolve_known_message_ids(chatter, unread_msgs)
             reporter = InputStatusReporter(chatter.stream_id, session.user_id)
@@ -248,12 +241,12 @@ async def execute_orchestrator(
                 session,
                 config,
                 chat_stream,
-                pending_user_text=state.pending_user_text,
-                last_user_ts=state.last_user_ts,
-                chain_user_saved=state.chain_user_saved,
+                has_new_user_input=state.turn_has_new_input,
                 is_final_timeout=state.is_final_timeout,
             )
             state.is_final_timeout = turn_control.is_final_timeout
+            # 一批真实新消息只推进一次记忆压缩计数；工具续轮不再重复计入。
+            state.turn_has_new_input = False
 
             if turn_control.has_pending_tool_results:
                 if decision.has_failed_tool and _exceeded_retry_limit(config, state):
@@ -270,11 +263,6 @@ async def execute_orchestrator(
                 if snapshot is not None:
                     session.context_snapshot = snapshot
                     await chatter.save_session(session)
-
-            if turn_control.chain_assistant_saved:
-                # assistant 已入链，清空暂存避免续轮时重复持久化 user 条目
-                state.chain_user_saved = True
-                state.pending_user_text = ""
 
             if turn_control.next_signal is not None:
                 yield turn_control.next_signal
@@ -293,16 +281,14 @@ class _LoopState:
     """
 
     __slots__ = (
-        "chain_user_saved",
         "consecutive_interrupt_count",
         "follow_up_count",
         "has_pending_tool_results",
         "is_final_timeout",
-        "last_user_ts",
-        "pending_user_text",
         "plain_text_reminders",
         "plain_text_retry_count",
         "summary",
+        "turn_has_new_input",
     )
 
     def __init__(self, summary: SummarySynchronizer) -> None:
@@ -310,25 +296,13 @@ class _LoopState:
         self.summary = summary
         self.has_pending_tool_results = False
         self.is_final_timeout = False
-        self.pending_user_text = ""
-        self.last_user_ts = 0.0
-        self.chain_user_saved = False
+        self.turn_has_new_input = False
         self.plain_text_retry_count = 0
         self.plain_text_reminders: list[LLMPayload] = []
         self.follow_up_count = 0
         self.consecutive_interrupt_count = 0
 
 
-def _stage_user_chain_entry(state: _LoopState, chain_text: str) -> None:
-    """暂存本轮待入链的用户文本。
-
-    ``chain_text`` 只含原始消息内容，不含末尾强调指令与临时注入，
-    避免这些每轮变化的提示词被固化进持久化对话链。
-    """
-    if not chain_text or chain_text == state.pending_user_text:
-        return
-    state.pending_user_text = chain_text
-    state.chain_user_saved = False
 
 
 async def _resolve_known_message_ids(

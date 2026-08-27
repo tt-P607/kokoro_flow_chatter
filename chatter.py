@@ -300,11 +300,10 @@ class KokoroFlowChatter(BaseChatter):
     def log_prompt(
         self,
         response: Any,
-        chain_payloads: list[dict[str, Any]] | None = None,
     ) -> None:
         """以面板格式输出发送给 LLM 的完整提示词。"""
         logger.print_panel(
-            format_prompt_for_log(response, chain_payloads=chain_payloads),
+            format_prompt_for_log(response),
             title=f"KFC 提示词 (stream={self.stream_id[:8]})",
             border_style="cyan",
         )

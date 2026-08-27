@@ -23,7 +23,6 @@ from ..context import (
     render_turn_contributions,
     render_user_payload,
 )
-from ..domain.chain_entry import ChainEntry
 from ..domain.decision import build_experience_snapshot
 from ..domain.turn_trigger import TurnTrigger, classify_turn_trigger
 from ..models import KFCEventType, WaitingConfig
@@ -50,11 +49,14 @@ class TurnInputResult:
 
     response: Any
     unread_msgs: list[Any] = field(default_factory=list)
+    request_only_payload: LLMPayload | None = None
+    """仅本次请求可见的回合触发提示；超时提示不属于真实用户历史。"""
+
     extra_payload: LLMPayload | None = None
     """本轮临时注入的上下文贡献，发送后不入对话链。"""
 
-    chain_text: str = ""
-    """本轮待写入对话链的用户文本；非新消息路径为空。"""
+    persistent_user_payload: LLMPayload | None = None
+    """本轮真实用户输入；非用户消息路径为空，发送前先进入快照。"""
 
     next_signal: Wait | None = None
     continue_loop: bool = False
@@ -64,25 +66,16 @@ class TurnInputResult:
 
 @dataclass(slots=True)
 class TurnControlResult:
-    """一轮决策提交后的主循环控制指令。"""
+    """一轮决策提交后的主循环控制指令。
+
+    助手输出不再单独维护链条目；闭合回合时由主循环从主链整体刷新快照。
+    """
 
     next_signal: Wait | Stop | None = None
     continue_loop: bool = False
     return_after_yield: bool = False
     has_pending_tool_results: bool = False
     is_final_timeout: bool = False
-    chain_assistant_saved: bool = False
-
-
-def build_chain_assistant_entry(
-    assistant_text: str,
-    serialized_tool_calls: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """构造写入对话链的 assistant 条目。
-
-    占位补齐与字段过滤由 ``ChainEntry.assistant`` 内部完成。
-    """
-    return ChainEntry.assistant(assistant_text, serialized_tool_calls).to_dict()
 
 
 async def prepare_turn_input(
@@ -190,14 +183,14 @@ async def _prepare_new_messages(
         stream_id=chatter.stream_id,
         session=session,
     )
-    user_payload, extra_payload, chain_text = render_user_payload(plan, media_items)
+    user_payload, extra_payload = render_user_payload(plan, media_items)
     _append_or_merge_user_payload(response, user_payload, allow_merge=not media_items)
 
     return TurnInputResult(
         response=response,
         unread_msgs=unread_msgs,
         extra_payload=extra_payload,
-        chain_text=chain_text,
+        persistent_user_payload=user_payload,
         has_pending_tool_results=False,
     )
 
@@ -208,11 +201,11 @@ async def _prepare_timeout(
     session: KFCSession,
     timeout_service: TimeoutService,
 ) -> TurnInputResult:
-    """处理超时路径：注入超时决策提示。"""
+    """处理超时路径：注入仅当前请求可见的超时决策提示。"""
     timeout_result = timeout_service.build_timeout_result(session)
-    _append_or_merge_user_payload(response, timeout_result.payload, allow_merge=True)
     return TurnInputResult(
         response=response,
+        request_only_payload=timeout_result.payload,
         extra_payload=await _collect_followup_payload(chatter.stream_id),
         is_final_timeout=timeout_result.is_final_timeout,
     )
@@ -277,9 +270,7 @@ async def commit_turn_decision(
     config: KFCConfig,
     chat_stream: ChatStream,
     *,
-    pending_user_text: str,
-    last_user_ts: float,
-    chain_user_saved: bool,
+    has_new_user_input: bool,
     is_final_timeout: bool,
 ) -> TurnControlResult:
     """把本轮决策提交到会话，并给出主循环的下一步指令。
@@ -291,9 +282,7 @@ async def commit_turn_decision(
         session: 当前会话。
         config: KFC 配置。
         chat_stream: 当前聊天流。
-        pending_user_text: 待入链的用户文本。
-        last_user_ts: 该用户文本对应的时间戳。
-        chain_user_saved: 用户条目是否已提前入链。
+        has_new_user_input: 本轮是否由真实新用户消息触发。
         is_final_timeout: 本轮是否为最后一次超时。
 
     Returns:
@@ -307,16 +296,15 @@ async def commit_turn_decision(
         raw_response=response.message or "",
     )
 
-    chain_assistant_saved = await _save_assistant_chain(
-        chatter,
+    await chatter.save_session(session)
+    _schedule_turn_compression(
         decision,
         response,
         session,
         config,
         chat_stream,
-        pending_user_text=pending_user_text,
-        last_user_ts=last_user_ts,
-        chain_user_saved=chain_user_saved,
+        chatter=chatter,
+        has_new_user_input=has_new_user_input,
     )
 
     if not decision.has_meaningful_action:
@@ -343,7 +331,6 @@ async def commit_turn_decision(
             continue_loop=True,
             has_pending_tool_results=True,
             is_final_timeout=is_final_timeout,
-            chain_assistant_saved=chain_assistant_saved,
         )
 
     # action 类工具无返回值，只有在没回复也没选择沉默时才需要续轮补话
@@ -357,7 +344,6 @@ async def commit_turn_decision(
             continue_loop=True,
             has_pending_tool_results=True,
             is_final_timeout=is_final_timeout,
-            chain_assistant_saved=chain_assistant_saved,
         )
 
     wait_seconds = config.wait.apply_rules(
@@ -387,7 +373,6 @@ async def commit_turn_decision(
             ),
             continue_loop=True,
             is_final_timeout=is_final_timeout,
-            chain_assistant_saved=chain_assistant_saved,
         )
 
     session.clear_waiting()
@@ -400,7 +385,6 @@ async def commit_turn_decision(
         ),
         return_after_yield=True,
         is_final_timeout=is_final_timeout,
-        chain_assistant_saved=chain_assistant_saved,
     )
 
 
@@ -422,7 +406,7 @@ def _final_signal(
     return signal
 
 
-async def _save_assistant_chain(
+def _schedule_turn_compression(
     chatter: KokoroFlowChatter,
     decision: Decision,
     response: Any,
@@ -430,16 +414,14 @@ async def _save_assistant_chain(
     config: KFCConfig,
     chat_stream: ChatStream,
     *,
-    pending_user_text: str,
-    last_user_ts: float,
-    chain_user_saved: bool,
+    has_new_user_input: bool,
 ) -> bool:
-    """把本轮 assistant 输出写入对话链，并按需调度记忆压缩。
+    """按已完成的真实对话轮次调度记忆压缩。
 
     Returns:
-        bool: 是否写入了 assistant 条目。
+        bool: 是否推进了轮次计数或调度了压缩。
     """
-    if not pending_user_text:
+    if not has_new_user_input:
         return False
 
     assistant_text = (response.message or "").strip() or decision.reply_text
@@ -449,14 +431,6 @@ async def _save_assistant_chain(
     ]
     if not assistant_text and not serialized_tool_calls:
         return False
-
-    entries = [build_chain_assistant_entry(assistant_text, serialized_tool_calls)]
-    if not chain_user_saved:
-        entries.insert(
-            0, ChainEntry.user(pending_user_text, ts=last_user_ts).to_dict()
-        )
-    session.update_chain(entries, config.prompt.max_context_payloads)
-    await chatter.save_session(session)
 
     session.compress_round_count += 1
     SummaryService.maybe_schedule_compression(

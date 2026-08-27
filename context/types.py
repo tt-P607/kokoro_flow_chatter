@@ -21,7 +21,7 @@ class ContextContribution:
 
     由第三方插件通过 ``on_prompt_build`` 提交，或由 KFC 内部 source
     （如备忘录）产出，最终渲染为临时 USER payload 注入本轮请求，
-    不进入持久化对话链。
+    不进入持久 transcript。
     """
 
     source: str
@@ -37,10 +37,7 @@ class ContextPlan:
     """单轮用户输入的上下文规划结果。"""
 
     user_text: str
-    """完整用户提示词，含末尾行为强调指令。"""
-
-    chain_text: str
-    """仅含原始消息内容，用于持久化对话链，不含强调指令。"""
+    """当前真实用户输入，可作为持久 transcript 记录。"""
 
     contributions: list[ContextContribution] = field(default_factory=list)
 
@@ -53,5 +50,4 @@ class InitialContextPlan:
     """注入系统提示词模板的额外变量。"""
 
     history_summary: str = ""
-    history_before_ts: float | None = None
-    """近期记忆摘要，及融合叙事的截断时间戳（与对话链分界，避免重叠）。"""
+    """近期记忆摘要；它只是动态背景，不是持久对话历史。"""

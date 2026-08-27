@@ -123,7 +123,6 @@ kokoro_flow_chatter/
 │
 ├── domain/                    # 领域模型（纯数据，无 IO）
 │   ├── decision.py            # 决策对象
-│   ├── chain_entry.py         # 对话链条目
 │   └── turn_trigger.py        # 回合触发分类
 │
 ├── protocol/                  # 协议层（纯函数，无副作用）
@@ -265,12 +264,11 @@ kokoro_flow_chatter/
 
 ### 上下文快照
 
-KFC 在每轮**回合闭合点**（决策提交完成、无待消化工具结果）把主链
-`response.payloads`（LLM 原始返回：推理、正文、工具调用与回执）持久化为
-`context_snapshot`，随会话 JSON 一并落盘；重启后首次 `execute()` 启动时
-优先据此恢复多角色历史链，并以最新动态 USER（含近期记忆摘要）为链头，
-保证重启前后上下文一致且不丢失日记总结与历史消息。恢复失败时自动回退
-到 `chain_payloads` 精简历史。无独立配置开关。
+`context_snapshot` 是 KFC 唯一持久 transcript 真相源。KFC 在每轮**回合
+闭合点**（决策提交完成、无待消化工具结果）把主链中的真实 USER/ASSISTANT、
+Reasoning、ToolCall 与 TOOL_RESULT 刷新到该快照；通道、近期记忆摘要和融
+合叙事只作为当前请求动态背景，不进入快照。行为强调与重试提醒通过
+RequestView 作当前请求 transient 注入，同样不会持久化。
 
 ---
 
@@ -344,7 +342,7 @@ uv run pytest plugins/kokoro_flow_chatter/test -q
 4. 测试 `do_nothing`、`pass_and_wait`、等待超时和最大连续超时。
 5. 创建、覆盖、取消主动预约，并验证热流和冷启动流触发。
 6. 达到摘要条件后确认摘要写入会话文件，重启后仍可恢复。
-7. 发布 `voice_call.ended` 事件，确认通话内容以一对 chain entry 回填。
+7. 发布 `voice_call.ended` 事件，确认通话内容以一对 USER/ASSISTANT 快照条目回填。
 8. 禁用、重载、卸载插件，确认无残留 Scheduler 或摘要后台任务。
 
 ---

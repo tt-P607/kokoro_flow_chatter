@@ -1,6 +1,6 @@
 """KFC 历史上下文 source。
 
-负责把聊天记录、心理活动流与存档对话链渲染成上下文文本／payload。
+负责把聊天记录和心理活动流渲染成当前请求动态背景。
 核心产物是 ``build_fused_narrative()``——把"说了什么"和"当时在想什么"
 按时间线交织成统一叙事，这是 KFC 与普通聊天器的关键差异。
 """
@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
-from ...domain.chain_entry import ChainEntry
 from ...models import KFCEventType
 
 if TYPE_CHECKING:
@@ -100,36 +99,6 @@ def build_channel_payload(chat_stream: ChatStream) -> LLMPayload:
     return LLMPayload(ROLE.USER, Text("\n".join(lines)))
 
 
-def restore_chain_payloads(
-    serialized_chain_payloads: list[dict[str, Any]],
-) -> list[LLMPayload]:
-    """从存档对话链还原可读历史 payload。
-
-    存档中的 ``tool_calls`` 仅作审计数据保留，不再还原成
-    ``ASSISTANT(tool_calls) → TOOL_RESULT → ASSISTANT(text)`` 三段式——
-    那样会让同一条回复既出现在工具参数里、又出现在文本里，造成重复输入。
-    运行期未完成的工具链由 ``response.payloads`` 自行维持。
-
-    Args:
-        serialized_chain_payloads: 存档中的链条目。
-
-    Returns:
-        list[LLMPayload]: 还原后的 USER / ASSISTANT payload 序列，
-        且保证首条为 USER（孤立的开头 ASSISTANT 会被丢弃）。
-    """
-    payloads: list[LLMPayload] = []
-    for raw in serialized_chain_payloads:
-        entry = ChainEntry.from_dict(raw)
-        if entry is None:
-            continue
-        role = ROLE.USER if entry.is_user else ROLE.ASSISTANT
-        payloads.append(LLMPayload(role, Text(entry.text)))
-
-    while payloads and payloads[0].role == ROLE.ASSISTANT:
-        payloads.pop(0)
-    return payloads
-
-
 def _is_bot_message(message: Message, bot_id: str) -> bool:
     """判断消息是否由 bot 自己发出。"""
     if bot_id and message.sender_id == bot_id:
@@ -212,13 +181,12 @@ def build_fused_narrative(
     """构建聊天记录与内心独白的融合叙事。
 
     消息来源为 ``context.history_messages``（受核心配置的上下文长度管控）；
-    存档对话链直接追加到请求中、不占此配额，二者通过 ``before_ts``
-    分界互不重叠。
+    它与 ``context_snapshot`` 都用于背景构建，输出只作为当前请求动态背景。
 
     Args:
         chat_stream: 当前聊天流。
         mental_log: 心理活动流；``None`` 时只渲染聊天记录。
-        before_ts: 只包含时间戳严格小于该值的内容，用于与对话链分界。
+        before_ts: 只包含时间戳严格小于该值的内容；缺省时包含全部记录。
 
     Returns:
         str: 融合叙事文本；无内容时返回空串。

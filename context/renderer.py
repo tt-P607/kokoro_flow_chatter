@@ -1,8 +1,7 @@
 """KFC 上下文渲染。
 
 把规划阶段产出的纯数据组装成 LLM payload。核心约束是**保护前缀缓存**：
-SYSTEM payload 只放稳定的人设与行为规范，一切每轮变化的内容（时间、
-摘要、叙事、第三方注入）都作为 USER payload 进入对话链。
+SYSTEM payload 只放稳定的人设与行为规范；每轮变化内容只作为当前请求上下文。
 """
 
 from __future__ import annotations
@@ -13,12 +12,12 @@ from typing import TYPE_CHECKING, Any
 from src.app.plugin_system.api.prompt_api import get_template
 from src.app.plugin_system.types import Content, LLMPayload, ROLE, Text
 
+from ..snapshot import DYNAMIC_BACKGROUND_MARKER, deserialize_snapshot
 from .sources.history_source import (
     build_channel_payload,
     build_current_time_payload,
     build_fused_narrative,
     build_history_summary_payload,
-    restore_chain_payloads,
 )
 from .types import ContextContribution, ContextOwner, ContextPlan, InitialContextPlan
 
@@ -106,7 +105,7 @@ async def render_initial_context(
     chat_stream: ChatStream,
     plan: InitialContextPlan,
     mental_log: MentalLog | None,
-    serialized_chain_payloads: list[dict[str, Any]],
+    serialized_context_snapshot: list[dict[str, Any]] | None,
     build_system_prompt_fn: Callable[
         [ChatStream, dict[str, str] | None], Awaitable[str]
     ]
@@ -117,20 +116,20 @@ async def render_initial_context(
     """渲染 ``execute()`` 启动所需的初始 payload。
 
     产出分为两组：``system_payloads`` 只含稳定系统提示词；
-    ``chain_payloads`` 依次是「当前通道 + 记忆摘要 + 融合叙事」合并的
-    动态 USER payload，以及从存档还原的历史对话链。先说明当前背景、
-    再展开过去对话，语义顺序更自然。
+    ``history_payloads`` 首项是「当前通道 + 记忆摘要 + 融合叙事」合并的动态
+    背景，其余是从唯一持久快照还原的真实对话。先说明当前背景、再展开
+    过去对话，语义顺序更自然。
 
     Args:
         chat_stream: 当前聊天流。
         plan: 初始上下文规划结果。
         mental_log: 心理活动流，供融合叙事使用。
-        serialized_chain_payloads: 存档中的对话链条目。
+        serialized_context_snapshot: 唯一持久 transcript 快照。
         build_system_prompt_fn: 系统提示词构建器，默认用本模块实现。
         build_fused_narrative_fn: 融合叙事构建器，默认用本模块实现。
 
     Returns:
-        tuple: ``(system_payloads, chain_payloads, has_history)``。
+        tuple: ``(system_payloads, history_payloads, has_history)``。
     """
     system_prompt_builder = build_system_prompt_fn or build_system_prompt
     narrative_builder = build_fused_narrative_fn or build_fused_narrative
@@ -146,24 +145,28 @@ async def render_initial_context(
     if summary_payload is not None:
         dynamic_parts.append(_collect_payload_text(summary_payload))
 
-    history_text = narrative_builder(chat_stream, mental_log, plan.history_before_ts)
+    history_text = narrative_builder(chat_stream, mental_log)
     if not history_text:
         history_text = _collect_payload_text(build_current_time_payload())
     dynamic_parts.append(history_text)
 
-    chain_payloads: list[LLMPayload] = [
-        LLMPayload(ROLE.USER, Text(SECTION_SEPARATOR.join(dynamic_parts)))
-    ]
-    restored_payloads = restore_chain_payloads(serialized_chain_payloads)
-    chain_payloads.extend(restored_payloads)
+    dynamic_background = LLMPayload(
+        ROLE.USER,
+        Text(
+            f"{DYNAMIC_BACKGROUND_MARKER}\n\n"
+            f"{SECTION_SEPARATOR.join(dynamic_parts)}"
+        ),
+    )
+    restored_payloads = deserialize_snapshot(serialized_context_snapshot) or []
+    history_payloads = [dynamic_background, *restored_payloads]
 
-    return system_payloads, chain_payloads, bool(history_text) or bool(restored_payloads)
+    return system_payloads, history_payloads, True
 
 
 def render_user_payload(
     plan: ContextPlan,
     media_items: list[dict[str, Any]] | None = None,
-) -> tuple[LLMPayload, LLMPayload | None, str]:
+) -> tuple[LLMPayload, LLMPayload | None]:
     """把用户回合规划渲染为 payload。
 
     Args:
@@ -171,8 +174,8 @@ def render_user_payload(
         media_items: 原生多模态图片列表；非空时打包为图文混合内容。
 
     Returns:
-        tuple: ``(user_payload, extra_payload | None, chain_text)``。
-        ``extra_payload`` 为本轮临时注入，发送后不入对话链。
+        tuple: ``(user_payload, extra_payload | None)``。
+        ``extra_payload`` 为本轮临时注入，发送后不进入持久 transcript。
     """
     content: Content | list[Content]
     if media_items:
@@ -184,7 +187,7 @@ def render_user_payload(
 
     user_payload = LLMPayload(ROLE.USER, content)  # type: ignore[arg-type]
     extra_payload = render_turn_contributions(plan.contributions)
-    return user_payload, extra_payload, plan.chain_text or plan.user_text
+    return user_payload, extra_payload
 
 
 def render_turn_contributions(

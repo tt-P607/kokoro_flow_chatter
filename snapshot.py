@@ -1,7 +1,7 @@
 """KFC 上下文快照。
 
-快照源是主链 ``response.payloads``——即 ``auto_append_response`` 回写的
-LLM 原始返回（推理 ``ReasoningText`` + 正文 ``Text`` + 工具调用
+快照源是主链持久 payload——即 ``RequestView`` 回写的 LLM 原始返回（推理
+``ReasoningText`` + 正文 ``Text`` + 工具调用
 ``ToolCall`` + 工具回执 ``ToolResult`` + 媒体），逐 part 一对一转存，
 不做二次格式化，恢复后即模型当时的真实输出。
 
@@ -9,7 +9,7 @@ LLM 原始返回（推理 ``ReasoningText`` + 正文 ``Text`` + 工具调用
 结果）进行，此刻主链必然闭合——所有 ``tool_calls`` 都有配对
 ``TOOL_RESULT``，链尾不可能悬挂，因此恢复后的链在结构上不会触发
 框架的 ``LLMContextError``。反序列化后仍显式自检，失败返回 ``None``，
-由调用方回退现有 ``chain_payloads``，绝不注入非法链。
+由调用方按“无历史、新会话”处理，绝不注入非法链。
 """
 
 from __future__ import annotations
@@ -46,6 +46,9 @@ _SYSTEM_REMINDER_RE = re.compile(
 #: 媒体类型的类名集合；这些类型的 value 为 base64 字符串，应完整入快照。
 _MEDIA_TYPES = {"Image", "Audio", "Video", "File"}
 
+DYNAMIC_BACKGROUND_MARKER = "【动态背景】"
+"""当前请求动态背景的可见标记；序列化时用它排除伪 USER 历史。"""
+
 
 def serialize_payloads(payloads: list[Any]) -> list[dict[str, Any]]:
     """把主链 payload 列表序列化为快照条目。
@@ -65,6 +68,8 @@ def serialize_payloads(payloads: list[Any]) -> list[dict[str, Any]]:
     for payload in payloads or []:
         role = getattr(payload, "role", None)
         if role in _SKIP_ROLES:
+            continue
+        if role == ROLE.USER and _is_dynamic_background(payload):
             continue
         content = getattr(payload, "content", None)
         if not isinstance(content, list):
@@ -119,7 +124,7 @@ def deserialize_snapshot(
     """把快照条目反序列化为 LLM payload 列表。
 
     先丢弃头部非 USER 与尾部悬挂工具段，再按框架同规则自检；校验
-    失败或结果为空时返回 ``None``，由调用方回退现有 ``chain_payloads``。
+    失败或结果为空时返回 ``None``，由调用方按无历史处理。
 
     Args:
         entries: 快照条目。
@@ -211,6 +216,15 @@ def _serialize_part(part: Any) -> dict[str, Any] | None:
     if rendered:
         return {"type": "text", "text": _truncate(rendered)}
     return None
+
+
+def _is_dynamic_background(payload: Any) -> bool:
+    """判断是否为每轮重建的动态背景 USER payload。"""
+    content = payload.content
+    if not isinstance(content, list):
+        content = [content]
+    text = "".join(part.text for part in content if isinstance(part, Text))
+    return text.startswith(DYNAMIC_BACKGROUND_MARKER)
 
 
 def _deserialize_entry(entry: dict[str, Any]) -> LLMPayload | None:

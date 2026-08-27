@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
+
 from .sources.initial_source import build_initial_context_plan
 from .sources.memo_source import build_memo_contribution
 from .sources.plugin_source import collect_plugin_turn_contributions
@@ -21,15 +23,11 @@ if TYPE_CHECKING:
     from ..session import KFCSession
 
 USER_PROMPT_NAME = "kfc_user_prompt"
-"""``on_prompt_build`` 事件中标识 KFC 用户提示词的模板名。"""
+"""``on_prompt_build`` 事件中标识 KFC 用户提示词的模板名。
 
-_LAST_MILE_INSTRUCTIONS = (
-    "请基于上述信息决定接下来你要调用的工具或动作。\n"
-    "重申：请务必使用工具来实现你的任何行为，不要直接在文本里写出你想说的话。\n"
-    "请务必保持你的回复符合你的人设和表达风格，\n"
-    "同时请确保你的回复有理有据，禁止无根据地编造信息或胡乱回复。"
-)
-"""追加在用户提示词末尾的行为强调指令。仅进入本轮请求，不入对话链。"""
+当前请求级行为强调不在这里持久化为伪 USER；稳定协议规则应留在系统模板，
+临时提醒由 RequestView 动态注入。
+"""
 
 
 def plan_initial_context(
@@ -69,10 +67,9 @@ async def plan_user_turn(
         session: 当前会话；为 ``None`` 时跳过备忘录注入。
 
     Returns:
-        ContextPlan: 用户提示词、链文本与上下文贡献列表。
+        ContextPlan: 当前真实用户输入与上下文贡献列表。
     """
-    chain_text = f"[新消息]\n{formatted_unreads}"
-    user_text = f"{chain_text}\n\n---\n{_LAST_MILE_INSTRUCTIONS}"
+    user_text = f"[新消息]\n{formatted_unreads}"
 
     contributions = await collect_plugin_turn_contributions(
         prompt_name=USER_PROMPT_NAME,
@@ -85,11 +82,7 @@ async def plan_user_turn(
         if memo_contribution is not None:
             contributions.append(memo_contribution)
 
-    return ContextPlan(
-        user_text=user_text,
-        chain_text=chain_text,
-        contributions=contributions,
-    )
+    return ContextPlan(user_text=user_text, contributions=contributions)
 
 
 async def plan_followup_contributions(stream_id: str) -> ContextPlan:
@@ -109,4 +102,15 @@ async def plan_followup_contributions(stream_id: str) -> ContextPlan:
         content="",
         stream_id=stream_id,
     )
-    return ContextPlan(user_text="", chain_text="", contributions=contributions)
+    return ContextPlan(user_text="", contributions=contributions)
+
+
+def build_last_mile_payload() -> LLMPayload:
+    """构造仅当前请求可见的收尾行为指令。"""
+    last_mile_instructions = (
+        "请基于上述信息决定接下来你要调用的工具或动作。\n"
+        "重申：请务必使用工具来实现你的任何行为，不要直接在文本里写出你想说的话。\n"
+        "请务必保持你的回复符合你的人设和表达风格，\n"
+        "同时请确保你的回复有理有据，禁止无根据地编造信息或胡乱回复。"
+    )
+    return LLMPayload(ROLE.USER, Text(last_mile_instructions))

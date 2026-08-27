@@ -42,7 +42,7 @@ def build_initial_context_plan(
         session: 当前会话。
 
     Returns:
-        InitialContextPlan: 系统模板变量、摘要与叙事截断点。
+        InitialContextPlan: 系统模板变量与动态记忆摘要。
     """
     _ = chat_stream
     from ...prompts.templates import KFC_REPLY_MODE_TOOL_CALLING
@@ -66,11 +66,9 @@ def build_initial_context_plan(
     if scheduled_info:
         extra_vars["scheduled_proactive_info"] = scheduled_info
 
-    chain_cutoff_ts = session.chain_cutoff_ts
     return InitialContextPlan(
         system_extra_vars=extra_vars,
         history_summary=session.history_summary,
-        history_before_ts=chain_cutoff_ts if chain_cutoff_ts > 0 else None,
     )
 
 

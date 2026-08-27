@@ -1,7 +1,7 @@
 """KFC 初始上下文构建。
 
-组装 ``execute()`` 启动时的第一份 LLM 请求：系统提示词、动态上下文、
-历史对话链与工具注册。
+组装 ``execute()`` 启动时的第一份 LLM 请求：稳定 SYSTEM、动态背景、
+唯一持久 transcript 快照与工具注册。
 
 所有 payload 统一经 ``add_payload()`` 注入，由 context manager 的
 reminder 管线统一管理注入与剥离——若绕过管线直接构造 payload，
@@ -20,7 +20,6 @@ from src.app.plugin_system.api.llm_api import (
 from src.app.plugin_system.api.log_api import get_logger
 
 from ..context import plan_initial_context, render_initial_context
-from ..snapshot import deserialize_snapshot
 
 logger = get_logger("kfc_context_builder")
 
@@ -89,27 +88,20 @@ async def build_initial_request(
         config=config,
         session=session,
     )
-    system_payloads, chain_payloads, _has_history = await render_initial_context(
+    system_payloads, history_payloads, _has_history = await render_initial_context(
         chat_stream=chat_stream,
         plan=plan,
         mental_log=session.mental_log,
-        serialized_chain_payloads=list(session.chain_payloads),
+        serialized_context_snapshot=session.context_snapshot,
     )
 
-    restored_snapshot = deserialize_snapshot(session.context_snapshot)
-    if restored_snapshot:
-        # 保留最新动态 USER（通道 + 日记总结 + 历史叙事）作为链头，
-        # 快照完整对话历史（含首轮用户消息）接在其后：既保留最新日记
-        # 总结与历史消息，又不丢模型原始返回。清空 chain_cutoff_ts 避免
-        # 融合叙事与快照首条 USER 重叠。
-        chain_payloads = [chain_payloads[0], *restored_snapshot]
-        session.chain_cutoff_ts = 0.0
+    if session.context_snapshot:
         logger.info(
-            f"已从上下文快照恢复 {len(restored_snapshot)} 条历史 payload "
+            f"已从上下文快照恢复 {len(session.context_snapshot)} 条 transcript "
             f"(stream={chatter.stream_id[:8]})"
         )
 
-    for payload in (*system_payloads, *chain_payloads):
+    for payload in (*system_payloads, *history_payloads):
         request.add_payload(payload)
 
     usable_map = await chatter.inject_usables(request)

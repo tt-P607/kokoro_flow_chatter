@@ -1,13 +1,13 @@
 """语音通话历史回填。
 
 场景：用户在 KFC 私聊中触发语音通话后，该流由 anima_chatter 接管；
-通话期间的对话只写入聊天流历史，不会进入 KFC 的持久化对话链。通话
-结束时 anima_chatter 广播 ``voice_call.ended``，本处理器据此把整段
-通话补回对话链。
+通话期间的对话只写入聊天流历史，不会进入 KFC 的持久化 transcript。通话
+结束时 anima_chatter 广播 ``voice_call.ended``，本处理器据此把整段通话
+补回 context_snapshot。
 
-**为什么打包成一对而非逐条补入**：对话链默认上限仅 20 条，一通 5 分钟
+**为什么打包成一对而非逐条补入**：transcript 默认上限仅 20 条，一通 5 分钟
 的通话轻易产生 10+ 条消息，逐条补入会吞掉一半额度。因此把整段通话压成
-一对（1 user + 1 assistant）摘要——无论通话多长，链占用恒为 1 对。
+一对（1 user + 1 assistant）摘要——无论通话多长，快照占用恒为 1 对。
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ from src.app.plugin_system.api.event_api import EventDecision
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseEventHandler
 
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
+
 from ..config import KFCConfig
-from ..domain.chain_entry import ChainEntry
 
 if TYPE_CHECKING:
     from src.app.plugin_system.api.event_api import EventType
@@ -41,13 +42,13 @@ _ASSISTANT_ACK_TEXT = "（已收到上面整段通话稿。）"
 
 
 class VoiceCallHistoryHandler(BaseEventHandler):
-    """把通话历史打包成一对摘要补回 KFC 对话链。"""
+    """把通话历史打包成一对摘要补回 KFC 持久 transcript。"""
 
     name: str = "kfc_voice_call_history_handler"
     description: str = (
         "通话结束后把 anima_chatter 在 KFC 流上记录的整段对话打包成一对 "
-        "user/assistant 摘要补回对话链，保证挂断后上下文连贯，"
-        "且不会用一通通话挤占多个链槽位。"
+        "user/assistant 摘要补回 context_snapshot，保证挂断后上下文连贯，"
+        "且不会用一通通话挤占多个快照槽位。"
     )
     weight: int = 0
     intercept_message: bool = False
@@ -83,23 +84,23 @@ class VoiceCallHistoryHandler(BaseEventHandler):
             return EventDecision.PASS, params
 
         try:
-            await self._patch_chain(stream_id, messages_in_call, params)
+            await self._patch_context_snapshot(stream_id, messages_in_call, params)
         except Exception as error:
             logger.error(
-                f"补写对话链异常 stream={stream_id[:8]}: {error}",
+                f"补写持久上下文异常 stream={stream_id[:8]}: {error}",
                 exc_info=True,
             )
             return EventDecision.PASS, params
 
         return EventDecision.SUCCESS, params
 
-    async def _patch_chain(
+    async def _patch_context_snapshot(
         self,
         stream_id: str,
         messages_in_call: list[Any],
         event_params: dict[str, Any],
     ) -> None:
-        """把整段通话写入 KFC 对话链。"""
+        """把整段通话写入唯一持久 transcript 快照。"""
         from ..plugin import KFCPlugin
 
         if not isinstance(self.plugin, KFCPlugin):
@@ -108,7 +109,7 @@ class VoiceCallHistoryHandler(BaseEventHandler):
 
         config = self.plugin.config
         if not isinstance(config, KFCConfig):
-            logger.warning("KFC 配置未加载，跳过对话链补丁")
+            logger.warning("KFC 配置未加载，跳过持久上下文补丁")
             return
 
         user_summary, assistant_summary, first_user_ts = _summarize_call(
@@ -119,14 +120,17 @@ class VoiceCallHistoryHandler(BaseEventHandler):
             return
 
         entries = [
-            ChainEntry.user(text=user_summary, ts=first_user_ts).to_dict(),
-            ChainEntry.assistant(text=assistant_summary).to_dict(),
+            LLMPayload(ROLE.USER, Text(user_summary)),
+            LLMPayload(ROLE.ASSISTANT, Text(assistant_summary)),
         ]
 
         store = self.plugin.session_store
         async with store.lock(stream_id):
             session = await store.get_or_create(stream_id)
-            session.update_chain(entries, config.prompt.max_context_payloads)
+            session.append_context_entries(
+                entries,
+                config.prompt.max_context_payloads,
+            )
             await store.save(session)
 
         raw_count = sum(
@@ -136,7 +140,7 @@ class VoiceCallHistoryHandler(BaseEventHandler):
         )
         duration = float(event_params.get("duration_seconds") or 0.0)
         logger.info(
-            f"已把通话打包成 1 对链条目 stream={stream_id[:8]} "
+            f"已把通话打包成 1 对 transcript 条目 stream={stream_id[:8]} "
             f"(原始消息 {raw_count} 条 / 持续 {duration:.0f}s)"
         )
 
@@ -148,8 +152,8 @@ def _summarize_call(messages_in_call: list[Any]) -> tuple[str, str, float]:
     分辨每一轮谁说了什么、相对位置如何。轮次以 user 发声为界：bot 在
     首条 user 之前的发言（如接通寒暄）计入第 0 轮。
 
-    user 摘要承载完整对话稿；assistant 摘要只写一句确认，既保持 chain
-    的 user/assistant 交替合法，又避免把发言全文重复一遍。
+    user 摘要承载完整对话稿；assistant 摘要只写一句确认，既保持 transcript
+    的 USER/ASSISTANT 交替合法，又避免把发言全文重复一遍。
 
     Args:
         messages_in_call: 形如 ``{"role", "text", "ts"}`` 的消息列表。
