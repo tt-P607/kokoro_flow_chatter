@@ -249,8 +249,8 @@ class KFCConfig(BaseConfig):
             le=10000,
         )
         max_context_payloads: int = Field(
-            default=20,
-            description="LLM 上下文持久化链最大条目数（超出时裁剪最旧的 USER/ASSISTANT 对）",
+            default=100,
+            description="LLM 快照容量；达到 80% 时批量裁剪并保留约末尾 20%",
             ge=2,
             le=1000,
         )

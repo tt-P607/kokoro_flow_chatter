@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -48,6 +49,12 @@ _MEDIA_TYPES = {"Image", "Audio", "Video", "File"}
 
 DYNAMIC_BACKGROUND_MARKER = "【动态背景】"
 """当前请求动态背景的可见标记；序列化时用它排除伪 USER 历史。"""
+
+_TRIM_TRIGGER_RATIO = 0.8
+"""快照达到上限的 80% 时触发一次批量裁剪。"""
+
+_TRIM_KEEP_RATIO = 0.2
+"""批量裁剪后保留末尾约 20% 的近期条目。"""
 
 
 def serialize_payloads(payloads: list[Any]) -> list[dict[str, Any]]:
@@ -95,18 +102,26 @@ def trim_snapshot(
     entries: list[dict[str, Any]],
     max_payloads: int,
 ) -> list[dict[str, Any]]:
-    """裁剪快照至上限，保证链头为 USER、尾部工具段闭合。
+    """在阈值点批量裁剪快照，保证链头为 USER、尾部工具段闭合。
+
+    平时不逐轮滑动删除；当条目数接近上限时一次性截掉旧前缀，只保留
+    近期尾巴，减少多次请求间持久上下文前缀的变化。
 
     Args:
         entries: 待裁剪的快照条目。
-        max_payloads: 最大条目数，超出时从头丢弃并保证首条是 USER。
+        max_payloads: 快照容量；触发与保留数量均按该配置计算。
 
     Returns:
         list[dict]: 裁剪后的快照条目。
     """
     if max_payloads <= 0:
         max_payloads = 30
-    if len(entries) > max_payloads:
+
+    trigger_count = math.ceil(max_payloads * _TRIM_TRIGGER_RATIO)
+    keep_count = max(1, math.ceil(max_payloads * _TRIM_KEEP_RATIO))
+    if len(entries) >= trigger_count:
+        entries = _batch_trim_to_recent_boundary(entries, keep_count)
+    elif len(entries) > max_payloads:
         entries = entries[-max_payloads:]
 
     # 丢弃头部非 USER 条目，保证恢复后对话以 USER 起始
@@ -116,6 +131,21 @@ def trim_snapshot(
     # 从尾部丢弃未配对的 assistant(tool_calls) 悬挂段
     entries = _drop_unpaired_tail(entries)
     return entries
+
+
+def _batch_trim_to_recent_boundary(
+    entries: list[dict[str, Any]],
+    keep_count: int,
+) -> list[dict[str, Any]]:
+    """按目标数量截尾，并向前调整到最近的真实对话边界。
+
+    从候选起点向后弹出会拆断正在进行的工具段或把 ASSISTANT 变成链头；
+    因此这里向左扩展到最近的 USER 条目，允许实际保留数略多于目标值。
+    """
+    start = len(entries) - keep_count
+    while start > 0 and entries[start].get("role") != ROLE.USER.value:
+        start -= 1
+    return entries[start:]
 
 
 def deserialize_snapshot(

@@ -237,7 +237,7 @@ kokoro_flow_chatter/
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `max_log_entries` | `50` | 活动流最大条目数 |
-| `max_context_payloads` | `20` | 上下文最大 payload 数 |
+| `max_context_payloads` | `100` | LLM 快照容量；达到 80% 时批量裁剪并保留约末尾 20% |
 | `compress_every_n_rounds` | `50` | 每 N 轮触发记忆压缩 |
 | `compress_days_window` | `3.0` | 压缩覆盖天数 |
 | `min_compress_interval_minutes` | `120.0` | 压缩最小间隔（分钟） |
