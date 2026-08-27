@@ -10,7 +10,12 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.prompt_api import get_template
-from src.app.plugin_system.types import Content, LLMPayload, ROLE, Text
+from src.app.plugin_system.types import (
+    Content,
+    LLMPayload,
+    ROLE,
+    Text,
+)
 
 from ..snapshot import DYNAMIC_BACKGROUND_MARKER, deserialize_snapshot
 from .sources.history_source import (
@@ -202,23 +207,23 @@ def render_turn_contributions(
         LLMPayload | None: 渲染结果；无有效内容时返回 ``None``。
     """
     valid_contributions = [
-        contribution for contribution in contributions if contribution.content.strip()
+        contribution for contribution in contributions if _has_content(contribution.content)
     ]
     if not valid_contributions:
         return None
 
-    blocks = [
-        block
-        for block in (
-            _render_owner_block(owner, valid_contributions)
-            for owner in _OWNER_RENDER_ORDER
-        )
-        if block
+    multimodal_contributions = [
+        contribution
+        for contribution in valid_contributions
+        if isinstance(contribution.content, list)
     ]
-    if not blocks:
-        return None
+    if not multimodal_contributions:
+        return LLMPayload(ROLE.USER, _render_text_blocks(valid_contributions))
 
-    return LLMPayload(ROLE.USER, Text("[附加上下文]\n" + "\n\n".join(blocks)))
+    return LLMPayload(
+        ROLE.USER,
+        _render_mixed_content(valid_contributions),
+    )
 
 
 def _render_owner_block(
@@ -232,11 +237,7 @@ def _render_owner_block(
             for contribution in contributions
             if contribution.owner == owner
         ),
-        key=lambda contribution: (
-            -contribution.priority,
-            contribution.source,
-            contribution.content,
-        ),
+        key=_contribution_sort_key,
     )
     rendered = [
         _render_contribution_text(contribution) for contribution in owner_contributions
@@ -247,6 +248,85 @@ def _render_owner_block(
     body = "\n\n".join(rendered)
     section_title = _OWNER_SECTION_TITLES.get(owner, "")
     return f"{section_title}\n{body}" if section_title else body
+
+
+def _render_text_blocks(
+    contributions: list[ContextContribution],
+) -> Text:
+    """渲染纯文本贡献为原有单段 USER 文本。"""
+    blocks = [
+        block
+        for block in (
+            _render_owner_block(owner, contributions)
+            for owner in _OWNER_RENDER_ORDER
+        )
+        if block
+    ]
+    return Text("[附加上下文]\n" + "\n\n".join(blocks))
+
+
+def _render_mixed_content(
+    contributions: list[ContextContribution],
+) -> list[Content]:
+    """把文本与标准多模态贡献渲染为当前请求 USER 内容列表。"""
+    parts: list[Content] = [Text("[附加上下文]")]
+
+    for owner in _OWNER_RENDER_ORDER:
+        owner_contributions = [
+            contribution
+            for contribution in contributions
+            if contribution.owner == owner
+        ]
+        text_contributions = [
+            contribution
+            for contribution in owner_contributions
+            if isinstance(contribution.content, str)
+        ]
+        text_block = _render_owner_block(owner, text_contributions)
+        if text_block:
+            parts.extend((Text(""), Text(text_block)))
+
+        for contribution in sorted(
+            (
+                item
+                for item in owner_contributions
+                if isinstance(item.content, list)
+            ),
+            key=_contribution_sort_key,
+        ):
+            contribution_parts = contribution.content
+            if len(parts) > 1:
+                parts.append(Text(""))
+            parts.append(Text(f"[{contribution.source}]"))
+            if contribution.source == _LEGACY_EXTRA_SOURCE:
+                parts.append(Text(_LEGACY_EXTRA_PREFIX))
+            parts.extend(contribution_parts)
+
+    if len(parts) == 1:
+        parts.append(Text("（空贡献）"))
+    return parts
+
+
+def _contribution_sort_key(contribution: ContextContribution) -> tuple[int, str, str]:
+    """提供跨文本和多模态贡献的稳定排序键。"""
+    content = contribution.content
+    preview = (
+        content.strip()
+        if isinstance(content, str)
+        else "\n".join(
+            part.text
+            for part in content
+            if isinstance(part, Text)
+        )
+    )
+    return (-contribution.priority, contribution.source, preview.strip())
+
+
+def _has_content(content: str | list[Content]) -> bool:
+    """判断贡献是否含有可渲染内容。"""
+    if isinstance(content, str):
+        return bool(content.strip())
+    return bool(content)
 
 
 def _render_contribution_text(contribution: ContextContribution) -> str:

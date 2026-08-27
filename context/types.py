@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from src.app.plugin_system.types import Content
+
 ContextOwner = Literal[
     "policy",
     "self_state",
@@ -29,7 +31,8 @@ class ContextContribution:
 
     owner: ContextOwner
     priority: int
-    content: str
+    content: str | list[Content]
+    """纯文本或 kernel 标准 Content parts；列表允许携带 Image 等真实多模态内容。"""
 
 
 @dataclass(slots=True)

@@ -201,7 +201,6 @@ kokoro_flow_chatter/
 | `temperature` | `0.7` | 温度参数；仅在 `models` 非空时生效，范围 0~2 |
 | `max_tokens` | `8000` | 最大输出 token；仅在 `models` 非空时生效 |
 | `native_multimodal` | `false` | 图片直接进 LLM 上下文 |
-| `max_images_per_payload` | `4` | 单次最多图片数 |
 | `blocked_tools` | `[]` | 屏蔽的工具列表 |
 | `max_follow_up_retries` | `3` | 工具失败最大续轮次数 |
 

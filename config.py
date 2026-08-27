@@ -50,17 +50,6 @@ class KFCConfig(BaseConfig):
                 "需确保 model_task 配置的模型支持多模态输入。"
             ),
         )
-        max_images_per_payload: int = Field(
-            default=4,
-            description=(
-                "原生多模态模式下的总图片配额（整个 payload 中所有来源的图片上限）。"
-                "配额由 bot 已发图片、用户新消息图片、历史图片三者共同占用，"
-                "优先级依次为：bot 已发 > 用户新消息 > 历史补充。"
-                "例如设为 4 时，若 bot 最近发了 1 张、用户本轮发了 2 张，则历史图片最多补 1 张。"
-            ),
-            ge=1,
-            le=32,
-        )
         custom_decision_prompt: str = Field(
             default="",
             description=(

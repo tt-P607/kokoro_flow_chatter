@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, cast, get_args
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.types import Content, Text
 
 from ..types import ContextContribution, ContextOwner
 
@@ -19,6 +20,23 @@ _VALID_OWNERS = frozenset(get_args(ContextOwner))
 _DEFAULT_OWNER: ContextOwner = "notice"
 _LEGACY_SOURCE = "legacy.on_prompt_build.extra"
 _EVENT_TEMPLATE = "{content}\n{extra}"
+
+
+def _normalize_content(raw_content: Any) -> str | list[Content] | None:
+    """归一化贡献内容，保留 kernel 标准多模态 parts。"""
+    if isinstance(raw_content, str):
+        content = raw_content.strip()
+        return content or None
+
+    if not isinstance(raw_content, list) or not raw_content:
+        return None
+    if not all(isinstance(part, Content) for part in raw_content):
+        return None
+    if not any(
+        isinstance(part, Text) and bool(part.text.strip()) for part in raw_content
+    ) and not any(not isinstance(part, Text) for part in raw_content):
+        return None
+    return list(raw_content)
 
 
 def _normalize_contribution(raw: Any) -> ContextContribution | None:
@@ -35,7 +53,7 @@ def _normalize_contribution(raw: Any) -> ContextContribution | None:
     if not isinstance(raw, dict):
         return None
 
-    content = str(raw.get("content", "") or "").strip()
+    content = _normalize_content(raw.get("content"))
     if not content:
         return None
 

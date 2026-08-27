@@ -19,6 +19,10 @@ from plugins.kokoro_flow_chatter.context.planner import (  # noqa: E402
 )
 from plugins.kokoro_flow_chatter.context.renderer import (  # noqa: E402
     render_initial_context,
+    render_turn_contributions,
+)
+from plugins.kokoro_flow_chatter.context.sources.plugin_source import (  # noqa: E402
+    _normalize_contribution,
 )
 from plugins.kokoro_flow_chatter.context.types import InitialContextPlan  # noqa: E402
 from plugins.kokoro_flow_chatter.config import KFCConfig  # noqa: E402
@@ -43,6 +47,8 @@ from plugins.kokoro_flow_chatter.runtime.request_view import (  # noqa: E402
     _without_transient_payloads,
 )
 from src.app.plugin_system.types import (  # noqa: E402
+    Content,
+    Image,
     LLMPayload,
     ROLE,
     Text,
@@ -196,6 +202,67 @@ async def test_turn_compression_scheduler_receives_each_collaborator_once(
     args, kwargs = calls[0]
     assert len(args) == 3
     assert kwargs.keys() == {"session_store"}
+
+
+def test_context_contribution_supports_multimodal_transient_parts() -> None:
+    """字符串贡献保持原行为；标准 parts 渲染为临时多模态 USER。"""
+    string_contribution = _normalize_contribution(
+        {"source": "plugin.text", "owner": "notice", "priority": 1, "content": "提醒"}
+    )
+    media_content: list[Content] = [Text("参考图"), Image("aW1hZ2U=")]
+    media_contribution = _normalize_contribution(
+        {
+            "source": "plugin.media",
+            "owner": "notice",
+            "priority": 0,
+            "content": media_content,
+        }
+    )
+    invalid_media = _normalize_contribution(
+        {
+            "source": "plugin.invalid",
+            "owner": "notice",
+            "priority": 0,
+            "content": ["not-content"],
+        }
+    )
+
+    assert isinstance(string_contribution.content, str)
+    string_payload = render_turn_contributions([string_contribution])
+    assert isinstance(string_payload.content, list)
+    assert isinstance(string_payload.content[0], Text)
+    assert string_payload.content[0].text == "[附加上下文]\n提醒"
+
+    assert media_contribution is not None
+    media_payload = render_turn_contributions(
+        [string_contribution, media_contribution]
+    )
+    assert media_payload.role == ROLE.USER
+    assert isinstance(media_payload.content, list)
+    assert any(isinstance(part, Text) and part.text == "参考图" for part in media_payload.content)
+    assert any(isinstance(part, Image) and part.value == "aW1hZ2U=" for part in media_payload.content)
+    assert invalid_media is None
+
+    source_payloads = [LLMPayload(ROLE.USER, Text("真实输入"))]
+    result_payloads = [
+        LLMPayload(ROLE.USER, Text("<system_reminder>注入</system_reminder>真实输入")),
+        media_payload,
+        LLMPayload(ROLE.ASSISTANT, Text("回复")),
+    ]
+    persistent = _without_transient_payloads(
+        result_payloads,
+        source_payloads=source_payloads,
+        transient_count=1,
+    )
+    assert [_text(payload) for payload in persistent] == ["真实输入", "回复"]
+    assert "aW1hZ2U=" not in str(persistent)
+
+
+def test_legacy_image_quota_config_is_removed() -> None:
+    """无效历史图片配额不应再出现在配置模型中。"""
+    from plugins.kokoro_flow_chatter.config import KFCConfig
+
+    assert "max_images_per_payload" not in KFCConfig.GeneralSection.model_fields
 
 
 @pytest.mark.asyncio
