@@ -26,6 +26,13 @@ from plugins.kokoro_flow_chatter.handlers.voice_call_history_handler import (  #
     VoiceCallHistoryHandler,
 )
 from plugins.kokoro_flow_chatter.plugin import KFCPlugin  # noqa: E402
+from plugins.kokoro_flow_chatter.runtime.turn_controller import (  # noqa: E402
+    commit_turn_decision,
+)
+from plugins.kokoro_flow_chatter.services.summary_service import (  # noqa: E402
+    SummaryService,
+)
+from plugins.kokoro_flow_chatter.domain.decision import Decision  # noqa: E402
 from plugins.kokoro_flow_chatter.session import KFCSession  # noqa: E402
 from plugins.kokoro_flow_chatter.snapshot import (  # noqa: E402
     DYNAMIC_BACKGROUND_MARKER,
@@ -146,6 +153,49 @@ def test_tool_continuation_shape_survives_snapshot_reload() -> None:
         ROLE.TOOL_RESULT,
         ROLE.ASSISTANT,
     ]
+
+
+@pytest.mark.asyncio
+async def test_turn_compression_scheduler_receives_each_collaborator_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """提交阶段不能因位置/关键字重复传递同一协作者而崩溃。"""
+    session = KFCSession(user_id="u1", stream_id="stream-turn")
+    session.append_context_entries(
+        [LLMPayload(ROLE.USER, Text("真实输入"))], _MAX_PAYLOADS
+    )
+
+    class _Chatter:
+        session_store = object()
+
+        async def save_session(self, _session: KFCSession) -> None:
+            return None
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def record(*args: object, **kwargs: object):
+        calls.append((args, kwargs))
+        return False
+
+    monkeypatch.setattr(
+        SummaryService, "maybe_schedule_compression", staticmethod(record)
+    )
+    result = await commit_turn_decision(
+        _Chatter(),
+        Decision(has_meaningful_action=False),
+        SimpleNamespace(message="纯文本", call_list=[]),
+        session,
+        KFCConfig(),
+        SimpleNamespace(bot_id="bot"),
+        has_new_user_input=True,
+        is_final_timeout=False,
+    )
+
+    assert result.next_signal is not None
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert len(args) == 3
+    assert kwargs.keys() == {"session_store"}
 
 
 @pytest.mark.asyncio

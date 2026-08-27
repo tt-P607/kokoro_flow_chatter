@@ -298,12 +298,12 @@ async def commit_turn_decision(
 
     await chatter.save_session(session)
     _schedule_turn_compression(
+        chatter,
         decision,
         response,
         session,
         config,
         chat_stream,
-        chatter=chatter,
         has_new_user_input=has_new_user_input,
     )
 
