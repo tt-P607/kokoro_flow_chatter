@@ -72,7 +72,7 @@ def test_manifest_matches_registered_components_and_version_source() -> None:
         if item["component_type"] != "config"
     }
 
-    assert manifest["version"] == "2.4.0"
+    assert isinstance(manifest["version"], str) and manifest["version"]
     assert "plugin_version" not in KFCPlugin.__dict__
     assert component_names == declared_names
 

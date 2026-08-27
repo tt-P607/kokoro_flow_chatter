@@ -12,7 +12,7 @@
     "stream_api": "1.0.0"
   },
   "display_name": "KokoroFlow 对话引擎",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "description": "KokoroFlow 对话引擎 — 基于心理活动流的私聊特化聊天器",
   "author": "言柒",
   "license": "AGPL-v3.0",

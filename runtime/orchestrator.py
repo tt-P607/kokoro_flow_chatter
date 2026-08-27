@@ -146,9 +146,13 @@ async def execute_orchestrator(
                 state.chain_user_saved = True
 
             strip_stale_reminder_prefixes(response)
-            transient_payloads = (
+            transient_payloads: list[LLMPayload] = (
                 [turn_input.extra_payload] if turn_input.extra_payload else []
-            )
+            ) + state.plain_text_reminders
+            # 纯文本重试的提醒随本轮请求临时注入，成功取得工具调用后自动
+            # 消失；失败的纯文本 ASSISTANT 输出同样不落主链——发送前记录
+            # 基线长度，模型仍只返回正文时直接回滚。
+            payload_baseline = len(response.payloads)
             send_target = build_request_view(response, transient_payloads)
             if config.debug.show_prompt:
                 chatter.log_prompt(send_target, session.chain_payloads)
@@ -199,7 +203,10 @@ async def execute_orchestrator(
                 if state.plain_text_retry_count < max_retries:
                     _log_missing_tool_call(response, state)
                     state.plain_text_retry_count += 1
-                    response.add_payload(
+                    _rollback_failed_assistant(response, payload_baseline)
+                    # 纠正提醒逐条累积为多重强调信号，随每次请求临时注入；
+                    # 取得有效工具调用或本轮收口时一并清除。
+                    state.plain_text_reminders.append(
                         LLMPayload(ROLE.USER, Text(_PLAIN_TEXT_RETRY_REMINDER))
                     )
                     state.has_pending_tool_results = True
@@ -208,7 +215,13 @@ async def execute_orchestrator(
                     f"经过 {state.plain_text_retry_count} 次重试仍未取得有效工具调用，"
                     "本轮强制收口"
                 )
+                # 强制收口时同样丢弃本次失败的纯文本输出：没有工具调用的
+                # 正文不可能被执行成功，持久化只会让下一轮读到自相矛盾的
+                # "我说过 xxx 却毫无反应"的残缺历史。
+                _rollback_failed_assistant(response, payload_baseline)
+                state.plain_text_reminders.clear()
             else:
+                state.plain_text_reminders.clear()
                 state.plain_text_retry_count = 0
                 logger.info(f"本轮调用列表：{[call.name for call in response.call_list]}")
 
@@ -287,6 +300,7 @@ class _LoopState:
         "is_final_timeout",
         "last_user_ts",
         "pending_user_text",
+        "plain_text_reminders",
         "plain_text_retry_count",
         "summary",
     )
@@ -300,6 +314,7 @@ class _LoopState:
         self.last_user_ts = 0.0
         self.chain_user_saved = False
         self.plain_text_retry_count = 0
+        self.plain_text_reminders: list[LLMPayload] = []
         self.follow_up_count = 0
         self.consecutive_interrupt_count = 0
 
@@ -402,6 +417,26 @@ def _log_missing_tool_call(response: Any, state: _LoopState) -> None:
         logger.info(f"LLM 返回纯文本（第 {attempt} 次），注入提醒后重试: {raw_message[:80]}")
     else:
         logger.warning(f"LLM 返回空响应（第 {attempt} 次），注入提醒后重试")
+
+
+def _rollback_failed_assistant(response: Any, payload_baseline: int) -> None:
+    """丢弃发送基线之后追加的失败 ASSISTANT 输出。
+
+    模型未返回工具调用时，本次正文不会被执行也不会真正发出，持久化
+    会让后续轮次读到"说过却无下文"的残缺历史。仅在末尾确实是本轮
+    新增的 ASSISTANT 时回滚；同时清空 ``message`` 等输出字段，防止
+    提交阶段把这段正文写进持久对话链。
+    """
+    payloads = response.payloads
+    if not isinstance(payloads, list):
+        return
+    if len(payloads) > payload_baseline:
+        trailing = payloads[payload_baseline:]
+        if all(payload.role == ROLE.ASSISTANT for payload in trailing):
+            del payloads[payload_baseline:]
+            response.message = ""
+            response.reasoning_content = ""
+            response.call_list = []
 
 
 def _exceeded_retry_limit(config: Any, state: _LoopState) -> bool:
