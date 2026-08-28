@@ -50,6 +50,9 @@ logger = get_logger("kfc_chatter")
 _VIRTUAL_TRIGGER_MESSAGE_ID = "virtual_timeout_trigger"
 """超时等无真实触发消息场景下使用的虚拟消息 ID。"""
 
+_CORE_WAKE_ONLY_RESUME_SOURCES: frozenset[str] = frozenset({"message", "timer"})
+"""Core 仅用于解除 Wait 状态、不携带独立行动语义的恢复来源。"""
+
 _TOOL_NAME_PREFIXES: tuple[str, ...] = ("action-", "tool-", "agent-")
 
 
@@ -105,11 +108,17 @@ class KokoroFlowChatter(BaseChatter):
             await runner.aclose()
 
     def stage_external_resume(self, event: WaitResumeEvent) -> None:
-        """暂存最近一次框架恢复事件。
+        """暂存最近一次具有独立行动语义的框架恢复事件。
+
+        Core 的 ``message`` 与 ``timer`` 事件只负责解除 ``Wait`` 状态：
+        前者对应未读消息，后者让 KFC 自行检查等待超时。把它们当成
+        external resume 会抢占正常输入分支并造成 ``Wait(0)`` 空转。
 
         Args:
             event: Core 通过 Chatter generator ``asend`` 送入的恢复事件。
         """
+        if event.source in _CORE_WAKE_ONLY_RESUME_SOURCES:
+            return
         self._pending_external_resume = event
 
     def take_external_resume(self) -> WaitResumeEvent | None:

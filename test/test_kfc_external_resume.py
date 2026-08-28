@@ -31,6 +31,9 @@ from plugins.kokoro_flow_chatter.runtime.orchestrator import (  # noqa: E402
 from plugins.kokoro_flow_chatter.runtime.turn_controller import (  # noqa: E402
     prepare_turn_input,
 )
+from plugins.kokoro_flow_chatter.services.timeout_service import (  # noqa: E402
+    TimeoutService,
+)
 from plugins.kokoro_flow_chatter.session import KFCSession  # noqa: E402
 
 
@@ -137,6 +140,131 @@ async def test_execute_receives_core_style_asend(
     assert isinstance(await generator.asend(event), Stop)
     assert received == [event]
     await generator.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["message", "timer"])
+async def test_execute_ignores_core_wake_only_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    """Core 的消息/定时唤醒不得占用 external resume 单槽。"""
+    received: list[WaitResumeEvent | None] = []
+
+    async def fake_orchestrator(chatter: KokoroFlowChatter):
+        yield Wait(0)
+        received.append(chatter.take_external_resume())
+        yield Stop(0)
+
+    monkeypatch.setattr(
+        "plugins.kokoro_flow_chatter.chatter.execute_orchestrator",
+        fake_orchestrator,
+    )
+    chatter = KokoroFlowChatter("target", cast(Any, object()))
+    generator = chatter.execute()
+    assert isinstance(await anext(generator), Wait)
+
+    assert isinstance(
+        await generator.asend(WaitResumeEvent(source=source)),
+        Stop,
+    )
+    assert received == [None]
+    await generator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_message_wake_processes_second_unread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wait 后的 message 唤醒必须让下一条真实消息进入正常 USER 回合。"""
+
+    async def fake_fetch_unreads(
+        time_format: str = "",
+    ) -> tuple[str, list[Any]]:
+        _ = time_format
+        return "", [message]
+
+    async def fake_plan(**_kwargs: Any) -> ContextPlan:
+        return ContextPlan(user_text="[新消息]\nsecond")
+
+    message = SimpleNamespace(
+        sender_id="user",
+        sender_name="User",
+        sender_cardname="",
+        sender_role=None,
+        processed_plain_text="second",
+        content="second",
+        message_id="m2",
+        time=123.0,
+    )
+    monkeypatch.setattr(
+        "plugins.kokoro_flow_chatter.runtime.turn_controller.plan_user_turn",
+        fake_plan,
+    )
+    chatter = KokoroFlowChatter("target", cast(Any, object()))
+    chatter.stage_external_resume(WaitResumeEvent(source="message", unread_count=1))
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    response = _Response()
+    session = KFCSession(user_id="user", stream_id="target")
+
+    result = await prepare_turn_input(
+        chatter,
+        response,
+        SimpleNamespace(platform="qq"),
+        KFCConfig(),
+        session,
+        cast(Any, _TimeoutService()),
+        False,
+    )
+
+    assert result.unread_msgs == [message]
+    assert result.persistent_user_payload is not None
+    assert result.external_resume_request_marker == ""
+    assert session.last_user_message_at == 123.0
+
+
+@pytest.mark.asyncio
+async def test_timer_wake_keeps_timeout_path_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wait 后的 timer 唤醒必须继续检查 KFC 自己的等待超时。"""
+
+    async def fake_fetch_unreads(
+        time_format: str = "",
+    ) -> tuple[str, list[Any]]:
+        _ = time_format
+        return "", []
+
+    async def empty_followup_payload(_stream_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "plugins.kokoro_flow_chatter.runtime.turn_controller._collect_followup_payload",
+        empty_followup_payload,
+    )
+    config = KFCConfig()
+    chatter = KokoroFlowChatter("target", cast(Any, object()))
+    chatter.stage_external_resume(WaitResumeEvent(source="timer", wait_time=0))
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    session = KFCSession(user_id="user", stream_id="target")
+    session.waiting_config.expected_reaction = "reply"
+    session.waiting_config.max_wait_seconds = 1.0
+    session.waiting_config.started_at = 1.0
+
+    result = await prepare_turn_input(
+        chatter,
+        _Response(),
+        SimpleNamespace(platform="qq"),
+        config,
+        session,
+        TimeoutService(config),
+        False,
+    )
+
+    assert result.request_only_payload is not None
+    assert result.external_resume_request_marker == ""
+    assert session.consecutive_timeout_count == 1
+    assert session.is_waiting() is False
 
 
 @pytest.mark.asyncio
