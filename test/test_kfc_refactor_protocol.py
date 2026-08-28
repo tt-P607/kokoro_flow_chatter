@@ -161,7 +161,7 @@ async def _unused_run_tool_call(
 
 
 def test_turn_trigger_priority_is_stable() -> None:
-    """触发优先级应固定，避免工具续轮被误判为新输入。"""
+    """触发优先级应固定，未闭合工具链优先于新输入与恢复事件。"""
     waiting_session = cast(Any, _FakeSession(waiting=True))
     idle_session = cast(Any, _FakeSession(waiting=False))
 
@@ -172,7 +172,7 @@ def test_turn_trigger_priority_is_stable() -> None:
             session=waiting_session,
             is_timeout=True,
         )
-        is TurnTrigger.NEW_MESSAGES
+        is TurnTrigger.FOLLOWUP_TOOL_RESULT
     )
     assert (
         classify_turn_trigger(
@@ -182,6 +182,35 @@ def test_turn_trigger_priority_is_stable() -> None:
             is_timeout=True,
         )
         is TurnTrigger.FOLLOWUP_TOOL_RESULT
+    )
+    assert (
+        classify_turn_trigger(
+            has_unread=True,
+            has_pending_tool_results=True,
+            session=waiting_session,
+            is_timeout=True,
+            has_external_resume=True,
+        )
+        is TurnTrigger.FOLLOWUP_TOOL_RESULT
+    )
+    assert (
+        classify_turn_trigger(
+            has_unread=True,
+            has_pending_tool_results=False,
+            session=waiting_session,
+            is_timeout=True,
+        )
+        is TurnTrigger.NEW_MESSAGES
+    )
+    assert (
+        classify_turn_trigger(
+            has_unread=False,
+            has_pending_tool_results=False,
+            session=waiting_session,
+            is_timeout=True,
+            has_external_resume=True,
+        )
+        is TurnTrigger.EXTERNAL_RESUME
     )
     assert (
         classify_turn_trigger(

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +58,12 @@ class TurnInputResult:
 
     persistent_user_payload: LLMPayload | None = None
     """本轮真实用户输入；非用户消息路径为空，发送前先进入快照。"""
+
+    external_resume_request_marker: str = ""
+    """通用 external resume 的请求级标记；普通回合为空。"""
+
+    external_resume_source: str = ""
+    """通用 external resume 来源，仅写入本次 LLM request metadata。"""
 
     next_signal: Wait | None = None
     continue_loop: bool = False
@@ -111,9 +118,17 @@ async def prepare_turn_input(
     _, raw_unreads = await chatter.fetch_unreads(time_format=_TIME_FORMAT)
     unread_msgs = await prefer_real_unreads(chatter, raw_unreads)
 
+    # 未闭合工具链期间不消费 external resume。真实未读仍保持现有优先级，
+    # resume 会留在 chatter 单槽中，待工具链安全闭合后的输入阶段处理。
+    external_resume = (
+        None if has_pending_tool_results else chatter.take_external_resume()
+    )
+    request_marker = uuid.uuid4().hex if external_resume is not None else ""
+
     is_timeout = (
         not unread_msgs
         and not has_pending_tool_results
+        and external_resume is None
         and session.is_waiting()
         and timeout_service.check_timeout(session)
     )
@@ -122,17 +137,32 @@ async def prepare_turn_input(
         has_pending_tool_results=has_pending_tool_results,
         session=session,
         is_timeout=is_timeout,
+        has_external_resume=external_resume is not None,
     )
 
     if trigger is TurnTrigger.NEW_MESSAGES:
         return await _prepare_new_messages(
-            chatter, response, chat_stream, config, session, unread_msgs
+            chatter,
+            response,
+            chat_stream,
+            config,
+            session,
+            unread_msgs,
+            external_resume=external_resume,
+            request_marker=request_marker,
         )
     if trigger is TurnTrigger.FOLLOWUP_TOOL_RESULT:
         return TurnInputResult(
             response=response,
             extra_payload=await _collect_followup_payload(chatter.stream_id),
             has_pending_tool_results=False,
+        )
+    if trigger is TurnTrigger.EXTERNAL_RESUME and external_resume is not None:
+        return await _prepare_external_resume(
+            chatter,
+            response,
+            external_resume,
+            request_marker,
         )
     if trigger is TurnTrigger.TIMEOUT_EXPIRED:
         return await _prepare_timeout(chatter, response, session, timeout_service)
@@ -152,6 +182,9 @@ async def _prepare_new_messages(
     config: KFCConfig,
     session: KFCSession,
     unread_msgs: list[Any],
+    *,
+    external_resume: Any = None,
+    request_marker: str = "",
 ) -> TurnInputResult:
     """处理新消息路径：记录消息、构建用户 payload。"""
     for message in unread_msgs:
@@ -182,6 +215,8 @@ async def _prepare_new_messages(
         formatted_unreads=format_unread_messages(chatter, unread_msgs),
         stream_id=chatter.stream_id,
         session=session,
+        external_resume=external_resume,
+        request_marker=request_marker,
     )
     user_payload, extra_payload = render_user_payload(plan, media_items)
     _append_or_merge_user_payload(response, user_payload, allow_merge=not media_items)
@@ -189,10 +224,61 @@ async def _prepare_new_messages(
     return TurnInputResult(
         response=response,
         unread_msgs=unread_msgs,
+        request_only_payload=_build_external_resume_payload(external_resume),
         extra_payload=extra_payload,
         persistent_user_payload=user_payload,
+        external_resume_request_marker=request_marker,
+        external_resume_source=(
+            str(external_resume.source) if external_resume is not None else ""
+        ),
         has_pending_tool_results=False,
     )
+
+
+async def _prepare_external_resume(
+    chatter: KokoroFlowChatter,
+    response: Any,
+    external_resume: Any,
+    request_marker: str,
+) -> TurnInputResult:
+    """构造不落持久 USER 链的通用 external resume 回合。"""
+    plan = await plan_followup_contributions(
+        chatter.stream_id,
+        external_resume=external_resume,
+        request_marker=request_marker,
+    )
+    request_only_payload = _build_external_resume_payload(external_resume)
+    extra_payload = render_turn_contributions(plan.contributions)
+    if request_only_payload is None and extra_payload is None:
+        return TurnInputResult(
+            response=response,
+            next_signal=Wait(0),
+            continue_loop=True,
+        )
+    return TurnInputResult(
+        response=response,
+        request_only_payload=request_only_payload,
+        extra_payload=extra_payload,
+        external_resume_request_marker=request_marker,
+        external_resume_source=str(external_resume.source or ""),
+    )
+
+
+def _build_external_resume_payload(external_resume: Any) -> LLMPayload | None:
+    """读取调用方显式提供的 transient resume prompt。
+
+    未提供 prompt 时不生成默认 USER 文案；第三方 contribution 仍可单独
+    形成回合，两者都为空则由调用方安全回到 Wait。
+    """
+    if external_resume is None:
+        return None
+    extra = external_resume.extra
+    if not isinstance(extra, dict):
+        return None
+    prompt = extra.get("resume_prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    return LLMPayload(ROLE.USER, Text(prompt.strip()))
 
 
 async def _prepare_timeout(

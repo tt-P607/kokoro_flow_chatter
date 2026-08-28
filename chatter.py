@@ -19,7 +19,14 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.stream_api import get_stream
-from src.app.plugin_system.base import BaseChatter, Failure, Stop, Success, Wait
+from src.app.plugin_system.base import (
+    BaseChatter,
+    Failure,
+    Stop,
+    Success,
+    Wait,
+    WaitResumeEvent,
+)
 from src.app.plugin_system.types import ChatType, Message
 
 from .actions.reply import KFCReplyAction
@@ -34,6 +41,8 @@ from .models import DO_NOTHING, KFC_REPLY, KFCEventType
 from .runtime import execute_orchestrator, send_interruptable_response
 
 if TYPE_CHECKING:
+    from src.app.plugin_system.base import BasePlugin
+
     from .session import KFCSession, KFCSessionStore
 
 logger = get_logger("kfc_chatter")
@@ -59,12 +68,59 @@ class KokoroFlowChatter(BaseChatter):
     chat_type: ChatType = ChatType.PRIVATE
     dependencies: list[str] = []
 
+    def __init__(self, stream_id: str, plugin: BasePlugin) -> None:
+        """初始化 Chatter 并创建单槽 external resume 暂存区。
+
+        Args:
+            stream_id: 当前聊天流 ID。
+            plugin: 所属插件实例。
+        """
+        super().__init__(stream_id, plugin)
+        self._pending_external_resume: WaitResumeEvent | None = None
+
     # ── 框架契约 ──────────────────────────────────────────
 
-    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:  # type: ignore[override]
-        """执行对话循环，委托 runtime 编排器。"""
-        async for result in execute_orchestrator(self):
-            yield result
+    async def execute(
+        self,
+    ) -> AsyncGenerator[
+        Wait | Success | Failure | Stop,
+        WaitResumeEvent | None,
+    ]:
+        """执行对话循环，并接收框架送入的恢复事件。
+
+        runtime 编排器保持单向生成器；框架通过 ``asend`` 送回的值在本层
+        暂存，由下一次安全输入阶段消费，避免把双向代理逻辑扩散到主循环。
+        """
+        runner = execute_orchestrator(self)
+        try:
+            result = await runner.asend(None)
+            while True:
+                incoming = yield result
+                if isinstance(incoming, WaitResumeEvent):
+                    self.stage_external_resume(incoming)
+                result = await runner.asend(None)
+        except StopAsyncIteration:
+            return
+        finally:
+            await runner.aclose()
+
+    def stage_external_resume(self, event: WaitResumeEvent) -> None:
+        """暂存最近一次框架恢复事件。
+
+        Args:
+            event: Core 通过 Chatter generator ``asend`` 送入的恢复事件。
+        """
+        self._pending_external_resume = event
+
+    def take_external_resume(self) -> WaitResumeEvent | None:
+        """一次性取得已暂存的恢复事件。
+
+        Returns:
+            当前待处理事件；没有事件时返回 ``None``。
+        """
+        event = self._pending_external_resume
+        self._pending_external_resume = None
+        return event
 
     async def modify_llm_usables(self, llm_usables: list[Any]) -> list[Any]:  # type: ignore[override]
         """在框架通用过滤之上，应用 KFC 屏蔽规则并稳定排序。

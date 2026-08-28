@@ -17,6 +17,7 @@ from .sources.plugin_source import collect_plugin_turn_contributions
 from .types import ContextPlan, InitialContextPlan
 
 if TYPE_CHECKING:
+    from src.app.plugin_system.base import WaitResumeEvent
     from src.app.plugin_system.types import ChatStream
 
     from ..config import KFCConfig
@@ -58,6 +59,8 @@ async def plan_user_turn(
     formatted_unreads: str,
     stream_id: str = "",
     session: KFCSession | None = None,
+    external_resume: WaitResumeEvent | None = None,
+    request_marker: str = "",
 ) -> ContextPlan:
     """规划本轮用户输入及 turn 级上下文贡献。
 
@@ -65,6 +68,8 @@ async def plan_user_turn(
         formatted_unreads: 已格式化的未读消息文本。
         stream_id: 当前聊天流 ID，供 ``on_prompt_build`` 订阅者读取。
         session: 当前会话；为 ``None`` 时跳过备忘录注入。
+        external_resume: 与真实未读同轮处理的通用恢复事件。
+        request_marker: external resume 请求标记。
 
     Returns:
         ContextPlan: 当前真实用户输入与上下文贡献列表。
@@ -75,6 +80,8 @@ async def plan_user_turn(
         prompt_name=USER_PROMPT_NAME,
         content=user_text,
         stream_id=stream_id,
+        external_resume=external_resume,
+        request_marker=request_marker,
     )
 
     if session is not None and session.memos:
@@ -85,7 +92,12 @@ async def plan_user_turn(
     return ContextPlan(user_text=user_text, contributions=contributions)
 
 
-async def plan_followup_contributions(stream_id: str) -> ContextPlan:
+async def plan_followup_contributions(
+    stream_id: str,
+    *,
+    external_resume: WaitResumeEvent | None = None,
+    request_marker: str = "",
+) -> ContextPlan:
     """规划续轮/超时路径的 turn 级上下文贡献。
 
     这两条路径不新增用户消息，但仍需收集第三方注入——否则
@@ -93,6 +105,8 @@ async def plan_followup_contributions(stream_id: str) -> ContextPlan:
 
     Args:
         stream_id: 当前聊天流 ID。
+        external_resume: 当前通用恢复事件；普通续轮为 ``None``。
+        request_marker: external resume 请求标记。
 
     Returns:
         ContextPlan: 仅含贡献列表，文本字段为空。
@@ -101,6 +115,8 @@ async def plan_followup_contributions(stream_id: str) -> ContextPlan:
         prompt_name=USER_PROMPT_NAME,
         content="",
         stream_id=stream_id,
+        external_resume=external_resume,
+        request_marker=request_marker,
     )
     return ContextPlan(user_text="", contributions=contributions)
 

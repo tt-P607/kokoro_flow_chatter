@@ -7,12 +7,15 @@
 
 from __future__ import annotations
 
-from typing import Any, cast, get_args
+from typing import TYPE_CHECKING, Any, cast, get_args
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import Content, Text
 
 from ..types import ContextContribution, ContextOwner
+
+if TYPE_CHECKING:
+    from src.app.plugin_system.base import WaitResumeEvent
 
 logger = get_logger("kfc_context_source")
 
@@ -76,6 +79,8 @@ async def collect_plugin_turn_contributions(
     prompt_name: str,
     content: str,
     stream_id: str = "",
+    external_resume: WaitResumeEvent | None = None,
+    request_marker: str = "",
 ) -> list[ContextContribution]:
     """收集第三方为本轮提交的上下文贡献。
 
@@ -83,6 +88,8 @@ async def collect_plugin_turn_contributions(
         prompt_name: 提示词模板名，供订阅者区分注入目标。
         content: 当前用户提示词正文，供订阅者参考。
         stream_id: 当前聊天流 ID。
+        external_resume: 当前待处理的通用恢复事件；普通回合为 ``None``。
+        request_marker: 本次 external resume 请求的稳定标记。
 
     Returns:
         list[ContextContribution]: 归一化后的贡献列表；事件失败时返回空列表。
@@ -94,6 +101,8 @@ async def collect_plugin_turn_contributions(
             "content": content,
             "extra": "",
             "stream_id": stream_id,
+            "external_resume": external_resume,
+            "request_marker": request_marker,
         }
         result = await publish_event(
             "on_prompt_build",

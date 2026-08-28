@@ -20,12 +20,14 @@ class TurnTrigger(str, Enum):
     Members:
         NEW_MESSAGES: 收到新的未读消息（最常见路径）。
         FOLLOWUP_TOOL_RESULT: 上轮产生了工具结果，本轮让模型继续消化。
+        EXTERNAL_RESUME: 收到框架外部恢复事件，需要形成 transient turn。
         TIMEOUT_EXPIRED: 等待已超时，需要 bot 主动续话。
         IDLE_WAIT: 既无新消息也未到超时，让出本 tick。
     """
 
     NEW_MESSAGES = "new_messages"
     FOLLOWUP_TOOL_RESULT = "followup_tool_result"
+    EXTERNAL_RESUME = "external_resume"
     TIMEOUT_EXPIRED = "timeout_expired"
     IDLE_WAIT = "idle_wait"
 
@@ -36,26 +38,31 @@ def classify_turn_trigger(
     has_pending_tool_results: bool,
     session: KFCSession,
     is_timeout: bool,
+    has_external_resume: bool = False,
 ) -> TurnTrigger:
     """确定本轮触发类型。
 
     优先级固定为
-    ``NEW_MESSAGES > FOLLOWUP_TOOL_RESULT > TIMEOUT_EXPIRED > IDLE_WAIT``，
-    确保新消息永远优先于工具续轮被处理。
+    ``FOLLOWUP_TOOL_RESULT > NEW_MESSAGES > EXTERNAL_RESUME > TIMEOUT_EXPIRED > IDLE_WAIT``，
+    确保未闭合工具链先消化完毕；真实消息与恢复事件均保留在各自队列，
+    待工具段闭合后的下一轮再正常处理，避免插入破坏工具段上下文。
 
     Args:
         has_unread: 是否存在待处理的未读消息。
         has_pending_tool_results: 上轮是否留下了待消化的工具结果。
         session: 当前会话，用于判断是否处于等待状态。
         is_timeout: 等待是否已超时。
+        has_external_resume: 是否有待处理的框架恢复事件。
 
     Returns:
         TurnTrigger: 本轮触发类型。
     """
-    if has_unread:
-        return TurnTrigger.NEW_MESSAGES
     if has_pending_tool_results:
         return TurnTrigger.FOLLOWUP_TOOL_RESULT
+    if has_unread:
+        return TurnTrigger.NEW_MESSAGES
+    if has_external_resume:
+        return TurnTrigger.EXTERNAL_RESUME
     if session.is_waiting() and is_timeout:
         return TurnTrigger.TIMEOUT_EXPIRED
     return TurnTrigger.IDLE_WAIT

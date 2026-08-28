@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 

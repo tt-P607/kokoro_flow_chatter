@@ -35,7 +35,7 @@ from ..snapshot import capture_snapshot
 from .context_builder import build_initial_request
 from .input_status import InputStatusReporter
 from .model_setup import resolve_model_set
-from .payload_hygiene import heal_orphan_tool_results, strip_stale_reminder_prefixes
+from .payload_hygiene import heal_orphan_tool_results
 from .request_view import build_request_view
 from .summary_sync import SummarySynchronizer
 from ..context.planner import build_last_mile_payload
@@ -142,6 +142,11 @@ async def execute_orchestrator(
             if turn_input.extra_payload is not None:
                 transient_payloads.append(turn_input.extra_payload)
             transient_payloads.extend(state.plain_text_reminders)
+            _set_external_resume_metadata(
+                response,
+                request_marker=turn_input.external_resume_request_marker,
+                source=turn_input.external_resume_source,
+            )
             # 纯文本重试的提醒随本轮请求临时注入，成功取得工具调用后自动
             # 消失；失败的纯文本 ASSISTANT 输出同样不落主链——发送前记录
             # 基线长度，模型仍只返回正文时直接回滚。
@@ -182,6 +187,7 @@ async def execute_orchestrator(
                 yield Failure("LLM 请求失败", error)
                 return
             finally:
+                _clear_external_resume_metadata(response)
                 if should_report:
                     await reporter.stop()
 
@@ -301,6 +307,44 @@ class _LoopState:
         self.plain_text_reminders: list[LLMPayload] = []
         self.follow_up_count = 0
         self.consecutive_interrupt_count = 0
+
+
+_EXTERNAL_RESUME_MARKER_KEY = "kfc_external_resume_request_marker"
+_EXTERNAL_RESUME_SOURCE_KEY = "kfc_external_resume_source"
+
+
+def _request_metadata(response: Any) -> dict[str, Any] | None:
+    """取得 response / request 背后的可变 request metadata。"""
+    upper = response._upper if hasattr(response, "_upper") else response
+    metadata = getattr(upper, "meta_data", None)
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _set_external_resume_metadata(
+    response: Any,
+    *,
+    request_marker: str,
+    source: str,
+) -> None:
+    """仅为本次 external resume 请求设置通用元数据。"""
+    metadata = _request_metadata(response)
+    if metadata is None:
+        return
+    metadata.pop(_EXTERNAL_RESUME_MARKER_KEY, None)
+    metadata.pop(_EXTERNAL_RESUME_SOURCE_KEY, None)
+    if not request_marker:
+        return
+    metadata[_EXTERNAL_RESUME_MARKER_KEY] = request_marker
+    metadata[_EXTERNAL_RESUME_SOURCE_KEY] = source
+
+
+def _clear_external_resume_metadata(response: Any) -> None:
+    """请求结束后清理 transient external resume 元数据。"""
+    metadata = _request_metadata(response)
+    if metadata is None:
+        return
+    metadata.pop(_EXTERNAL_RESUME_MARKER_KEY, None)
+    metadata.pop(_EXTERNAL_RESUME_SOURCE_KEY, None)
 
 
 
