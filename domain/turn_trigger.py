@@ -43,9 +43,9 @@ def classify_turn_trigger(
     """确定本轮触发类型。
 
     优先级固定为
-    ``FOLLOWUP_TOOL_RESULT > NEW_MESSAGES > EXTERNAL_RESUME > TIMEOUT_EXPIRED > IDLE_WAIT``，
-    确保未闭合工具链先消化完毕；真实消息与恢复事件均保留在各自队列，
-    待工具段闭合后的下一轮再正常处理，避免插入破坏工具段上下文。
+    ``FOLLOWUP_TOOL_RESULT > EXTERNAL_RESUME > NEW_MESSAGES > TIMEOUT_EXPIRED > IDLE_WAIT``，
+    确保未闭合工具链先消化完毕；跨流行动等恢复事件优先于普通未读，
+    形成不受真实聊天稀释的独立行动轮，未读保留在队列中待下一轮处理。
 
     Args:
         has_unread: 是否存在待处理的未读消息。
@@ -59,10 +59,10 @@ def classify_turn_trigger(
     """
     if has_pending_tool_results:
         return TurnTrigger.FOLLOWUP_TOOL_RESULT
-    if has_unread:
-        return TurnTrigger.NEW_MESSAGES
     if has_external_resume:
         return TurnTrigger.EXTERNAL_RESUME
+    if has_unread:
+        return TurnTrigger.NEW_MESSAGES
     if session.is_waiting() and is_timeout:
         return TurnTrigger.TIMEOUT_EXPIRED
     return TurnTrigger.IDLE_WAIT

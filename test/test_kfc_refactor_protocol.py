@@ -161,7 +161,7 @@ async def _unused_run_tool_call(
 
 
 def test_turn_trigger_priority_is_stable() -> None:
-    """触发优先级应固定，未闭合工具链优先于新输入与恢复事件。"""
+    """触发优先级应固定：未闭合工具链最优先，恢复事件优先于真实未读。"""
     waiting_session = cast(Any, _FakeSession(waiting=True))
     idle_session = cast(Any, _FakeSession(waiting=False))
 
@@ -192,6 +192,17 @@ def test_turn_trigger_priority_is_stable() -> None:
             has_external_resume=True,
         )
         is TurnTrigger.FOLLOWUP_TOOL_RESULT
+    )
+    # external resume 优先于真实未读：handoff 形成独立行动轮。
+    assert (
+        classify_turn_trigger(
+            has_unread=True,
+            has_pending_tool_results=False,
+            session=waiting_session,
+            is_timeout=False,
+            has_external_resume=True,
+        )
+        is TurnTrigger.EXTERNAL_RESUME
     )
     assert (
         classify_turn_trigger(

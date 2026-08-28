@@ -118,8 +118,9 @@ async def prepare_turn_input(
     _, raw_unreads = await chatter.fetch_unreads(time_format=_TIME_FORMAT)
     unread_msgs = await prefer_real_unreads(chatter, raw_unreads)
 
-    # 未闭合工具链期间不消费 external resume。真实未读仍保持现有优先级，
-    # resume 会留在 chatter 单槽中，待工具链安全闭合后的输入阶段处理。
+    # 未闭合工具链期间不消费 external resume，待工具链安全闭合后的
+    # 输入阶段处理；resume 优先于真实未读形成独立行动轮，未读
+    # 保留在框架未读队列中待下一轮正常处理。
     external_resume = (
         None if has_pending_tool_results else chatter.take_external_resume()
     )

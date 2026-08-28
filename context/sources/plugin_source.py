@@ -112,6 +112,9 @@ async def collect_plugin_turn_contributions(
                 "values": values,
                 "policies": {},
                 "strict": False,
+                # EventBus 协议要求订阅者返回的 params key 集合与发布时完全一致，
+                # 贡献键必须在此预置，订阅者才能原地追加（否则其修改会被丢弃）。
+                "context_contributions": [],
             },
         )
         final_params: dict[str, Any] = result.get("params", {})

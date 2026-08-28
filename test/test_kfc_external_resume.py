@@ -193,25 +193,77 @@ async def test_cold_zero_unread_resume_uses_only_transient_contribution(
 
 
 @pytest.mark.asyncio
-async def test_real_unread_and_resume_share_one_turn(
+async def test_external_resume_takes_precedence_over_real_unread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """真实未读保留真实 USER turn，同时合入 resume contribution。"""
+    """external resume 优先于真实未读：独立行动轮，未读保留不消费。"""
     captured: dict[str, Any] = {}
 
-    async def fake_plan(**kwargs: Any) -> ContextPlan:
+    async def fake_plan(*_args: Any, **kwargs: Any) -> ContextPlan:
         captured.update(kwargs)
         return ContextPlan(
-            user_text="[新消息]\nhello",
+            user_text="",
             contributions=[
                 ContextContribution(
                     source="plugin.resume",
                     owner="notice",
                     priority=10,
-                    content="同轮内部行动",
+                    content="跨流行动指令",
                 )
             ],
         )
+
+    monkeypatch.setattr(
+        "plugins.kokoro_flow_chatter.runtime.turn_controller.plan_followup_contributions",
+        fake_plan,
+    )
+    message = SimpleNamespace(
+        sender_id="user",
+        sender_name="User",
+        processed_plain_text="hello",
+        content="hello",
+        message_id="m1",
+        time=123.0,
+    )
+    event = WaitResumeEvent(source="external")
+    chatter = _Chatter(event, [message])
+    response = _Response()
+    session = KFCSession(user_id="user", stream_id="target")
+    initial_activity = session.last_activity_at
+
+    result = await prepare_turn_input(
+        cast(Any, chatter),
+        response,
+        SimpleNamespace(platform="qq"),
+        KFCConfig(),
+        session,
+        cast(Any, _TimeoutService()),
+        False,
+    )
+
+    # 独立行动轮：resume 生效，真实未读不被写入/消费。
+    assert "跨流行动指令" in _text(result.extra_payload)
+    assert result.persistent_user_payload is None
+    assert result.unread_msgs == []
+    assert result.external_resume_request_marker
+    assert captured["external_resume"] == event
+    assert session.last_user_message_at is None
+    assert session.last_activity_at == initial_activity
+    assert len(session.mental_log) == 0
+    # 未读保留在队列中。
+    assert chatter._unread_msgs == [message]  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_real_unread_processed_normally_after_resume_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """resume 行动轮结束后，下一轮真实未读正常处理。"""
+    captured: dict[str, Any] = {}
+
+    async def fake_plan(**kwargs: Any) -> ContextPlan:
+        captured.update(kwargs)
+        return ContextPlan(user_text="[新消息]\nhello")
 
     monkeypatch.setattr(
         "plugins.kokoro_flow_chatter.runtime.turn_controller.plan_user_turn",
@@ -225,8 +277,8 @@ async def test_real_unread_and_resume_share_one_turn(
         message_id="m1",
         time=123.0,
     )
-    event = WaitResumeEvent(source="external")
-    chatter = _Chatter(event, [message])
+    # resume 槽位已空：行动轮已完成。
+    chatter = _Chatter(None, [message])
     response = _Response()
     session = KFCSession(user_id="user", stream_id="target")
 
@@ -242,9 +294,7 @@ async def test_real_unread_and_resume_share_one_turn(
 
     assert result.unread_msgs == [message]
     assert result.persistent_user_payload is not None
-    assert "同轮内部行动" in _text(result.extra_payload)
-    assert captured["external_resume"] == event
-    assert captured["request_marker"] == result.external_resume_request_marker
+    assert result.external_resume_request_marker == ""
     assert session.last_user_message_at == 123.0
     assert len(session.mental_log) == 1
 
