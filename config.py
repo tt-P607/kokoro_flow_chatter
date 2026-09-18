@@ -79,6 +79,25 @@ class KFCConfig(BaseConfig):
             ge=0,
             le=20,
         )
+        guard_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否启用响应守卫。启用后，每次取得工具调用结果时先调用 "
+                "response_guard 服务检测明显属于模型层安全拒答的输出，"
+                "命中时回滚本轮输出并原样重试。"
+                "response_guard 插件未安装时本项无效果。"
+            ),
+        )
+        guard_max_retries: int = Field(
+            default=1,
+            description=(
+                "响应守卫命中后的原样重试次数上限。达到上限后回滚本轮输出"
+                "并静默结束本轮，不会把审核文本发给用户。"
+                "设为 0 表示不重试，命中即刻静默收口。"
+            ),
+            ge=0,
+            le=5,
+        )
         enable_input_status: bool = Field(
             default=False,
             description=(
