@@ -235,6 +235,12 @@ async def execute_orchestrator(
                     from_tool_call=bool(response.call_list),
                 ):
                     continue
+                # 守卫已明确判定本轮响应无效，且重试预算已耗尽：response 已被
+                # 完整回滚，本轮必须在这里显式结束。继续往下走只会让空响应
+                # 进入决策层，在提交阶段写入一条空的 bot planning，把一次明确
+                # 的失败伪装成一次正常决策。
+                yield Stop(0)
+                return
             elif not response.call_list:
                 if _handle_plain_text_violation(
                     response, payload_baseline, state, config, model_set
@@ -480,6 +486,9 @@ def _rollback_failed_assistant(response: Any, payload_baseline: int) -> None:
             del payloads[payload_baseline:]
             response.message = ""
             response.reasoning_content = ""
+            # 推理分段与推理正文是同一份内容的两个视图，回滚必须同时
+            # 清空，否则被拦响应仍会以分段形式留在响应对象上。
+            response.reasoning_parts = []
             response.call_list = []
 
 
