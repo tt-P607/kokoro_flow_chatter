@@ -549,8 +549,9 @@ def _handle_guard_refusal(
         state.guard_retry_count += 1
         logger.warning(
             f"Response Guard 判定{shape}为模型层安全拒答（第 "
-            f"{state.guard_retry_count} 次 Guard retry），回滚本轮输出并注入"
-            f"一次性 Guard Retry Reminder；evidence={evidence_text}"
+            f"{state.guard_retry_count}/{config.general.guard_max_retries} 次 Guard "
+            f"retry），回滚本轮输出并注入一次性 Guard Retry Reminder；"
+            f"evidence={evidence_text}"
         )
         state.guard_reminder = LLMPayload(ROLE.USER, Text(_GUARD_RETRY_REMINDER))
         state.has_pending_tool_results = True

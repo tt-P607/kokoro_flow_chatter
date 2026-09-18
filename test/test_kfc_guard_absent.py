@@ -98,7 +98,7 @@ def test_legacy_config_without_guard_fields_loads(tmp_path: Path) -> None:
 
     assert config.general.enabled is True
     assert config.general.guard_enabled is True
-    assert config.general.guard_max_retries == 1
+    assert config.general.guard_max_retries == 3
 
 
 def test_auto_update_appends_missing_guard_fields(tmp_path: Path) -> None:
@@ -109,11 +109,11 @@ def test_auto_update_appends_missing_guard_fields(tmp_path: Path) -> None:
     config = KFCConfig.load(path, auto_update=True)
 
     assert config.general.guard_enabled is True
-    assert config.general.guard_max_retries == 1
+    assert config.general.guard_max_retries == 3
     with path.open("rb") as handle:
         rendered = tomllib.load(handle)
     assert rendered["general"]["guard_enabled"] is True
-    assert rendered["general"]["guard_max_retries"] == 1
+    assert rendered["general"]["guard_max_retries"] == 3
 
 
 def test_real_config_file_loads_without_guard_fields() -> None:
@@ -130,4 +130,4 @@ def test_real_config_file_loads_without_guard_fields() -> None:
 
     assert isinstance(config, KFCConfig)
     assert config.general.guard_enabled is True
-    assert config.general.guard_max_retries == 1
+    assert config.general.guard_max_retries == 3
