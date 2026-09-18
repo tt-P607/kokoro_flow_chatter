@@ -88,17 +88,6 @@ class KFCConfig(BaseConfig):
                 "response_guard 插件未安装时本项无效果。"
             ),
         )
-        guard_max_retries: int = Field(
-            default=3,
-            description=(
-                "响应守卫命中后的原样重试次数上限。初始请求不计入次数，"
-                "因此总模型生成次数为上限值加一。达到上限后回滚本轮输出"
-                "并静默结束本轮，不会把审核文本发给用户。"
-                "设为 0 表示不重试，命中即刻静默收口。"
-            ),
-            ge=0,
-            le=5,
-        )
         enable_input_status: bool = Field(
             default=False,
             description=(

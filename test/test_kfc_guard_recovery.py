@@ -1,12 +1,15 @@
 """模型层拒答的恢复流程测试。
 
-覆盖两类失败的分流、一次性 transient reminder 的生命周期，以及
-被拦截内容不进入持久上下文的各种保证。
+覆盖两类失败的分流、逐层累积的 Guard Retry 提示，以及被拦截内容与
+提示都不进入持久上下文的各种保证。
 
 概念链路：
 
-    响应 ──► Response Guard ──┬─ MODEL_REFUSAL ──► Guard recovery
+    响应 ──► Response Guard ──┬─ MODEL_REFUSAL ──► Guard recovery（L1..L3）
                               └─ PASS ──────────► 格式纠正 / 正常决策
+
+Guard Retry 固定三层，提示不驻留在状态里：状态只保存 ``guard_retry_count``，
+每次组装发送视图时按层级现场构造 ``L1..LN``。
 """
 
 from __future__ import annotations
@@ -29,10 +32,12 @@ from plugins.kokoro_flow_chatter.runtime.guard_hook import (  # noqa: E402
     check_response_guard,
 )
 from plugins.kokoro_flow_chatter.runtime.orchestrator import (  # noqa: E402
-    _GUARD_RETRY_REMINDER,
+    _GUARD_MAX_RETRIES,
+    _GUARD_RETRY_REMINDERS,
     _PLAIN_TEXT_RETRY_REMINDER,
     _LoopState,
-    _consume_guard_reminder,
+    _build_guard_retry_reminders,
+    _guard_retry_payloads,
     _handle_guard_refusal,
     _handle_plain_text_violation,
 )
@@ -51,6 +56,9 @@ from src.app.plugin_system.types import (  # noqa: E402
     Text,
     ToolCall,
 )
+
+_L1, _L2, _L3 = _GUARD_RETRY_REMINDERS
+"""三层提示的具名引用，供断言顺序与内容。"""
 
 _EVIDENCE = ("reasoning_explicit_safety_refusal", "reply_platform_refusal")
 _PLAIN_REFUSAL = (
@@ -110,11 +118,14 @@ def _state() -> _LoopState:
     return _LoopState(summary=cast(Any, None))
 
 
-def _config(max_retries: int = 1) -> KFCConfig:
-    """构造只指定守卫重试上限的 KFC 配置。"""
-    return KFCConfig(
-        general=KFCConfig.GeneralSection(guard_max_retries=max_retries)
-    )
+def _config(**overrides: Any) -> KFCConfig:
+    """构造只指定守卫开关的 KFC 配置。
+
+    Guard Retry 层数不接受用户配置，因此这里没有对应入参。
+    """
+    settings: dict[str, Any] = {"guard_enabled": True}
+    settings.update(overrides)
+    return KFCConfig(general=KFCConfig.GeneralSection(**settings))
 
 
 def _plain_refusal_response() -> _FakeResponse:
@@ -147,6 +158,12 @@ def _tool_refusal_response() -> _FakeResponse:
     )
 
 
+def _content_of(payload: LLMPayload) -> list[Any]:
+    """取 payload 的内容列表。"""
+    content = payload.content
+    return content if isinstance(content, list) else [content]
+
+
 def _reminder_text(payload: LLMPayload) -> str:
     """取出 payload 中的纯文本内容。"""
     return "".join(
@@ -154,60 +171,216 @@ def _reminder_text(payload: LLMPayload) -> str:
     )
 
 
-# ── 一次性 reminder 的生命周期 ──────────────────────────────────────────
+def _layers_in(payloads: list[LLMPayload]) -> list[str]:
+    """按出现顺序提取一组 payload 中的 Guard 层级文本。"""
+    layers: list[str] = []
+    for payload in payloads:
+        text = _reminder_text(payload)
+        if text in _GUARD_RETRY_REMINDERS:
+            layers.append(text)
+    return layers
 
 
-def test_guard_block_creates_single_reminder() -> None:
-    """命中时创建一条 Guard 提示。"""
-    state = _state()
-    _handle_guard_refusal(
-        _tool_refusal_response(),
+def _payloads_text(payloads: list[LLMPayload]) -> str:
+    """拼接一组 payload 的全部文本。"""
+    chunks: list[str] = []
+    for payload in payloads:
+        chunks.extend(
+            item.text for item in _content_of(payload) if isinstance(item, Text)
+        )
+    return "\n".join(chunks)
+
+
+def _block(
+    state: _LoopState, *, from_tool_call: bool = True, **kwargs: Any
+) -> bool:
+    """驱动一次守卫命中，返回是否进入重试。"""
+    response = (
+        _tool_refusal_response() if from_tool_call else _plain_refusal_response()
+    )
+    return _handle_guard_refusal(
+        response,
         1,
         state,
-        _config(),
         _EVIDENCE,
-        from_tool_call=True,
+        from_tool_call=from_tool_call,
+        **kwargs,
     )
 
-    assert state.guard_reminder is not None
-    assert _GUARD_RETRY_REMINDER in _reminder_text(state.guard_reminder)
+
+# ── 固定层数与分层构造 ─────────────────────────────────────────────────
 
 
-def test_reminder_is_one_shot() -> None:
-    """提示只被消费一次，消费后槽位立即清空。"""
+def test_retry_limit_is_derived_from_reminder_layers() -> None:
+    """重试上限由提示层数推导，避免两者写成不同数字。"""
+    assert len(_GUARD_RETRY_REMINDERS) == 3
+    assert _GUARD_MAX_RETRIES == len(_GUARD_RETRY_REMINDERS)
+
+
+def test_reminders_are_distinct_and_ordered() -> None:
+    """三层文案互不相同，且第 3 层保留 do_nothing 收口出口。"""
+    assert len(set(_GUARD_RETRY_REMINDERS)) == _GUARD_MAX_RETRIES
+    assert "action-do_nothing" in _L3
+
+
+@pytest.mark.parametrize(
+    ("retry_count", "expected"),
+    [
+        (0, []),
+        (1, [_L1]),
+        (2, [_L1, _L2]),
+        (3, [_L1, _L2, _L3]),
+    ],
+)
+def test_build_reminders_by_retry_count(
+    retry_count: int, expected: list[str]
+) -> None:
+    """按重试次数逐层切片，后面的层级包含前面的层级。"""
+    payloads = _build_guard_retry_reminders(retry_count)
+    assert _layers_in(payloads) == expected
+    assert all(payload.role == ROLE.USER for payload in payloads)
+
+
+def test_build_reminders_ignores_negative_count() -> None:
+    """非法计数不产生提示。"""
+    assert _build_guard_retry_reminders(-1) == []
+
+
+# ── 逐层注入 ───────────────────────────────────────────────────────────
+
+
+def test_first_retry_shows_only_l1() -> None:
+    """第 1 次重试只带 L1。"""
     state = _state()
-    _handle_guard_refusal(
-        _plain_refusal_response(),
-        1,
-        state,
-        _config(),
-        _EVIDENCE,
-        from_tool_call=False,
-    )
+    assert _block(state) is True
 
-    assert len(_consume_guard_reminder(state)) == 1
-    assert _consume_guard_reminder(state) == []
-    assert state.guard_reminder is None
+    assert state.guard_retry_count == 1
+    assert _layers_in(_build_guard_retry_reminders(state.guard_retry_count)) == [
+        _L1
+    ]
 
 
-def test_consecutive_blocks_do_not_accumulate_reminders() -> None:
-    """连续命中不会累积：每次请求最多一条提示。"""
+def test_second_retry_shows_l1_then_l2() -> None:
+    """第 2 次重试带 L1 + L2，顺序固定。"""
+    state = _state()
+    _block(state)
+    assert _block(state) is True
+
+    assert state.guard_retry_count == 2
+    assert _layers_in(_build_guard_retry_reminders(state.guard_retry_count)) == [
+        _L1,
+        _L2,
+    ]
+
+
+def test_third_retry_shows_all_three_layers() -> None:
+    """第 3 次重试带 L1 + L2 + L3。"""
     state = _state()
     for _ in range(3):
-        response = _tool_refusal_response()
-        _handle_guard_refusal(
-            response, 1, state, _config(5), _EVIDENCE, from_tool_call=True
-        )
-        consumed = _consume_guard_reminder(state)
-        assert len(consumed) == 1
-        # 消费后槽位为空，下一次命中重新创建而不是复用同一条
-        assert state.guard_reminder is None
+        assert _block(state) is True
+
+    assert state.guard_retry_count == 3
+    assert _layers_in(_build_guard_retry_reminders(state.guard_retry_count)) == [
+        _L1,
+        _L2,
+        _L3,
+    ]
+
+
+def test_mixed_refusal_shapes_share_one_counter() -> None:
+    """工具调用拒答与纯文本拒答共用同一个计数器与同一套层级。"""
+    state = _state()
+
+    for index, from_tool_call in enumerate((True, False, True), start=1):
+        assert _block(state, from_tool_call=from_tool_call) is True
+        assert state.guard_retry_count == index
+
+    # 第 4 次命中时固定预算已耗尽：收口
+    assert _block(state, from_tool_call=False) is False
+    assert state.guard_retry_count == _GUARD_MAX_RETRIES
 
 
 def test_no_reminder_without_block() -> None:
-    """未命中时槽位保持为空，不会凭空注入提示。"""
+    """未命中时不产生任何提示。"""
     state = _state()
-    assert _consume_guard_reminder(state) == []
+    assert _build_guard_retry_reminders(state.guard_retry_count) == []
+
+
+def test_reminders_are_rebuilt_not_accumulated_in_state() -> None:
+    """提示不驻留状态：重复构造得到等值内容，状态里没有提示列表。"""
+    state = _state()
+    _block(state)
+
+    first = _build_guard_retry_reminders(state.guard_retry_count)
+    second = _build_guard_retry_reminders(state.guard_retry_count)
+    assert _layers_in(first) == _layers_in(second) == [_L1]
+
+    slots = getattr(type(state), "__slots__", ())
+    assert "guard_reminders" not in slots
+
+
+# ── 回合触发提示的重试沿用 ─────────────────────────────────────────────
+
+
+def _trigger_payload() -> LLMPayload:
+    """构造一条模拟超时提示的回合级触发 payload。"""
+    return LLMPayload(ROLE.USER, Text("（超时提示：你等待的时间已到）"))
+
+
+def test_retry_reuses_turn_trigger_payload() -> None:
+    """重试轮沿用被打断回合的触发提示，且可反复取用。"""
+    state = _state()
+    trigger = _trigger_payload()
+
+    assert _block(state, retry_payload=trigger) is True
+
+    consumed = _guard_retry_payloads(state)
+    assert len(consumed) == 1
+    assert consumed[0] is trigger
+    # 回合级上下文：同一回合的后续重试仍需取到同一条
+    assert _guard_retry_payloads(state) == [trigger]
+
+
+def test_retry_without_trigger_payload_stays_empty() -> None:
+    """新消息回合不带触发提示，重试轮也不会凭空造一条。"""
+    state = _state()
+    _block(state)
+    assert _guard_retry_payloads(state) == []
+
+
+def test_later_retry_keeps_earlier_trigger_payload() -> None:
+    """重试轮自身不带触发提示，不得把上一轮暂存的冲掉。"""
+    state = _state()
+    trigger = _trigger_payload()
+
+    _block(state, retry_payload=trigger)
+    # 第二轮重试：仍然是同一回合，因此没有新的触发提示
+    _block(state)
+
+    assert _guard_retry_payloads(state) == [trigger]
+
+
+def test_first_request_of_new_turn_replaces_trigger_payload() -> None:
+    """新回合的首次请求会以本回合取值覆写上一回合的残留。"""
+    state = _state()
+    state.guard_retry_payload = _trigger_payload()
+
+    _block(state, retry_payload=None)
+
+    assert state.guard_retry_payload is None
+    assert _guard_retry_payloads(state) == []
+
+
+def test_trigger_payload_cleared_on_exhaustion() -> None:
+    """预算耗尽收口时清除暂存的触发提示，不污染下一回合。"""
+    state = _state()
+
+    for _ in range(_GUARD_MAX_RETRIES):
+        _block(state, retry_payload=_trigger_payload())
+    assert _block(state) is False
+
+    assert _guard_retry_payloads(state) == []
+    assert state.guard_retry_payload is None
 
 
 # ── 两类失败的分流 ──────────────────────────────────────────────────────
@@ -216,20 +389,12 @@ def test_no_reminder_without_block() -> None:
 def test_plain_text_refusal_uses_guard_retry() -> None:
     """纯文本安全拒答走 Guard 重试，不消耗纯文本重试额度。"""
     state = _state()
-    retry = _handle_guard_refusal(
-        _plain_refusal_response(),
-        1,
-        state,
-        _config(),
-        _EVIDENCE,
-        from_tool_call=False,
-    )
+    retry = _block(state, from_tool_call=False)
 
     assert retry is True
     assert state.guard_retry_count == 1
     assert state.plain_text_retry_count == 0
     assert state.plain_text_reminders == []
-    assert state.guard_reminder is not None
 
 
 def test_plain_text_pass_uses_plain_text_retry() -> None:
@@ -242,7 +407,7 @@ def test_plain_text_pass_uses_plain_text_retry() -> None:
     assert retry is True
     assert state.plain_text_retry_count == 1
     assert state.guard_retry_count == 0
-    assert state.guard_reminder is None
+    assert _build_guard_retry_reminders(state.guard_retry_count) == []
     assert len(state.plain_text_reminders) == 1
     assert _PLAIN_TEXT_RETRY_REMINDER in _reminder_text(
         state.plain_text_reminders[0]
@@ -254,85 +419,60 @@ def test_guard_path_clears_plain_text_reminders() -> None:
     state = _state()
     state.plain_text_reminders.append(LLMPayload(ROLE.USER, Text("旧提醒")))
 
-    _handle_guard_refusal(
-        _plain_refusal_response(),
-        1,
-        state,
-        _config(),
-        _EVIDENCE,
-        from_tool_call=False,
-    )
+    _block(state, from_tool_call=False)
 
     assert state.plain_text_reminders == []
 
 
-def test_plain_text_path_clears_guard_reminder() -> None:
-    """走格式纠正时清掉上一轮的 Guard 提示。"""
+def test_plain_text_path_drops_guard_layers() -> None:
+    """转为格式纠正时清零层数，L1/L2 不会泄漏进格式重试。"""
     state = _state()
-    state.guard_reminder = LLMPayload(ROLE.USER, Text(_GUARD_RETRY_REMINDER))
+    _block(state)
+    _block(state)
+    assert state.guard_retry_count == 2
 
     _handle_plain_text_violation(
         _normal_plain_response(), 1, state, _config(), [{}]
     )
 
-    assert state.guard_reminder is None
+    assert state.guard_retry_count == 0
+    assert _build_guard_retry_reminders(state.guard_retry_count) == []
     assert len(state.plain_text_reminders) == 1
 
 
 def test_guard_retry_then_normal_plain_text_falls_back_to_format_retry() -> None:
     """Guard 重试后返回普通纯文本：重新按当前响应判定为格式问题。"""
     state = _state()
-    # 第 1 次：工具调用拒答
-    _handle_guard_refusal(
-        _tool_refusal_response(),
-        1,
-        state,
-        _config(),
-        _EVIDENCE,
-        from_tool_call=True,
-    )
-    _consume_guard_reminder(state)
+    _block(state)
 
-    # 第 2 次：普通纯文本角色回复（Guard PASS）
     retry = _handle_plain_text_violation(
         _normal_plain_response(), 1, state, _config(), [{}]
     )
 
     assert retry is True
     assert state.plain_text_retry_count == 1
-    assert state.guard_retry_count == 1
-    assert state.guard_reminder is None
+    # 守卫链已结束：层数清零，格式纠正只带纯文本提示
+    assert state.guard_retry_count == 0
+    assert _layers_in(_build_guard_retry_reminders(state.guard_retry_count)) == []
 
 
-def test_guard_retry_then_plain_refusal_stops_without_format_retries() -> None:
-    """Guard 重试后再次纯文本拒答：直接收口，不落入三次格式重试。"""
+def test_guard_retry_then_plain_refusal_exhausts_fixed_budget() -> None:
+    """固定三次后再次拒答：收口，且不产生格式纠正提示。"""
     state = _state()
-    config = _config(1)
 
-    assert (
-        _handle_guard_refusal(
-            _tool_refusal_response(),
-            1,
-            state,
-            config,
-            _EVIDENCE,
-            from_tool_call=True,
-        )
-        is True
-    )
-    _consume_guard_reminder(state)
+    for _ in range(_GUARD_MAX_RETRIES):
+        assert _block(state, from_tool_call=True) is True
 
     response = _plain_refusal_response()
     assert (
         _handle_guard_refusal(
-            response, 1, state, config, _EVIDENCE, from_tool_call=False
+            response, 1, state, _EVIDENCE, from_tool_call=False
         )
         is False
     )
-    # 收口路径同样完成回滚，且未产生新的格式纠正提示
+    # 收口路径同样完成回滚，且未产生格式纠正提示
     assert response.message == ""
     assert response.call_list == []
-    assert state.guard_reminder is None
     assert state.plain_text_reminders == []
     assert state.plain_text_retry_count == 0
 
@@ -340,68 +480,26 @@ def test_guard_retry_then_plain_refusal_stops_without_format_retries() -> None:
 def test_counter_isolation_between_two_retry_kinds() -> None:
     """两类重试的计数完全独立，互不挤占额度。"""
     state = _state()
-    config = _config(5)
 
     # 1) 普通格式错误
-    _handle_plain_text_violation(_normal_plain_response(), 1, state, config, [{}])
+    _handle_plain_text_violation(
+        _normal_plain_response(), 1, state, _config(), [{}]
+    )
     assert state.plain_text_retry_count == 1
     assert state.guard_retry_count == 0
 
-    # 2) 工具调用拒答
-    _handle_guard_refusal(
-        _tool_refusal_response(), 1, state, config, _EVIDENCE, from_tool_call=True
-    )
+    # 2) 工具调用拒答：只清格式提示，不动格式计数
+    _block(state)
     assert state.plain_text_retry_count == 1
+    assert state.plain_text_reminders == []
     assert state.guard_retry_count == 1
 
-    # 3) 又是普通格式错误
-    _handle_plain_text_violation(_normal_plain_response(), 1, state, config, [{}])
-    assert state.plain_text_retry_count == 2
-    assert state.guard_retry_count == 1
-
-
-def test_default_budget_allows_three_retries() -> None:
-    """默认预算为 3 次 Guard retry，初始响应不计入其中。
-
-    三次重试分别以工具调用形态与纯文本形态出现，证明两种拒答共用同一个
-    计数器；每次命中都重新创建一条提示，消费后立即消失。
-    """
-    config = KFCConfig(general=KFCConfig.GeneralSection())
-    assert config.general.guard_max_retries == 3
-
-    state = _state()
-    for expected, from_tool_call in enumerate((True, False, True), start=1):
-        response = (
-            _tool_refusal_response()
-            if from_tool_call
-            else _plain_refusal_response()
-        )
-        assert (
-            _handle_guard_refusal(
-                response,
-                1,
-                state,
-                config,
-                _EVIDENCE,
-                from_tool_call=from_tool_call,
-            )
-            is True
-        )
-        assert state.guard_retry_count == expected
-        assert len(_consume_guard_reminder(state)) == 1
-        assert state.guard_reminder is None
-
-    # 第 4 次命中时预算已耗尽：直接收口，不再产生提示
-    response = _plain_refusal_response()
-    assert (
-        _handle_guard_refusal(
-            response, 1, state, config, _EVIDENCE, from_tool_call=False
-        )
-        is False
+    # 3) 又是普通格式错误：格式计数继续累加，守卫层数归零
+    _handle_plain_text_violation(
+        _normal_plain_response(), 1, state, _config(), [{}]
     )
-    assert state.guard_retry_count == 3
-    assert state.guard_reminder is None
-    assert response.message == ""
+    assert state.plain_text_retry_count == 2
+    assert state.guard_retry_count == 0
 
 
 # ── 纯文本响应必须真的经过 Guard ────────────────────────────────────────
@@ -445,34 +543,31 @@ def _persistent_chain_after_send(
     )
 
 
-def test_request_view_sends_reminder_but_chain_keeps_it_out() -> None:
-    """提示进入本次发送视图，但不会写回持久主链。"""
+def test_request_view_sends_layers_but_chain_keeps_them_out() -> None:
+    """三层提示都进入本次发送视图，但不写回持久主链。"""
     source = _FakeResponse(payloads=[_user("用户真实消息")])
-    reminder = LLMPayload(ROLE.USER, Text(_GUARD_RETRY_REMINDER))
+    transient = _build_guard_retry_reminders(_GUARD_MAX_RETRIES)
 
-    view = build_request_view(source, [reminder])
-    assert len(view.payloads) == 2
-    assert _GUARD_RETRY_REMINDER in _reminder_text(view.payloads[1])
+    view = build_request_view(source, transient)
+    assert len(view.payloads) == 1 + _GUARD_MAX_RETRIES
+    assert _layers_in(view.payloads) == [_L1, _L2, _L3]
 
     persistent = _persistent_chain_after_send(
-        source, [reminder], _assistant("正常角色回复")
+        source, transient, _assistant("正常角色回复")
     )
 
     assert len(persistent) == 2
     assert persistent[-1].role == ROLE.ASSISTANT
-    assert all(
-        _GUARD_RETRY_REMINDER not in _reminder_text(payload)
-        for payload in persistent
-    )
+    assert _layers_in(persistent) == []
 
 
-def test_guard_reminder_absent_from_context_snapshot() -> None:
-    """被拦截拒答与 Guard 提示都不会进入上下文快照。"""
+def test_all_layers_absent_from_context_snapshot() -> None:
+    """被拦截拒答与三层提示都不会进入上下文快照。"""
     source = _FakeResponse(payloads=[_user("用户真实消息")])
-    reminder = LLMPayload(ROLE.USER, Text(_GUARD_RETRY_REMINDER))
+    transient = _build_guard_retry_reminders(_GUARD_MAX_RETRIES)
 
     persistent = _persistent_chain_after_send(
-        source, [reminder], _assistant("正常角色回复")
+        source, transient, _assistant("正常角色回复")
     )
     snapshot = capture_snapshot(persistent, 20)
 
@@ -480,7 +575,8 @@ def test_guard_reminder_absent_from_context_snapshot() -> None:
     blob = json.dumps(snapshot, ensure_ascii=False, default=str)
     # 正向对照：正常内容确实会被序列化，断言才有意义
     assert "正常角色回复" in blob
-    assert _GUARD_RETRY_REMINDER not in blob
+    for layer in _GUARD_RETRY_REMINDERS:
+        assert layer not in blob
     assert _PLAIN_REFUSAL not in blob
 
 
@@ -488,12 +584,7 @@ def test_rollback_leaves_nothing_for_mental_log() -> None:
     """回滚后 message 为空，提交阶段不可能把拒答写进 mental_log。"""
     response = _plain_refusal_response()
     _handle_guard_refusal(
-        response,
-        1,
-        _state(),
-        _config(),
-        _EVIDENCE,
-        from_tool_call=False,
+        response, 1, _state(), _EVIDENCE, from_tool_call=False
     )
 
     assert response.message == ""
@@ -504,7 +595,7 @@ def test_rollback_leaves_nothing_for_mental_log() -> None:
     assert _PLAIN_REFUSAL not in _reminder_text(response.payloads[0])
 
 
-# ── 主循环：守卫预算耗尽必须显式收口 ────────────────────────────────────
+# ── 主循环驱动 ──────────────────────────────────────────────────────────
 
 
 class _ScriptExhausted(Exception):
@@ -534,7 +625,9 @@ class _HarnessSession:
         self.bot_planning: list[dict[str, Any]] = []
         self.user_id = "user-1"
 
-    def append_context_entries(self, payloads: list[Any], max_payloads: int) -> bool:
+    def append_context_entries(
+        self, payloads: list[Any], max_payloads: int
+    ) -> bool:
         """不实际改动快照，避免测试依赖会话序列化。"""
         return False
 
@@ -564,7 +657,9 @@ class _HarnessChatter:
         """记录保存动作。"""
         _ = session
 
-    async def fetch_unreads(self, time_format: str = "") -> tuple[str, list[Any]]:
+    async def fetch_unreads(
+        self, time_format: str = ""
+    ) -> tuple[str, list[Any]]:
         """返回空未读快照。"""
         _ = time_format
         return "", []
@@ -584,417 +679,337 @@ class _HarnessChatter:
         """占位工具执行，仅供决策层取用引用。"""
 
 
-def _payloads_text(payloads: list[LLMPayload]) -> str:
-    """拼接一组 payload 的全部文本。"""
-    chunks: list[str] = []
-    for payload in payloads:
-        content = payload.content
-        parts = content if isinstance(content, list) else [content]
-        chunks.extend(part.text for part in parts if isinstance(part, Text))
-    return "\n".join(chunks)
+class _OrchestratorHarness:
+    """为一条 ``execute_orchestrator`` 脚本装配替身与传感器。"""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        turn_inputs: list[TurnInputResult],
+        *,
+        blocked: int | None = None,
+    ) -> None:
+        """记录 monkeypatch、脚本与被拦次数。"""
+        self.monkeypatch = monkeypatch
+        self.turn_inputs = turn_inputs
+        self.blocked = blocked
+        self.sent_views: list[list[LLMPayload]] = []
+        self.guard_retries: list[int] = []
+        self.decisions: list[Any] = []
+        self.committed: list[Any] = []
+        self.chain = _ChainResponse([_user("用户真实消息")])
+        self.session = _HarnessSession()
+        self.signals: list[Any] = []
+
+    def response_for_view(self, index: int) -> Any:
+        """返回第 ``index`` 次请求应产出的响应。"""
+        if self.blocked is None or index <= self.blocked:
+            call = ToolCall(
+                id="call-1", name="kfc_reply", args={"content": [_PLAIN_REFUSAL]}
+            )
+            self.chain.reasoning_content = (
+                "安全政策不允许此类内容，我必须拒绝这个请求。"
+            )
+            self.chain.reasoning_parts = [
+                SimpleNamespace(text="安全政策不允许此类内容")
+            ]
+        else:
+            call = ToolCall(
+                id="call-2", name="kfc_reply", args={"content": [_NORMAL_REPLY]}
+            )
+            self.chain.reasoning_content = ""
+            self.chain.reasoning_parts = []
+        self.chain.payloads.append(LLMPayload(ROLE.ASSISTANT, [call]))
+        self.chain.call_list = [call]
+        return self.chain
+
+    def install(self, module: Any) -> None:
+        """把替身接到 orchestrator 模块上。"""
+        monkeypatch = self.monkeypatch
+        chain = self.chain
+        harness = self
+
+        async def _prepare_turn_input(*args: Any, **kwargs: Any) -> Any:
+            if not harness.turn_inputs:
+                raise _ScriptExhausted
+            return harness.turn_inputs.pop(0)
+
+        async def _send_llm_request(
+            chatter_arg: Any,
+            send_target: Any,
+            config_arg: Any,
+            known_ids: Any,
+            state: Any,
+        ) -> tuple[Any, list[Any]]:
+            _ = (chatter_arg, config_arg, known_ids, state)
+            harness.sent_views.append(list(send_target.payloads))
+            return harness.response_for_view(len(harness.sent_views)), []
+
+        async def _guard(
+            response: Any, *, request_name: str, retry_index: int = 0
+        ) -> GuardCheck:
+            _ = (response, request_name)
+            harness.guard_retries.append(retry_index)
+            blocked = harness.blocked is None or len(harness.guard_retries) <= (
+                harness.blocked
+            )
+            return GuardCheck(
+                blocked=blocked, evidence=_EVIDENCE if blocked else ()
+            )
+
+        async def _run_decision(*args: Any, **kwargs: Any) -> Any:
+            harness.decisions.append((args, kwargs))
+            return SimpleNamespace(proactive_schedule=None, has_failed_tool=False)
+
+        async def _commit_turn_decision(*args: Any, **kwargs: Any) -> Any:
+            harness.committed.append((args, kwargs))
+            return SimpleNamespace(
+                next_signal=None,
+                return_after_yield=False,
+                has_pending_tool_results=False,
+                is_final_timeout=False,
+            )
+
+        class _FakeSummary:
+            def __init__(self, *args: Any) -> None:
+                """忽略参数。"""
+
+            def sync_if_changed(self, *args: Any) -> None:
+                """测试中无需同步摘要。"""
+
+        class _FakeTimeoutService:
+            def __init__(self, *args: Any) -> None:
+                """忽略参数。"""
+
+        async def _fake_activate_stream(stream_id: str) -> Any:
+            return SimpleNamespace(stream_id=stream_id, platform="qq")
+
+        async def _fake_build_initial_request(*args: Any, **kwargs: Any) -> Any:
+            return chain, {}
+
+        monkeypatch.setattr(module, "activate_stream", _fake_activate_stream)
+        monkeypatch.setattr(module, "resolve_model_set", lambda cfg: [{"m": 1}])
+        monkeypatch.setattr(
+            module, "build_initial_request", _fake_build_initial_request
+        )
+        monkeypatch.setattr(module, "SummarySynchronizer", _FakeSummary)
+        monkeypatch.setattr(module, "TimeoutService", _FakeTimeoutService)
+        monkeypatch.setattr(module, "prepare_turn_input", _prepare_turn_input)
+        monkeypatch.setattr(
+            module, "build_last_mile_payload", lambda: _user("[last-mile]")
+        )
+        monkeypatch.setattr(
+            module, "heal_orphan_tool_results", lambda *a, **k: None
+        )
+        monkeypatch.setattr(module, "_send_llm_request", _send_llm_request)
+        monkeypatch.setattr(module, "check_response_guard", _guard)
+        monkeypatch.setattr(module, "run_decision", _run_decision)
+        monkeypatch.setattr(
+            module, "commit_turn_decision", _commit_turn_decision
+        )
+
+    async def drive(self, module: Any, config: KFCConfig) -> None:
+        """驱动主循环并收集发出的信号。"""
+        chatter = _HarnessChatter(config, self.session)
+        try:
+            async for signal in module.execute_orchestrator(chatter):
+                self.signals.append(signal)
+        except _ScriptExhausted:
+            pass
 
 
-@pytest.mark.parametrize("max_retries", [1, 3])
-async def test_guard_budget_exhausted_stops_before_decision(
-    monkeypatch: pytest.MonkeyPatch, max_retries: int
+def _retry_turn_inputs(count: int, chain: Any) -> list[TurnInputResult]:
+    """构造「首次请求 + ``count`` 次重试」的脚本。"""
+    items = [
+        TurnInputResult(response=chain, persistent_user_payload=_user("用户真实消息"))
+    ]
+    items.extend(
+        TurnInputResult(response=chain, has_pending_tool_results=False)
+        for _ in range(count)
+    )
+    return items
+
+
+async def test_fixed_three_retries_then_stop(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """守卫重试预算耗尽时必须显式结束本轮，不进入决策层。
+    """固定三次重试后仍拒答：完整回滚、显式收口，不进入决策层。
 
-    驱动真实 ``execute_orchestrator``：初始响应与每一次重试都被守卫判定
-    为模型层拒答，第 ``max_retries + 1`` 次命中时直接收口。初始请求不计入
-    重试次数，因此预算 3 对应四次模型生成。
+    初始响应与每一次重试都被判为模型层拒答，第 4 次命中时直接收口。
+    初始请求不计入重试次数，因此共四次模型生成。
     """
     from plugins.kokoro_flow_chatter.runtime import orchestrator as module
 
-    config = KFCConfig(
-        general=KFCConfig.GeneralSection(
-            guard_enabled=True, guard_max_retries=max_retries
-        )
+    harness = _OrchestratorHarness(
+        monkeypatch,
+        _retry_turn_inputs(_GUARD_MAX_RETRIES, None),
+        blocked=None,
     )
-    session = _HarnessSession()
-    chatter = _HarnessChatter(config, session)
-    chain = _ChainResponse([_user("用户真实消息")])
+    for item in harness.turn_inputs:
+        item.response = harness.chain
+    harness.install(module)
 
-    sent_views: list[list[LLMPayload]] = []
-    guard_retries: list[int] = []
-    decision_calls: list[Any] = []
-    committed: list[Any] = []
-
-    turn_inputs = [
-        TurnInputResult(
-            response=chain, persistent_user_payload=_user("用户真实消息")
-        ),
-        # 守卫重试：带 has_pending_tool_results 的续轮，无新用户输入，
-        # 因此 guard_retry_count 不会被重置。
-        *(
-            TurnInputResult(response=chain, has_pending_tool_results=False)
-            for _ in range(max_retries)
-        ),
-    ]
-
-    async def _fake_prepare_turn_input(*args: Any, **kwargs: Any) -> Any:
-        if not turn_inputs:
-            raise _ScriptExhausted
-        return turn_inputs.pop(0)
-
-    async def _fake_send_llm_request(
-        chatter_arg: Any,
-        send_target: Any,
-        config_arg: Any,
-        known_ids: Any,
-        state: Any,
-    ) -> tuple[Any, list[Any]]:
-        _ = (chatter_arg, config_arg, known_ids, state)
-        sent_views.append(list(send_target.payloads))
-        call = ToolCall(id="call-1", name="kfc_reply", args={"content": [_PLAIN_REFUSAL]})
-        chain.payloads.append(LLMPayload(ROLE.ASSISTANT, [call]))
-        chain.call_list = [call]
-        chain.reasoning_content = "安全政策不允许此类内容，我必须拒绝这个请求。"
-        chain.reasoning_parts = [SimpleNamespace(text="安全政策不允许此类内容")]
-        return chain, []
-
-    async def _fake_guard(
-        response: Any, *, request_name: str, retry_index: int = 0
-    ) -> GuardCheck:
-        _ = (response, request_name)
-        guard_retries.append(retry_index)
-        return GuardCheck(blocked=True, evidence=_EVIDENCE)
-
-    async def _fake_run_decision(*args: Any, **kwargs: Any) -> Any:
-        decision_calls.append((args, kwargs))
-        raise AssertionError("守卫预算耗尽后不得进入 run_decision")
-
-    async def _fake_commit_turn_decision(*args: Any, **kwargs: Any) -> Any:
-        committed.append((args, kwargs))
-        return SimpleNamespace(
-            next_signal=None,
-            return_after_yield=False,
-            has_pending_tool_results=False,
-            is_final_timeout=False,
-        )
-
-    class _FakeSummary:
-        def __init__(self, *args: Any) -> None:
-            """忽略参数。"""
-
-        def sync_if_changed(self, *args: Any) -> None:
-            """测试中无需同步摘要。"""
-
-    class _FakeTimeoutService:
-        def __init__(self, *args: Any) -> None:
-            """忽略参数。"""
-
-    async def _fake_activate_stream(stream_id: str) -> Any:
-        return SimpleNamespace(stream_id=stream_id, platform="qq")
-
-    async def _fake_build_initial_request(*args: Any, **kwargs: Any) -> Any:
-        return chain, {}
-
-    monkeypatch.setattr(module, "activate_stream", _fake_activate_stream)
-    monkeypatch.setattr(module, "resolve_model_set", lambda cfg: [{"m": 1}])
-    monkeypatch.setattr(module, "build_initial_request", _fake_build_initial_request)
-    monkeypatch.setattr(module, "SummarySynchronizer", _FakeSummary)
-    monkeypatch.setattr(module, "TimeoutService", _FakeTimeoutService)
-    monkeypatch.setattr(module, "prepare_turn_input", _fake_prepare_turn_input)
-    monkeypatch.setattr(
-        module, "build_last_mile_payload", lambda: _user("[last-mile]")
-    )
-    monkeypatch.setattr(module, "heal_orphan_tool_results", lambda *a, **k: None)
-    monkeypatch.setattr(module, "_send_llm_request", _fake_send_llm_request)
-    monkeypatch.setattr(module, "check_response_guard", _fake_guard)
-    monkeypatch.setattr(module, "run_decision", _fake_run_decision)
-    monkeypatch.setattr(module, "commit_turn_decision", _fake_commit_turn_decision)
-
-    signals: list[Any] = []
     try:
-        async for signal in module.execute_orchestrator(chatter):
-            signals.append(signal)
+        await harness.drive(module, _config())
     except _ScriptExhausted:
         pytest.fail("守卫收口后主循环仍在继续，未显式结束本轮")
 
     # 收口信号：Stop(0)，且只发出一次
-    assert len(signals) == 1
-    assert isinstance(signals[0], Stop)
-    assert signals[0].time == 0
+    assert len(harness.signals) == 1
+    assert isinstance(harness.signals[0], Stop)
+    assert harness.signals[0].time == 0
 
-    # 未进入决策层，未提交任何 planning
-    assert decision_calls == []
-    assert committed == []
-    assert session.bot_planning == []
-    assert session.context_snapshot is None
+    # 未进入决策层，未提交任何 planning / 快照
+    assert harness.decisions == []
+    assert harness.committed == []
+    assert harness.session.bot_planning == []
+    assert harness.session.context_snapshot is None
 
-    # 守卫在每次模型生成后各检查一次，重试序号从 0 递增到上限
-    assert guard_retries == list(range(max_retries + 1))
+    # 守卫在每次模型生成后各检查一次，序号从 0 递增到固定上限
+    assert harness.guard_retries == list(range(_GUARD_MAX_RETRIES + 1))
 
     # 被拦响应已完整回滚
-    assert chain.message == ""
-    assert chain.reasoning_content == ""
-    assert chain.reasoning_parts == []
-    assert chain.call_list == []
-    assert len(chain.payloads) == 1
-    assert _PLAIN_REFUSAL not in _payloads_text(chain.payloads)
+    assert harness.chain.message == ""
+    assert harness.chain.reasoning_content == ""
+    assert harness.chain.reasoning_parts == []
+    assert harness.chain.call_list == []
+    assert len(harness.chain.payloads) == 1
+    assert _PLAIN_REFUSAL not in _payloads_text(harness.chain.payloads)
 
-    # 提示只注入一次：首次请求无提示，每次重试恰好一条 Guard 提示
-    assert len(sent_views) == max_retries + 1
-    assert _GUARD_RETRY_REMINDER not in _payloads_text(sent_views[0])
-    for view in sent_views[1:]:
-        assert _payloads_text(view).count(_GUARD_RETRY_REMINDER) == 1
-    # 收口时提示不残留，也不会误用纯文本格式提示
-    assert _PLAIN_TEXT_RETRY_REMINDER not in _payloads_text(sent_views[-1])
+    # 逐层累积：第 N 次重试的发送视图带 L1..LN，顺序固定
+    assert len(harness.sent_views) == _GUARD_MAX_RETRIES + 1
+    assert _layers_in(harness.sent_views[0]) == []
+    for index, view in enumerate(harness.sent_views[1:], start=1):
+        assert _layers_in(view) == list(_GUARD_RETRY_REMINDERS[:index])
+
+    # 收口时不会误用纯文本格式提示
+    assert _PLAIN_TEXT_RETRY_REMINDER not in _payloads_text(
+        harness.sent_views[-1]
+    )
 
 
-async def test_guard_recovery_succeeds_before_budget_exhausted(
+async def test_retry_succeeds_before_budget_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """重试期间恢复出正常回复时立即进入决策层，不再继续消耗预算。
+    """第 2 次重试恢复出正常回复：立即决策，不再发第 3 次重试。
 
-    预算 3 下的脚本：初始与 Retry #1 均为 MODEL_REFUSAL，Retry #2 返回
-    正常工具调用。此时应当正常决策并发送，而不是发出第 3 次重试。
+    脚本：初始与 Retry #1 被判拒答，Retry #2 返回正常工具调用。
     """
     from plugins.kokoro_flow_chatter.runtime import orchestrator as module
 
-    config = KFCConfig(
-        general=KFCConfig.GeneralSection(guard_enabled=True, guard_max_retries=3)
+    harness = _OrchestratorHarness(
+        monkeypatch, _retry_turn_inputs(2, None), blocked=2
     )
-    session = _HarnessSession()
-    chatter = _HarnessChatter(config, session)
-    chain = _ChainResponse([_user("用户真实消息")])
+    for item in harness.turn_inputs:
+        item.response = harness.chain
+    harness.install(module)
 
-    sent_views: list[list[LLMPayload]] = []
-    guard_retries: list[int] = []
-    decisions: list[Any] = []
-    committed: list[Any] = []
+    await harness.drive(module, _config())
 
-    turn_inputs = [
-        TurnInputResult(
-            response=chain, persistent_user_payload=_user("用户真实消息")
-        ),
-        TurnInputResult(response=chain, has_pending_tool_results=False),
-        TurnInputResult(response=chain, has_pending_tool_results=False),
-    ]
+    # 恢复成功：三次请求（初始 + 2 次重试），第 3 次不再被拦截
+    assert harness.guard_retries == [0, 1, 2]
+    assert len(harness.sent_views) == 3
+    assert len(harness.decisions) == 1
+    assert len(harness.committed) == 1
+    assert harness.signals == []
 
-    async def _fake_prepare_turn_input(*args: Any, **kwargs: Any) -> Any:
-        if not turn_inputs:
-            raise _ScriptExhausted
-        return turn_inputs.pop(0)
+    # 层级按序推进，恢复成功那次带 L1 + L2；第 3 层未出现
+    assert _layers_in(harness.sent_views[0]) == []
+    assert _layers_in(harness.sent_views[1]) == [_L1]
+    assert _layers_in(harness.sent_views[2]) == [_L1, _L2]
 
-    def _refusal_call() -> ToolCall:
-        return ToolCall(
-            id="call-1", name="kfc_reply", args={"content": [_PLAIN_REFUSAL]}
-        )
+    # 三层提示都不残留在响应链上，正常回复已进入主链
+    persistent_text = _payloads_text(harness.chain.payloads)
+    for layer in _GUARD_RETRY_REMINDERS:
+        assert layer not in persistent_text
+    assert _PLAIN_TEXT_RETRY_REMINDER not in persistent_text
 
-    def _normal_call() -> ToolCall:
-        return ToolCall(
-            id="call-2", name="kfc_reply", args={"content": [_NORMAL_REPLY]}
-        )
-
-    async def _fake_send_llm_request(
-        chatter_arg: Any,
-        send_target: Any,
-        config_arg: Any,
-        known_ids: Any,
-        state: Any,
-    ) -> tuple[Any, list[Any]]:
-        _ = (chatter_arg, config_arg, known_ids, state)
-        sent_views.append(list(send_target.payloads))
-        if len(sent_views) <= 2:
-            call = _refusal_call()
-            chain.reasoning_content = "安全政策不允许此类内容，我必须拒绝这个请求。"
-            chain.reasoning_parts = [SimpleNamespace(text="安全政策不允许此类内容")]
-        else:
-            call = _normal_call()
-            chain.reasoning_content = ""
-            chain.reasoning_parts = []
-        chain.payloads.append(LLMPayload(ROLE.ASSISTANT, [call]))
-        chain.call_list = [call]
-        return chain, []
-
-    async def _fake_guard(
-        response: Any, *, request_name: str, retry_index: int = 0
-    ) -> GuardCheck:
-        _ = (response, request_name)
-        guard_retries.append(retry_index)
-        blocked = len(guard_retries) <= 2
-        return GuardCheck(blocked=blocked, evidence=_EVIDENCE if blocked else ())
-
-    async def _fake_run_decision(*args: Any, **kwargs: Any) -> Any:
-        decisions.append((args, kwargs))
-        return SimpleNamespace(proactive_schedule=None, has_failed_tool=False)
-
-    async def _fake_commit_turn_decision(*args: Any, **kwargs: Any) -> Any:
-        committed.append((args, kwargs))
-        return SimpleNamespace(
-            next_signal=None,
-            return_after_yield=False,
-            has_pending_tool_results=False,
-            is_final_timeout=False,
-        )
-
-    class _FakeSummary:
-        def __init__(self, *args: Any) -> None:
-            """忽略参数。"""
-
-        def sync_if_changed(self, *args: Any) -> None:
-            """测试中无需同步摘要。"""
-
-    class _FakeTimeoutService:
-        def __init__(self, *args: Any) -> None:
-            """忽略参数。"""
-
-    async def _fake_activate_stream(stream_id: str) -> Any:
-        return SimpleNamespace(stream_id=stream_id, platform="qq")
-
-    async def _fake_build_initial_request(*args: Any, **kwargs: Any) -> Any:
-        return chain, {}
-
-    monkeypatch.setattr(module, "activate_stream", _fake_activate_stream)
-    monkeypatch.setattr(module, "resolve_model_set", lambda cfg: [{"m": 1}])
-    monkeypatch.setattr(module, "build_initial_request", _fake_build_initial_request)
-    monkeypatch.setattr(module, "SummarySynchronizer", _FakeSummary)
-    monkeypatch.setattr(module, "TimeoutService", _FakeTimeoutService)
-    monkeypatch.setattr(module, "prepare_turn_input", _fake_prepare_turn_input)
-    monkeypatch.setattr(
-        module, "build_last_mile_payload", lambda: _user("[last-mile]")
-    )
-    monkeypatch.setattr(module, "heal_orphan_tool_results", lambda *a, **k: None)
-    monkeypatch.setattr(module, "_send_llm_request", _fake_send_llm_request)
-    monkeypatch.setattr(module, "check_response_guard", _fake_guard)
-    monkeypatch.setattr(module, "run_decision", _fake_run_decision)
-    monkeypatch.setattr(module, "commit_turn_decision", _fake_commit_turn_decision)
-
-    signals: list[Any] = []
-    try:
-        async for signal in module.execute_orchestrator(chatter):
-            signals.append(signal)
-    except _ScriptExhausted:
-        pass
-
-    # 恢复成功：发出了 3 次请求（初始 + 2 次重试），第 3 次不再被拦截
-    assert guard_retries == [0, 1, 2]
-    assert len(sent_views) == 3
-    assert len(decisions) == 1
-    assert len(committed) == 1
-    # 正常决策路径不向框架发出收口信号
-    assert signals == []
-
-    # 每次重试请求恰好带一条提示，恢复成功的请求同样只有一条
-    assert _GUARD_RETRY_REMINDER not in _payloads_text(sent_views[0])
-    assert _payloads_text(sent_views[1]).count(_GUARD_RETRY_REMINDER) == 1
-    assert _payloads_text(sent_views[2]).count(_GUARD_RETRY_REMINDER) == 1
-
-    # 提示不残留在响应链上，正常回复已进入主链
-    assert _GUARD_RETRY_REMINDER not in _payloads_text(chain.payloads)
-    assert _PLAIN_TEXT_RETRY_REMINDER not in _payloads_text(chain.payloads)
     reply_calls = [
         item
-        for payload in chain.payloads
-        for item in payload.content
+        for payload in harness.chain.payloads
+        for item in _content_of(payload)
         if isinstance(item, ToolCall)
     ]
     assert reply_calls[-1].args["content"] == [_NORMAL_REPLY]
 
 
-async def test_new_user_message_resets_guard_budget(
+async def test_new_user_message_resets_layers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """重试过程中到达的新用户消息把守卫预算重置，不与上一轮共用。
+    """新用户消息开启新回合：层数归零，上一轮的提示不泄漏。"""
+    from plugins.kokoro_flow_chatter.runtime import orchestrator as module
 
-    预算 3 下的脚本：新消息 A 触发 MODEL_REFUSAL 并重试；紧接着新消息 B
-    到达，此时重试序号必须回到 0，否则上一轮的失败会持续挤压本轮额度。
+    harness = _OrchestratorHarness(
+        monkeypatch,
+        [
+            TurnInputResult(
+                response=None, persistent_user_payload=_user("用户真实消息 A")
+            ),
+            TurnInputResult(
+                response=None, persistent_user_payload=_user("用户真实消息 B")
+            ),
+        ],
+        blocked=None,
+    )
+    for item in harness.turn_inputs:
+        item.response = harness.chain
+    harness.install(module)
+
+    await harness.drive(module, _config())
+
+    # 第二次检查发生在新用户消息之后，序号归零
+    assert harness.guard_retries == [0, 0]
+    assert len(harness.sent_views) == 2
+    # 两次都是各回合的首次请求，都不带任何层级
+    assert _layers_in(harness.sent_views[0]) == []
+    assert _layers_in(harness.sent_views[1]) == []
+    assert harness.signals == []
+
+
+async def test_retry_request_carries_turn_trigger_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """超时回合被拦后，每次重试请求都带上该回合的触发提示。
+
+    超时提示描述的是「本轮为什么开口」。首次请求带上是既有行为；关键在于
+    重试轮走工具续轮路径、自身不含任何触发提示，必须沿用过去，否则模型会
+    以一次新规划的姿态重新决定动作与话题方向。
     """
     from plugins.kokoro_flow_chatter.runtime import orchestrator as module
 
-    config = KFCConfig(
-        general=KFCConfig.GeneralSection(guard_enabled=True, guard_max_retries=3)
+    timeout_prompt = "（超时提示：等待时间已到，请决定继续等待或主动开口。）"
+    harness = _OrchestratorHarness(
+        monkeypatch,
+        [
+            # 第 1 轮：超时回合，只带仅当前请求可见的触发提示
+            TurnInputResult(
+                response=None, request_only_payload=_user(timeout_prompt)
+            ),
+            # 后两轮：守卫重试，走工具续轮路径，本身没有任何触发提示
+            TurnInputResult(response=None, has_pending_tool_results=False),
+            TurnInputResult(response=None, has_pending_tool_results=False),
+        ],
+        blocked=2,
     )
-    session = _HarnessSession()
-    chatter = _HarnessChatter(config, session)
-    chain = _ChainResponse([_user("用户真实消息 A")])
+    for item in harness.turn_inputs:
+        item.response = harness.chain
+    harness.install(module)
 
-    sent_views: list[list[LLMPayload]] = []
-    guard_retries: list[int] = []
+    await harness.drive(module, _config())
 
-    turn_inputs = [
-        TurnInputResult(
-            response=chain, persistent_user_payload=_user("用户真实消息 A")
-        ),
-        TurnInputResult(
-            response=chain, persistent_user_payload=_user("用户真实消息 B")
-        ),
-    ]
-
-    async def _fake_prepare_turn_input(*args: Any, **kwargs: Any) -> Any:
-        if not turn_inputs:
-            raise _ScriptExhausted
-        return turn_inputs.pop(0)
-
-    async def _fake_send_llm_request(
-        chatter_arg: Any,
-        send_target: Any,
-        config_arg: Any,
-        known_ids: Any,
-        state: Any,
-    ) -> tuple[Any, list[Any]]:
-        _ = (chatter_arg, config_arg, known_ids, state)
-        sent_views.append(list(send_target.payloads))
-        call = ToolCall(
-            id="call-1", name="kfc_reply", args={"content": [_PLAIN_REFUSAL]}
+    assert harness.guard_retries == [0, 1, 2]
+    assert len(harness.sent_views) == 3
+    for index, view in enumerate(harness.sent_views):
+        assert timeout_prompt in _payloads_text(view), (
+            f"第 {index + 1} 次请求缺少回合触发提示"
         )
-        chain.payloads.append(LLMPayload(ROLE.ASSISTANT, [call]))
-        chain.call_list = [call]
-        chain.reasoning_content = "安全政策不允许此类内容，我必须拒绝这个请求。"
-        chain.reasoning_parts = [SimpleNamespace(text="安全政策不允许此类内容")]
-        return chain, []
 
-    async def _fake_guard(
-        response: Any, *, request_name: str, retry_index: int = 0
-    ) -> GuardCheck:
-        _ = (response, request_name)
-        guard_retries.append(retry_index)
-        return GuardCheck(blocked=True, evidence=_EVIDENCE)
+    # 层级随重试推进
+    assert _layers_in(harness.sent_views[1]) == [_L1]
+    assert _layers_in(harness.sent_views[2]) == [_L1, _L2]
 
-    class _FakeSummary:
-        def __init__(self, *args: Any) -> None:
-            """忽略参数。"""
-
-        def sync_if_changed(self, *args: Any) -> None:
-            """测试中无需同步摘要。"""
-
-    class _FakeTimeoutService:
-        def __init__(self, *args: Any) -> None:
-            """忽略参数。"""
-
-    async def _fake_activate_stream(stream_id: str) -> Any:
-        return SimpleNamespace(stream_id=stream_id, platform="qq")
-
-    async def _fake_build_initial_request(*args: Any, **kwargs: Any) -> Any:
-        return chain, {}
-
-    monkeypatch.setattr(module, "activate_stream", _fake_activate_stream)
-    monkeypatch.setattr(module, "resolve_model_set", lambda cfg: [{"m": 1}])
-    monkeypatch.setattr(module, "build_initial_request", _fake_build_initial_request)
-    monkeypatch.setattr(module, "SummarySynchronizer", _FakeSummary)
-    monkeypatch.setattr(module, "TimeoutService", _FakeTimeoutService)
-    monkeypatch.setattr(module, "prepare_turn_input", _fake_prepare_turn_input)
-    monkeypatch.setattr(
-        module, "build_last_mile_payload", lambda: _user("[last-mile]")
-    )
-    monkeypatch.setattr(module, "heal_orphan_tool_results", lambda *a, **k: None)
-    monkeypatch.setattr(module, "_send_llm_request", _fake_send_llm_request)
-    monkeypatch.setattr(module, "check_response_guard", _fake_guard)
-
-    signals: list[Any] = []
-    try:
-        async for signal in module.execute_orchestrator(chatter):
-            signals.append(signal)
-    except _ScriptExhausted:
-        pass
-
-    # 第二次检查发生在新用户消息到来之后，序号必须归零
-    assert guard_retries == [0, 0]
-    assert len(sent_views) == 2
-    # 两次请求各自最多一条提示，收口前不残留
-    assert _GUARD_RETRY_REMINDER not in _payloads_text(sent_views[0])
-    assert _payloads_text(sent_views[1]).count(_GUARD_RETRY_REMINDER) == 1
-    assert signals == []
-
+    # 触发提示与层级都不写回持久主链
+    persistent_text = _payloads_text(harness.chain.payloads)
+    assert timeout_prompt not in persistent_text
+    for layer in _GUARD_RETRY_REMINDERS:
+        assert layer not in persistent_text

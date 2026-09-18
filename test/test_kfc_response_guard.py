@@ -23,6 +23,7 @@ from plugins.kokoro_flow_chatter.runtime.guard_hook import (  # noqa: E402
     guard_available,
 )
 from plugins.kokoro_flow_chatter.runtime.orchestrator import (  # noqa: E402
+    _GUARD_MAX_RETRIES,
     _LoopState,
     _handle_guard_refusal,
 )
@@ -97,11 +98,11 @@ def _state() -> _LoopState:
     return _LoopState(summary=cast(Any, None))
 
 
-def _config(max_retries: int = 1) -> KFCConfig:
-    """构造只指定守卫重试上限的 KFC 配置。"""
-    return KFCConfig(
-        general=KFCConfig.GeneralSection(guard_max_retries=max_retries)
-    )
+def _config(**overrides: Any) -> KFCConfig:
+    """构造只指定守卫开关的 KFC 配置。"""
+    settings: dict[str, Any] = {"guard_enabled": True}
+    settings.update(overrides)
+    return KFCConfig(general=KFCConfig.GeneralSection(**settings))
 
 
 # ── 接入层 ──────────────────────────────────────────────────────────────
@@ -196,7 +197,7 @@ def test_first_block_rolls_back_and_retries() -> None:
     state = _state()
 
     retry = _handle_guard_refusal(
-        response, 1, state, _config(), _EVIDENCE, from_tool_call=True
+        response, 1, state, _EVIDENCE, from_tool_call=True
     )
 
     assert retry is True
@@ -209,43 +210,28 @@ def test_first_block_rolls_back_and_retries() -> None:
     assert response.call_list == []
 
 
-def test_second_block_stops_retrying() -> None:
-    """第二次命中：不再重试，计数不再增长。"""
-    response = _response()
+def test_blocks_exhaust_fixed_three_retries() -> None:
+    """固定三次重试后再次命中即收口，计数停在上限。"""
     state = _state()
 
-    assert (
-        _handle_guard_refusal(
-            response, 1, state, _config(), _EVIDENCE, from_tool_call=True
+    for _ in range(_GUARD_MAX_RETRIES):
+        assert (
+            _handle_guard_refusal(
+                _response(), 1, state, _EVIDENCE, from_tool_call=True
+            )
+            is True
         )
-        is True
-    )
-    response = _response()
+    assert state.guard_retry_count == _GUARD_MAX_RETRIES
 
+    response = _response()
     assert (
         _handle_guard_refusal(
-            response, 1, state, _config(), _EVIDENCE, from_tool_call=True
+            response, 1, state, _EVIDENCE, from_tool_call=True
         )
         is False
     )
-    assert state.guard_retry_count == 1
+    assert state.guard_retry_count == _GUARD_MAX_RETRIES
     assert len(response.payloads) == 1
-    assert response.call_list == []
-
-
-def test_zero_budget_stops_immediately() -> None:
-    """重试上限为 0 时命中即刻收口。"""
-    response = _response()
-    state = _state()
-
-    assert (
-        _handle_guard_refusal(
-            response, 1, state, _config(0), _EVIDENCE, from_tool_call=True
-        )
-        is False
-    )
-    assert state.guard_retry_count == 0
-    assert response.message == ""
     assert response.call_list == []
 
 
@@ -256,7 +242,7 @@ def test_block_clears_pending_plain_text_reminders() -> None:
     state.plain_text_reminders.append(LLMPayload(ROLE.USER, Text("提醒")))
 
     _handle_guard_refusal(
-        response, 1, state, _config(), _EVIDENCE, from_tool_call=True
+        response, 1, state, _EVIDENCE, from_tool_call=True
     )
 
     assert state.plain_text_reminders == []
@@ -269,7 +255,7 @@ def test_guard_retry_is_independent_from_plain_text_retry() -> None:
     state.plain_text_retry_count = 3
 
     _handle_guard_refusal(
-        response, 1, state, _config(), _EVIDENCE, from_tool_call=True
+        response, 1, state, _EVIDENCE, from_tool_call=True
     )
 
     assert state.guard_retry_count == 1
