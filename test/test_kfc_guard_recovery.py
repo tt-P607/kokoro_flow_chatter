@@ -56,6 +56,7 @@ from src.app.plugin_system.types import (  # noqa: E402
     Text,
     ToolCall,
 )
+from src.kernel.llm import ReasoningText  # noqa: E402
 
 _L1, _L2, _L3 = _GUARD_RETRY_REMINDERS
 """三层提示的具名引用，供断言顺序与内容。"""
@@ -200,7 +201,7 @@ def _block(
     )
     return _handle_guard_refusal(
         response,
-        1,
+        list(response.payloads[:1]),
         state,
         _EVIDENCE,
         from_tool_call=from_tool_call,
@@ -401,7 +402,7 @@ def test_plain_text_pass_uses_plain_text_retry() -> None:
     """守卫放行的普通纯文本走原有格式纠正，不消耗 Guard 额度。"""
     state = _state()
     retry = _handle_plain_text_violation(
-        _normal_plain_response(), 1, state, _config(), [{}]
+        _normal_plain_response(), [_user("[新消息]")], state, _config(), [{}]
     )
 
     assert retry is True
@@ -432,7 +433,7 @@ def test_plain_text_path_drops_guard_layers() -> None:
     assert state.guard_retry_count == 2
 
     _handle_plain_text_violation(
-        _normal_plain_response(), 1, state, _config(), [{}]
+        _normal_plain_response(), [_user("[新消息]")], state, _config(), [{}]
     )
 
     assert state.guard_retry_count == 0
@@ -446,7 +447,7 @@ def test_guard_retry_then_normal_plain_text_falls_back_to_format_retry() -> None
     _block(state)
 
     retry = _handle_plain_text_violation(
-        _normal_plain_response(), 1, state, _config(), [{}]
+        _normal_plain_response(), [_user("[新消息]")], state, _config(), [{}]
     )
 
     assert retry is True
@@ -466,7 +467,7 @@ def test_guard_retry_then_plain_refusal_exhausts_fixed_budget() -> None:
     response = _plain_refusal_response()
     assert (
         _handle_guard_refusal(
-            response, 1, state, _EVIDENCE, from_tool_call=False
+            response, list(response.payloads[:1]), state, _EVIDENCE, from_tool_call=False
         )
         is False
     )
@@ -483,7 +484,7 @@ def test_counter_isolation_between_two_retry_kinds() -> None:
 
     # 1) 普通格式错误
     _handle_plain_text_violation(
-        _normal_plain_response(), 1, state, _config(), [{}]
+        _normal_plain_response(), [_user("[新消息]")], state, _config(), [{}]
     )
     assert state.plain_text_retry_count == 1
     assert state.guard_retry_count == 0
@@ -496,7 +497,7 @@ def test_counter_isolation_between_two_retry_kinds() -> None:
 
     # 3) 又是普通格式错误：格式计数继续累加，守卫层数归零
     _handle_plain_text_violation(
-        _normal_plain_response(), 1, state, _config(), [{}]
+        _normal_plain_response(), [_user("[新消息]")], state, _config(), [{}]
     )
     assert state.plain_text_retry_count == 2
     assert state.guard_retry_count == 0
@@ -539,7 +540,7 @@ def _persistent_chain_after_send(
     return _without_transient_payloads(
         sent,
         source_payloads=list(source.payloads),
-        transient_count=len(view.payloads) - len(source.payloads),
+        transient_payloads=transient,
     )
 
 
@@ -561,6 +562,54 @@ def test_request_view_sends_layers_but_chain_keeps_them_out() -> None:
     assert _layers_in(persistent) == []
 
 
+def test_guard_rollback_discards_transient_turn_boundary() -> None:
+    """拒绝续轮回复时，连同该回复产生的中性回合边界一起回滚。"""
+    source = _FakeResponse(payloads=[_user("原始消息"), _assistant("已有回复")])
+    before_send = list(source.payloads)
+    persisted = _persistent_chain_after_send(
+        source, [_user("仅本轮可见的触发提示")], _assistant(_PLAIN_REFUSAL)
+    )
+    response = _FakeResponse(payloads=persisted, message=_PLAIN_REFUSAL)
+
+    assert _handle_guard_refusal(
+        response, before_send, _state(), _EVIDENCE, from_tool_call=False
+    )
+    assert response.payloads == source.payloads
+    assert response.message == ""
+
+
+def test_guard_retry_after_assistant_keeps_only_successful_reply() -> None:
+    """仅临时触发的续轮经两次拒绝后保留原历史与最终有效回复。"""
+    from src.kernel.llm.context_structure import validate_payload_sequence
+
+    source = _FakeResponse(payloads=[_user("原始消息"), _assistant("已有回复")])
+    initial_payloads = list(source.payloads)
+    trigger = _user("仅本轮可见的触发提示")
+    state = _state()
+
+    for retry_index in range(2):
+        before_send = list(source.payloads)
+        source.payloads = _persistent_chain_after_send(
+            source,
+            [trigger, *_build_guard_retry_reminders(retry_index)],
+            _assistant(_PLAIN_REFUSAL),
+        )
+        assert _handle_guard_refusal(
+            source, before_send, state, _EVIDENCE, from_tool_call=False
+        )
+        assert source.payloads == initial_payloads
+
+    persistent = _persistent_chain_after_send(
+        source, [trigger, *_build_guard_retry_reminders(2)], _assistant(_NORMAL_REPLY)
+    )
+    validate_payload_sequence(persistent, allow_incomplete_tail=False)
+    assert persistent[0:2] == initial_payloads
+    assert persistent[-1].content == [Text(_NORMAL_REPLY)]
+    assert _PLAIN_REFUSAL not in _payloads_text(persistent)
+    assert _layers_in(persistent) == []
+    assert "仅本轮可见的触发提示" not in _payloads_text(persistent)
+
+
 def test_all_layers_absent_from_context_snapshot() -> None:
     """被拦截拒答与三层提示都不会进入上下文快照。"""
     source = _FakeResponse(payloads=[_user("用户真实消息")])
@@ -569,7 +618,7 @@ def test_all_layers_absent_from_context_snapshot() -> None:
     persistent = _persistent_chain_after_send(
         source, transient, _assistant("正常角色回复")
     )
-    snapshot = capture_snapshot(persistent, 20)
+    snapshot = capture_snapshot(persistent)
 
     assert snapshot is not None
     blob = json.dumps(snapshot, ensure_ascii=False, default=str)
@@ -584,7 +633,7 @@ def test_rollback_leaves_nothing_for_mental_log() -> None:
     """回滚后 message 为空，提交阶段不可能把拒答写进 mental_log。"""
     response = _plain_refusal_response()
     _handle_guard_refusal(
-        response, 1, _state(), _EVIDENCE, from_tool_call=False
+        response, list(response.payloads[:1]), _state(), _EVIDENCE, from_tool_call=False
     )
 
     assert response.message == ""
@@ -622,12 +671,11 @@ class _HarnessSession:
         """初始化记录容器。"""
         self.history_summary = ""
         self.context_snapshot: Any = None
+        self.sealed_segments: list[Any] = []
         self.bot_planning: list[dict[str, Any]] = []
         self.user_id = "user-1"
 
-    def append_context_entries(
-        self, payloads: list[Any], max_payloads: int
-    ) -> bool:
+    def append_context_entries(self, payloads: list[Any]) -> bool:
         """不实际改动快照，避免测试依赖会话序列化。"""
         return False
 
@@ -644,6 +692,7 @@ class _HarnessChatter:
         self.stream_id = "guard-stream"
         self._config = config
         self._session = session
+        self.session_store = object()
 
     def get_config(self) -> KFCConfig:
         """返回注入的配置。"""
@@ -793,7 +842,14 @@ class _OrchestratorHarness:
             module, "build_initial_request", _fake_build_initial_request
         )
         monkeypatch.setattr(module, "SummarySynchronizer", _FakeSummary)
+        monkeypatch.setattr(
+            module.SummaryService, "maybe_schedule_compression", lambda *a, **k: False
+        )
         monkeypatch.setattr(module, "TimeoutService", _FakeTimeoutService)
+        async def _no_rotation(_chatter: Any, response: Any, *args: Any, **kwargs: Any) -> tuple[Any, None, bool]:
+            return response, None, False
+
+        monkeypatch.setattr(module, "rotate_if_needed", _no_rotation)
         monkeypatch.setattr(module, "prepare_turn_input", _prepare_turn_input)
         monkeypatch.setattr(
             module, "build_last_mile_payload", lambda: _user("[last-mile]")
@@ -886,6 +942,47 @@ async def test_fixed_three_retries_then_stop(
     assert _PLAIN_TEXT_RETRY_REMINDER not in _payloads_text(
         harness.sent_views[-1]
     )
+
+
+async def test_guard_retry_removes_refusal_after_send_trims_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """发送时裁剪旧回合后，重试请求仍不能携带被拦回复。"""
+    from plugins.kokoro_flow_chatter.runtime import orchestrator as module
+
+    harness = _OrchestratorHarness(
+        monkeypatch, _retry_turn_inputs(1, None), blocked=1
+    )
+    harness.chain.payloads = [
+        _user("旧消息"), _assistant("旧回复"), _user("用户真实消息")
+    ]
+    for item in harness.turn_inputs:
+        item.response = harness.chain
+    harness.install(module)
+
+    async def _send_with_trim(
+        _chatter: Any,
+        send_target: Any,
+        _config: Any,
+        _known_ids: Any,
+        _state: Any,
+    ) -> tuple[Any, list[Any]]:
+        harness.sent_views.append(list(send_target.payloads))
+        if len(harness.sent_views) == 1:
+            harness.chain.payloads = [harness.chain.payloads[-1]]
+        result = harness.response_for_view(len(harness.sent_views))
+        if len(harness.sent_views) == 1:
+            result.payloads[-1].content.insert(0, ReasoningText("被拦推理"))
+        return result, []
+
+    monkeypatch.setattr(module, "_send_llm_request", _send_with_trim)
+    await harness.drive(module, _config())
+
+    assert len(harness.sent_views) == 2
+    assert _L1 in _payloads_text(harness.sent_views[1])
+    assert _PLAIN_REFUSAL not in repr(harness.sent_views[1])
+    assert "被拦推理" not in repr(harness.sent_views[1])
+    assert _PLAIN_REFUSAL not in repr(harness.chain.payloads)
 
 
 async def test_retry_succeeds_before_budget_exhausted(

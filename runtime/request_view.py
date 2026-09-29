@@ -14,8 +14,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.app.plugin_system.types import LLMPayload, ROLE
+from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.kernel.llm.context_structure import validate_payload_sequence
+from src.kernel.llm.exceptions import LLMContextError
 from src.kernel.llm.request import LLMRequest
+
+CONTINUATION_BOUNDARY_TEXT = "（会话继续）"
 
 
 @dataclass(slots=True)
@@ -44,7 +48,7 @@ class RequestView:
             Any: source 支持回写时返回 source 本身，否则返回新结果对象。
         """
         source_payloads = list(self.source.payloads)
-        transient_count = max(len(self.payloads) - len(source_payloads), 0)
+        transient_payloads = self.payloads[len(source_payloads) :]
 
         # LLMResponse 把请求元信息挂在 _upper 上；source 若本身就是
         # LLMRequest，则元信息直接位于自身。
@@ -66,8 +70,9 @@ class RequestView:
         persistent_payloads = _without_transient_payloads(
             result.payloads,
             source_payloads=source_payloads,
-            transient_count=transient_count,
+            transient_payloads=transient_payloads,
         )
+        validate_payload_sequence(persistent_payloads, allow_incomplete_tail=True)
         result.payloads = persistent_payloads
 
         if not hasattr(self.source, "message"):
@@ -107,30 +112,61 @@ def _without_transient_payloads(
     payloads: list[LLMPayload],
     *,
     source_payloads: list[LLMPayload],
-    transient_count: int,
+    transient_payloads: list[LLMPayload],
 ) -> list[LLMPayload]:
-    """剔除临时 payload，并还原被 reminder 修改过的持久 USER payload。
+    """剔除临时 payload，并保留由它触发的回复所需的回合边界。
 
     Args:
         payloads: 发送后的完整 payload 列表。
         source_payloads: 发送前的主链快照。
-        transient_count: 本次追加的临时 payload 数量。
+        transient_payloads: 本次追加的临时 payload；用于在发送前裁剪后仍
+            能按身份区分临时输入与新输出。
 
     Returns:
         list[LLMPayload]: 应回写主链的持久 payload 列表。
     """
-    base_count = len(source_payloads)
-    if transient_count <= 0:
-        persistent_payloads = list(payloads)
-    else:
-        persistent_payloads = (
-            list(payloads[:base_count])
-            + list(payloads[base_count + transient_count :])
+    source_by_identity = {id(payload): payload for payload in source_payloads}
+    transient_identities = {id(payload) for payload in transient_payloads}
+    persistent_payloads: list[LLMPayload] = []
+    has_real_user = False
+    removed_transient_user = False
+
+    for payload in payloads:
+        if id(payload) in transient_identities:
+            removed_transient_user = removed_transient_user or payload.role == ROLE.USER
+            continue
+
+        source_payload = source_by_identity.get(id(payload))
+        if source_payload is not None:
+            persistent_payloads.append(source_payload if source_payload.role == ROLE.USER else payload)
+        else:
+            if (
+                payload.role == ROLE.ASSISTANT
+                and removed_transient_user
+                and has_real_user
+                and persistent_payloads
+                and persistent_payloads[-1].role == ROLE.ASSISTANT
+            ):
+                persistent_payloads.append(
+                    LLMPayload(ROLE.USER, Text(CONTINUATION_BOUNDARY_TEXT))
+                )
+            persistent_payloads.append(payload)
+        has_real_user = has_real_user or payload.role == ROLE.USER
+        removed_transient_user = False
+
+    first_user_index = next(
+        (
+            index
+            for index, payload in enumerate(persistent_payloads)
+            if payload.role == ROLE.USER
+        ),
+        None,
+    )
+    if first_user_index is None and any(
+        payload.role == ROLE.ASSISTANT for payload in persistent_payloads
+    ):
+        raise LLMContextError(
+            "RequestView 裁剪后缺少真实 USER，不能回写包含 assistant 的响应"
         )
 
-    for index, source_payload in enumerate(source_payloads):
-        if index >= len(persistent_payloads):
-            break
-        if source_payload.role == ROLE.USER:
-            persistent_payloads[index] = source_payload
     return persistent_payloads

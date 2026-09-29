@@ -8,13 +8,13 @@
 
 ## 概述
 
-KFC 是一个面向私聊场景的 Chatter 插件。与传统聊天器不同，KFC 将 LLM 的每次决策与内心独白绑定，形成连续的心理活动流。对话历史与内心活动按时间线交织，让模型在回复时不仅能看到"说了什么"，还能"回想起"当时在想什么。
+KFC 是一个面向私聊场景的 Chatter 插件。KFC 将 LLM 的每次决策与内心独白记录在独立的心理活动流中；请求使用持久化的原话链，封存旧回合后以第一人称日记延续记忆。
 
 ### 核心能力
 
 - **心理活动流**：每次回复附带内心独白（情绪、期待），形成可回顾的心理时间线
-- **近期记忆压缩**：自动将近期对话压缩为第一人称叙事摘要，长期对话不丢失上下文
-- **完整上下文快照**：每次成功发送 LLM 请求前把完整 payload 链（含工具调用与结果）持久化到会话 JSON，重启后恢复，消除重启导致的上下文连续性损失
+- **后台日记压缩**：预算接近上限时封存旧完整回合，立即重建活动链，后台把封存原话与旧日记整合为第一人称日记
+- **完整上下文快照**：持续保存原话 payload 链（含工具调用与结果）至独立上下文文件，重启后恢复
 - **私人备忘录**：LLM 可自主记录带过期时间的待办/提醒，自动过期清理
 - **等待与超时**：回复后进入等待状态，超时后智能决定追问、继续或结束
 - **主动发起**：沉默超过阈值后有概率主动发起对话，支持深夜静默和模型预约
@@ -66,20 +66,23 @@ KFC 通过原生 Tool Calling 驱动对话，所有行为通过工具调用完�
 | 来源 | 内容 |
 |------|------|
 | 系统提示词 | 人设、行为规范、场景状态 |
-| 近期记忆摘要 | 自动压缩的对话叙事（第一人称） |
-| 对话链 | 最近的 USER/ASSISTANT 对话记录 |
-| 融合叙事 | 聊天记录与内心独白按时间线交织 |
-| 心理活动流 | 最近的内心事件（等待、超时、打断等） |
+| 日记 | 封存原话与旧日记整合的第一人称记忆 |
+| 框架历史 | 核心配置限定条数的聊天消息，与心理活动按时间线注入动态背景 |
+| 对话链 | 活动回合的原始 USER/ASSISTANT、推理、工具调用与结果 |
+| 心理活动流 | 独立保存的内心事件（等待、超时、打断等） |
 | 私人备忘录 | 当前有效的备忘条目 |
 | 第三方注入 | 其他插件通过 `on_prompt_build` 提供的上下文 |
 
-### 近期记忆压缩
+### 上下文轮换与日记
 
-对话轮数达到阈值后，自动将近期对话压缩为叙事摘要：
+日记为空时，后台读取框架已加载的近 3 天聊天记录，生成并保存一次初始日记；没有近期记录则跳过。后续封存原话仍按正常流程压缩，生成失败不影响当前聊天，原话不会被删除。
 
-- 使用独立的压缩模型（`compress_model_task`），不影响主对话
-- 以第一人称书写，注入后续每轮上下文
-- 摘要生成后立即生效，无需重启
+完整请求接近模型有效窗口的 80% 时，先把旧完整回合封存，再立即用日记、框架历史和当前活动回合重建请求：
+
+- 后台使用独立的模型任务（`compress_model_task`）整合封存原话与旧日记，不阻塞当前对话。
+- 日记任务使用独立的系统提示词，沿用核心人设及行为边界，不继承主对话的工具调用协议；聊天记录与旧日记只作为待整理材料。
+- 日记成功写盘后才删除对应的封存原话；三次失败则保留原话和旧日记，重启后重试。
+- 日记生成后热更新同一次运行的动态背景，重启后也会加载。
 
 ### 私人备忘录
 
@@ -116,8 +119,10 @@ kokoro_flow_chatter/
 ├── chatter.py                 # 组件门面：实现框架契约，向 runtime 暴露能力
 ├── models.py                  # 共享数据模型：常量、事件类型、备忘、等待状态
 ├── mental_log.py              # 心理活动流容器
-├── session.py                 # 会话状态与持久化存储
-├── compressor.py              # 近期记忆压缩
+├── session.py                 # 独立会话状态与上下文存储
+├── snapshot.py                # 原话链序列化与恢复
+├── context_budget.py          # 模型预算守卫
+├── diary_compressor.py        # 封存段后台日记压缩
 ├── multimodal.py              # 原生多模态图片处理
 ├── framework_compat.py        # 框架未公开能力的兼容边界
 │
@@ -138,6 +143,7 @@ kokoro_flow_chatter/
 │   ├── orchestrator.py        # 主循环编排
 │   ├── turn_controller.py     # 回合输入准备与决策提交
 │   ├── context_builder.py     # 初始请求构建
+│   ├── context_rotation.py    # 封存旧回合并重建活动链
 │   ├── model_setup.py         # 模型集解析
 │   ├── payload_hygiene.py     # 上下文链清理（孤立结果 / 残留提醒）
 │   ├── summary_sync.py        # 记忆摘要热更新
@@ -152,7 +158,7 @@ kokoro_flow_chatter/
 │   ├── renderer.py            # payload 组装
 │   ├── types.py               # 上下文类型定义
 │   └── sources/               # 各上下文来源
-│       ├── history_source.py  # 历史 / 摘要 / 融合叙事
+│       ├── history_source.py  # 通道 / 日记 / 时间背景
 │       ├── initial_source.py  # 启动时的系统模板变量
 │       ├── memo_source.py     # 备忘录
 │       └── plugin_source.py   # 第三方注入
@@ -237,12 +243,6 @@ kokoro_flow_chatter/
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `max_log_entries` | `50` | 活动流最大条目数 |
-| `max_context_payloads` | `100` | LLM 快照容量；达到 80% 时批量裁剪并保留约末尾 20% |
-| `compress_every_n_rounds` | `50` | 每 N 轮触发记忆压缩 |
-| `compress_days_window` | `3.0` | 压缩覆盖天数 |
-| `min_compress_interval_minutes` | `120.0` | 压缩最小间隔（分钟） |
-| `compress_min_chars` | `800` | 摘要最小字数 |
-| `compress_max_chars` | `1200` | 摘要最大字数 |
 | `compress_model_task` | `"actor"` | 压缩使用的模型任务（独立于主对话） |
 
 ### `[buffer]` 打断
@@ -263,11 +263,11 @@ kokoro_flow_chatter/
 
 ### 上下文快照
 
-`context_snapshot` 是 KFC 唯一持久 transcript 真相源。KFC 在每轮**回合
-闭合点**（决策提交完成、无待消化工具结果）把主链中的真实 USER/ASSISTANT、
-Reasoning、ToolCall 与 TOOL_RESULT 刷新到该快照；通道、近期记忆摘要和融
-合叙事只作为当前请求动态背景，不进入快照。行为强调与重试提醒通过
-RequestView 作当前请求 transient 注入，同样不会持久化。
+`context_snapshot` 保存当前活动原话链。新用户输入在发送前写入快照；每轮
+**回合闭合点**（决策提交完成、无待消化工具结果）再把主链中的真实
+USER/ASSISTANT、Reasoning、ToolCall 与 TOOL_RESULT 无损刷新到快照。
+通道、日记、框架历史与心理活动只作为动态背景，不进入快照；时间线为空时用当前时间代替。行为强调与重试提醒通过
+RequestView 作当前请求 transient 注入，也不会持久化。
 
 ---
 
@@ -287,9 +287,9 @@ RequestView 作当前请求 transient 注入，同样不会持久化。
 
 - 插件加载后注册提示词模板，并通过 TaskManager 等待统一 Scheduler 启动。
 - 主动发起检查使用名为 `kfc_proactive_check` 的周期调度；插件卸载时会移除。
-- 近期摘要按聊天流去重调度；同一流不会并发启动多份压缩任务，卸载时会取消残留任务。
-- 会话状态保存在 `data/kokoro_flow_chatter/sessions/`，按 `stream_id` 隔离；同目录下的 `_index.json` 维护 `stream_id` 与账号的可读映射。
-- **单一 JSON 承载全部会话数据**：`mental_log`（日记）、`history_summary`（近期记忆摘要）、`memos`（备忘录）、`context_snapshot`（完整上下文快照）等所有跨轮状态都在同一个 `<stream_id>.json` 文件里，不设额外存储目录。
+- 封存段后台压缩按聊天流去重调度；同一流不会并发启动多份任务，卸载时取消残留任务。
+- 会话状态保存在 `data/kokoro_flow_chatter/sessions/state/`，活动流、备忘录、预约等与 `data/kokoro_flow_chatter/sessions/context/` 中的快照、封存队列、日记按 `stream_id` 分文件保存。上下文损坏只清理上下文文件；旧单文件格式不迁移。
+- `state/_index.json` 维护 `stream_id` 与账号的可读映射。
 - 禁用 `[general].enabled` 后不注册 Chatter，由框架为私聊流选择其他可用 Chatter。
 
 ## 自动测试
@@ -326,11 +326,11 @@ uv run pytest plugins/kokoro_flow_chatter/test -q
 3. 流级识别跳过当前由框架 `MediaManager` 提供，但尚未暴露为插件公共 API；KFC 通过 `framework_compat.py` 集中隔离该内部边界。
 4. 表情包按设计仍走 VLM 文字描述，以复用其哈希缓存，属预期行为。
 
-### 近期摘要不生成
+### 日记不生成
 
-1. 首次有效对话会尝试生成空摘要；后续按 `compress_every_n_rounds` 触发。
+1. 空日记仅在框架已加载的近 3 天聊天历史非空时初始化；已有日记按封存队列压缩。
 2. 检查 `compress_model_task` 是否存在可用模型。
-3. 检查 `min_compress_interval_minutes` 是否阻止了短时间重复压缩。
+3. 日记模板未注册或模型生成失败三次时，当前进程暂停重试；封存原话保留，重启后可重新检查队列。
 4. 同一流已有压缩任务运行时，新请求会被去重而不是重复启动。
 
 ## 人工验证清单
@@ -340,7 +340,7 @@ uv run pytest plugins/kokoro_flow_chatter/test -q
 3. 在模型生成期间连续发送新消息，确认旧请求被打断且消息合并处理。
 4. 测试 `do_nothing`、`pass_and_wait`、等待超时和最大连续超时。
 5. 创建、覆盖、取消主动预约，并验证热流和冷启动流触发。
-6. 达到摘要条件后确认摘要写入会话文件，重启后仍可恢复。
+6. 确认核心配置限定的框架历史在首次请求和轮换重建后仍可见；后台日记成功才清除封存原话，重启后仍可恢复。
 7. 发布 `voice_call.ended` 事件，确认通话内容以一对 USER/ASSISTANT 快照条目回填。
 8. 禁用、重载、卸载插件，确认无残留 Scheduler 或摘要后台任务。
 

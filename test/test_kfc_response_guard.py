@@ -197,7 +197,7 @@ def test_first_block_rolls_back_and_retries() -> None:
     state = _state()
 
     retry = _handle_guard_refusal(
-        response, 1, state, _EVIDENCE, from_tool_call=True
+        response, list(response.payloads[:1]), state, _EVIDENCE, from_tool_call=True
     )
 
     assert retry is True
@@ -215,9 +215,10 @@ def test_blocks_exhaust_fixed_three_retries() -> None:
     state = _state()
 
     for _ in range(_GUARD_MAX_RETRIES):
+        response = _response()
         assert (
             _handle_guard_refusal(
-                _response(), 1, state, _EVIDENCE, from_tool_call=True
+                response, list(response.payloads[:1]), state, _EVIDENCE, from_tool_call=True
             )
             is True
         )
@@ -226,7 +227,7 @@ def test_blocks_exhaust_fixed_three_retries() -> None:
     response = _response()
     assert (
         _handle_guard_refusal(
-            response, 1, state, _EVIDENCE, from_tool_call=True
+            response, list(response.payloads[:1]), state, _EVIDENCE, from_tool_call=True
         )
         is False
     )
@@ -242,7 +243,7 @@ def test_block_clears_pending_plain_text_reminders() -> None:
     state.plain_text_reminders.append(LLMPayload(ROLE.USER, Text("提醒")))
 
     _handle_guard_refusal(
-        response, 1, state, _EVIDENCE, from_tool_call=True
+        response, list(response.payloads[:1]), state, _EVIDENCE, from_tool_call=True
     )
 
     assert state.plain_text_reminders == []
@@ -255,7 +256,7 @@ def test_guard_retry_is_independent_from_plain_text_retry() -> None:
     state.plain_text_retry_count = 3
 
     _handle_guard_refusal(
-        response, 1, state, _EVIDENCE, from_tool_call=True
+        response, list(response.payloads[:1]), state, _EVIDENCE, from_tool_call=True
     )
 
     assert state.guard_retry_count == 1

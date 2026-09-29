@@ -40,61 +40,61 @@ def _assistant(text: str) -> LLMPayload:
 
 
 def test_rollback_drops_trailing_assistant_and_clears_message() -> None:
-    """回滚应丢弃基线后的 ASSISTANT 并清空输出字段。"""
+    """回滚应丢弃本轮 ASSISTANT 并清空输出字段。"""
     response: Any = _FakeResponse(
         payloads=[_user("[新消息]"), _assistant("纯文本输出")],
         message="纯文本输出",
     )
-    _rollback_failed_assistant(response, payload_baseline=1)
+    _rollback_failed_assistant(response, list(response.payloads[:1]))
     assert len(response.payloads) == 1
     assert response.payloads[-1].role == ROLE.USER
     assert response.message == ""
 
 
-def test_rollback_keeps_chain_when_trailing_has_tool_calls() -> None:
-    """末尾含工具调用的 ASSISTANT 是合法成功输出，不得回滚。"""
+def test_rollback_preserves_prior_tool_call() -> None:
+    """发送前已有的工具调用必须在回滚后保留。"""
     tool_call = ToolCall(id="call-1", name="kfc_reply", args={})
     success_assistant = LLMPayload(ROLE.ASSISTANT, [tool_call])
     response: Any = _FakeResponse(
-        payloads=[_user("[新消息]"), success_assistant],
-        message="回复正文",
+        payloads=[_user("[新消息]"), success_assistant, _assistant("被拦回复")],
+        message="被拦回复",
         call_list=[tool_call],
     )
-    _rollback_failed_assistant(response, payload_baseline=2)
-    # 基线等于长度，无新增可删；message 不应被清空
-    assert response.message == "回复正文"
+    _rollback_failed_assistant(response, list(response.payloads[:2]))
+    assert response.payloads[-1] is success_assistant
+    assert response.message == ""
 
 
-def test_rollback_ignores_when_no_new_payloads() -> None:
-    """无新增 payload 时回滚应为无害空操作。"""
-    response: Any = _FakeResponse(payloads=[_user("历史"), _assistant("旧输出")], message="保留")
-    _rollback_failed_assistant(response, payload_baseline=99)
-    assert len(response.payloads) == 2
-    assert response.message == "保留"
+def test_rollback_restores_snapshot_when_send_trimmed_history() -> None:
+    """发送后列表比原链更短时仍须剥离无效回复。"""
+    history = [_user("历史"), _assistant("旧输出"), _user("当前消息")]
+    response: Any = _FakeResponse(
+        payloads=[history[-1], _assistant("被拦回复")], message="被拦回复"
+    )
+    _rollback_failed_assistant(response, history)
+    assert response.payloads == history
+    assert response.message == ""
 
 
-def test_rollback_skips_non_assistant_trailing() -> None:
-    """末尾不是 ASSISTANT 时（异常链形态）不做破坏性删除。"""
+def test_rollback_drops_new_user_boundary_with_refusal() -> None:
+    """本轮临时触发而生成的 USER 边界也不能留在主链。"""
     response: Any = _FakeResponse(
         payloads=[_user("历史"), _user("新消息"), _assistant("纯文本输出")],
         message="纯文本输出",
     )
-    # 模拟基线后出现了非 ASSISTANT payload：不做删除
-    baseline = 1
-    payloads = response.payloads
-    if all(p.role == ROLE.ASSISTANT for p in payloads[baseline:]):
-        del payloads[baseline:]
-    assert len(response.payloads) == 3
+    _rollback_failed_assistant(response, list(response.payloads[:1]))
+    assert len(response.payloads) == 1
+    assert response.message == ""
 
 
 @pytest.mark.parametrize(
-    ("baseline", "expected_len"),
-    [(1, 1), (0, 0)],
+    "before_send",
+    [[], [_user("历史")]],
 )
-def test_rollback_partial_shapes(baseline: int, expected_len: int) -> None:
-    """不同基线下只删除本次新增的 ASSISTANT 段。"""
+def test_rollback_partial_shapes(before_send: list[LLMPayload]) -> None:
+    """不同主链快照下均只保留发送前内容。"""
     response: Any = _FakeResponse(
-        payloads=[_assistant("本轮纯文本")], message="x"
+        payloads=[*before_send, _assistant("本轮纯文本")], message="x"
     )
-    _rollback_failed_assistant(response, payload_baseline=baseline)
-    assert len(response.payloads) == expected_len
+    _rollback_failed_assistant(response, before_send)
+    assert response.payloads == before_send

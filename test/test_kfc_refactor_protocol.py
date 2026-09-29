@@ -93,6 +93,12 @@ from plugins.kokoro_flow_chatter.runtime.request_view import (  # noqa: E402
     _without_transient_payloads,
     build_request_view,
 )
+import plugins.kokoro_flow_chatter.runtime.request_view as request_view_module  # noqa: E402
+from src.kernel.llm.exceptions import LLMContextError  # noqa: E402
+from src.kernel.llm.context_structure import validate_payload_sequence  # noqa: E402
+from src.kernel.llm.request_execution import (  # noqa: E402
+    normalize_tool_result_payload,
+)
 from plugins.kokoro_flow_chatter.runtime.turn_controller import (  # noqa: E402
     _final_signal,
 )
@@ -744,6 +750,65 @@ def test_build_fused_narrative_interleaves_messages_and_thoughts() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_snapshot", [False, True])
+async def test_initial_context_includes_framework_history_with_or_without_snapshot(
+    with_snapshot: bool,
+) -> None:
+    """框架限制后的历史消息在冷启动及恢复快照时均进入动态背景。"""
+    chat_stream = cast(Any, SimpleNamespace(
+        stream_name="对方",
+        platform="qq",
+        chat_type="private",
+        bot_id="bot",
+        bot_nickname="机器人",
+        context=SimpleNamespace(history_messages=[
+            SimpleNamespace(
+                time=100.0, sender_name="对方", sender_id="user",
+                message_id="history-1", processed_plain_text="框架保留的历史原话",
+            ),
+            SimpleNamespace(
+                time=101.0, sender_name="机器人", sender_id="bot",
+                message_id="history-2", processed_plain_text="框架保留的历史回复",
+            ),
+        ]),
+    ))
+    snapshot = (
+        [{"role": "user", "content": [{"type": "text", "text": "快照中的活动原话"}]}]
+        if with_snapshot else None
+    )
+
+    async def _system_prompt(_stream: Any, _vars: dict[str, str] | None) -> str:
+        return "系统提示词"
+
+    system_payloads, history_payloads, has_history = await render_initial_context(
+        chat_stream=chat_stream,
+        plan=InitialContextPlan(history_summary="已有日记"),
+        mental_log=None,
+        serialized_context_snapshot=snapshot,
+        build_system_prompt_fn=_system_prompt,
+    )
+
+    assert "框架保留的历史原话" in _text_of(history_payloads[0])
+    assert "框架保留的历史回复" in _text_of(history_payloads[0])
+    assert "已有日记" in _text_of(history_payloads[0])
+    assert "框架保留的历史原话" not in _text_of(system_payloads[0])
+    assert has_history is with_snapshot
+    assert len(history_payloads) == (2 if with_snapshot else 1)
+    if with_snapshot:
+        assert _text_of(history_payloads[1]) == "快照中的活动原话"
+
+    from plugins.kokoro_flow_chatter.snapshot import capture_snapshot
+
+    captured = capture_snapshot(history_payloads)
+    if with_snapshot:
+        assert captured is not None
+        assert "快照中的活动原话" in str(captured)
+        assert "框架保留的历史原话" not in str(captured)
+    else:
+        assert captured is None
+
+
+@pytest.mark.asyncio
 async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
     """初始上下文只保留稳定 SYSTEM；动态背景不进入持久快照。"""
     chat_stream = cast(
@@ -775,7 +840,6 @@ async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
         mental_log=None,
         serialized_context_snapshot=snapshot,
         build_system_prompt_fn=_build_system_prompt,
-        build_fused_narrative_fn=lambda _stream, _log: "融合叙事",
     )
 
     assert [payload.role for payload in system_payloads] == [ROLE.SYSTEM]
@@ -787,16 +851,27 @@ async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
     ]
     dynamic_text = _text_of(history_payloads[0])
     assert "近期摘要" in dynamic_text
-    assert "融合叙事" in dynamic_text
+    assert "当前时间：" in dynamic_text
+    assert "融合叙事" not in dynamic_text
     assert _text_of(history_payloads[1]) == "旧用户输入"
     assert has_history is True
 
     from plugins.kokoro_flow_chatter.snapshot import capture_snapshot
 
-    captured = capture_snapshot(history_payloads + history_payloads[:0], 30)
+    captured = capture_snapshot(history_payloads)
     assert captured is not None
     assert [entry["role"] for entry in captured] == ["user", "assistant"]
     assert all("近期摘要" not in str(entry) for entry in captured)
+
+    _, invalid_history, invalid_has_history = await render_initial_context(
+        chat_stream=chat_stream,
+        plan=plan,
+        mental_log=None,
+        serialized_context_snapshot=[{"role": "assistant", "content": []}],
+        build_system_prompt_fn=_build_system_prompt,
+    )
+    assert len(invalid_history) == 1
+    assert invalid_has_history is False
 
 
 def test_render_turn_contributions_orders_by_owner_and_priority() -> None:
@@ -944,27 +1019,176 @@ def test_request_view_keeps_transient_payload_out_of_source() -> None:
     assert view.payloads == [base_payload, extra_payload]
 
 
-def test_without_transient_payloads_restores_source_users() -> None:
-    """裁剪辅助应同时去掉临时项并还原被 reminder 修改的 USER。"""
+def test_without_transient_payloads_keeps_source_users_by_identity() -> None:
+    """裁剪辅助按对象身份保留主链 USER，并去掉临时项。"""
     source_user = LLMPayload(ROLE.USER, Text("原始"))
     source_assistant = LLMPayload(ROLE.ASSISTANT, Text("旧回复"))
-    injected_user = LLMPayload(ROLE.USER, [Text("注入"), Text("原始")])
     transient_user = LLMPayload(ROLE.USER, Text("临时"))
     new_assistant = LLMPayload(ROLE.ASSISTANT, Text("新回复"))
 
     stripped = _without_transient_payloads(
-        [injected_user, source_assistant, transient_user, new_assistant],
+        [source_user, source_assistant, transient_user, new_assistant],
         source_payloads=[source_user, source_assistant],
-        transient_count=1,
+        transient_payloads=[transient_user],
     )
     unchanged = _without_transient_payloads(
-        [injected_user, source_assistant],
+        [source_user, source_assistant],
         source_payloads=[source_user, source_assistant],
-        transient_count=0,
+        transient_payloads=[],
     )
 
-    assert stripped == [source_user, source_assistant, new_assistant]
+    assert stripped[0:2] == [source_user, source_assistant]
+    assert stripped[2].role == ROLE.USER
+    assert "临时" not in str(stripped[2].content)
+    assert stripped[3] is new_assistant
     assert unchanged == [source_user, source_assistant]
+
+
+def test_transient_user_between_assistants_preserves_valid_history() -> None:
+    """临时触发的后续回复不得因裁剪连接 USER 而形成连续 ASSISTANT。"""
+    source_user = LLMPayload(ROLE.USER, Text("之前的真实消息"))
+    previous_assistant = LLMPayload(ROLE.ASSISTANT, Text("之前的回复"))
+    transient_user = LLMPayload(ROLE.USER, Text("本轮触发提示"))
+    new_assistant = LLMPayload(ROLE.ASSISTANT, Text("新的回复"))
+
+    persistent = _without_transient_payloads(
+        [source_user, previous_assistant, transient_user, new_assistant],
+        source_payloads=[source_user, previous_assistant],
+        transient_payloads=[transient_user],
+    )
+    validate_payload_sequence(persistent, allow_incomplete_tail=False)
+    assert persistent[0] is source_user
+    assert persistent[1] is previous_assistant
+    assert persistent[2].role == ROLE.USER
+    assert "本轮触发提示" not in str(persistent[2].content)
+    assert persistent[-1] is new_assistant
+
+
+def test_without_transient_payloads_tracks_trimmed_source_boundary() -> None:
+    """发送前主链被裁剪时，新 assistant 仍应作为新输出保留。"""
+    old_user = LLMPayload(ROLE.USER, Text("旧输入"))
+    source_user = LLMPayload(ROLE.USER, Text("当前输入"))
+    source_assistant = LLMPayload(ROLE.ASSISTANT, Text("旧回复"))
+    transient_user = LLMPayload(ROLE.USER, Text("临时上下文"))
+    new_assistant = LLMPayload(ROLE.ASSISTANT, Text("新回复"))
+
+    stripped = _without_transient_payloads(
+        [source_user, transient_user, new_assistant],
+        source_payloads=[old_user, source_user, source_assistant],
+        transient_payloads=[transient_user],
+    )
+
+    assert stripped == [source_user, new_assistant]
+
+
+def test_without_transient_payloads_preserves_normalized_tool_chain() -> None:
+    """工具调用与回执归一化后仍应保持可校验的完整链路。"""
+    source = [
+        LLMPayload(ROLE.USER, Text("查天气")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="call-1", name="weather", args={"city": "上海"})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="晴", call_id="call-1", name="weather")],
+        ),
+    ]
+    transient = [LLMPayload(ROLE.USER, Text("临时提醒"))]
+    sent = [
+        source[0],
+        source[1],
+        normalize_tool_result_payload(source[2]),
+        transient[0],
+        LLMPayload(ROLE.ASSISTANT, Text("今天晴天")),
+    ]
+
+    persistent = _without_transient_payloads(
+        sent,
+        source_payloads=source,
+        transient_payloads=transient,
+    )
+
+    validate_payload_sequence(persistent, allow_incomplete_tail=False)
+    assert persistent[:3] == source
+    assert persistent[-1].role == ROLE.ASSISTANT
+
+
+def test_without_transient_payloads_rejects_assistant_without_user() -> None:
+    """裁剪掉全部真实 USER 时，包含 assistant 的结果必须报上下文错误。"""
+    transient = LLMPayload(ROLE.USER, Text("临时提醒"))
+    with pytest.raises(LLMContextError):
+        _without_transient_payloads(
+            [
+                LLMPayload(ROLE.ASSISTANT, Text("旧回复")),
+                transient,
+                LLMPayload(ROLE.ASSISTANT, Text("新回复")),
+            ],
+            source_payloads=[LLMPayload(ROLE.USER, Text("已裁剪输入"))],
+            transient_payloads=[transient],
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("orphan_result", [False, True])
+async def test_request_view_send_rejects_orphan_assistant_before_call_list_write(
+    monkeypatch: pytest.MonkeyPatch,
+    orphan_result: bool,
+) -> None:
+    """裁剪后没有真实 USER 时，send 不得回写可执行工具调用。"""
+    transient = LLMPayload(ROLE.USER, Text("临时上下文"))
+    call = ToolCall(id="call-1", name="external-action", args={})
+    source = SimpleNamespace(
+        payloads=[LLMPayload(ROLE.USER, Text("已裁剪输入"))],
+        model_set=[],
+        context_manager=None,
+        _upper=SimpleNamespace(request_name="test", meta_data={}),
+        message="旧消息",
+        reasoning_content=None,
+        reasoning_parts=[],
+        call_list=[],
+        tool_call_compat=False,
+        _consumed=False,
+        _appended_to_context=False,
+    )
+
+    class _FakeRequest:
+        """返回被临时 USER 隔离出的 assistant 工具调用。"""
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.payloads: list[LLMPayload] = []
+
+        async def send(self, **_kwargs: Any) -> Any:
+            """返回未消费的最小响应。"""
+            payloads = [LLMPayload(ROLE.ASSISTANT, [call]), transient]
+            if orphan_result:
+                payloads = [
+                    source.payloads[0],
+                    LLMPayload(
+                        ROLE.TOOL_RESULT,
+                        ToolResult(value="ok", call_id="missing", name="external-action"),
+                    ),
+                    LLMPayload(ROLE.ASSISTANT, [call]),
+                    transient,
+                ]
+            return SimpleNamespace(
+                _consumed=True,
+                payloads=payloads,
+                message="新消息",
+                reasoning_content=None,
+                reasoning_parts=[],
+                call_list=[call],
+                tool_call_compat=False,
+                _appended_to_context=False,
+            )
+
+    monkeypatch.setattr(request_view_module, "LLMRequest", _FakeRequest)
+    view = build_request_view(source, [transient])
+
+    with pytest.raises(LLMContextError):
+        await view.send(auto_append_response=False, stream=False)
+
+    assert source.call_list == []
 
 
 @pytest.mark.asyncio

@@ -112,6 +112,7 @@ def _is_bot_message(message: Message, bot_id: str) -> bool:
 def _collect_message_timeline(
     chat_stream: ChatStream,
     before_ts: float | None,
+    since_ts: float | None = None,
 ) -> list[tuple[float, str]]:
     """把聊天记录收集为 ``(时间戳, 渲染行)`` 序列。"""
     bot_id = chat_stream.bot_id or ""
@@ -123,6 +124,8 @@ def _collect_message_timeline(
             continue
         timestamp = float(raw_time)
         if before_ts is not None and timestamp >= before_ts:
+            continue
+        if since_ts is not None and timestamp < since_ts:
             continue
 
         text = (message.processed_plain_text or "").strip()
@@ -143,6 +146,15 @@ def _collect_message_timeline(
         timeline.append((timestamp, f"[{time_str}] {sender}{id_part}说：{text}"))
 
     return timeline
+
+
+def build_recent_chat_history(
+    chat_stream: ChatStream, since_ts: float, before_ts: float
+) -> str:
+    """以时间顺序渲染框架历史中指定时间窗口内的聊天消息。"""
+    timeline = _collect_message_timeline(chat_stream, before_ts, since_ts)
+    timeline.sort(key=lambda item: item[0])
+    return "\n".join(line for _, line in timeline)
 
 
 def _collect_thought_timeline(

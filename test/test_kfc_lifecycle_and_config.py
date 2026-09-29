@@ -133,10 +133,11 @@ async def test_summary_service_deduplicates_stream_tasks(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def _fake_compress(*args: Any, **kwargs: Any) -> None:
+    async def _fake_compress(*args: Any, **kwargs: Any) -> bool:
         _ = (args, kwargs)
         started.set()
         await release.wait()
+        return True
 
     monkeypatch.setattr(
         "plugins.kokoro_flow_chatter.services.summary_service.compress_history",
@@ -148,19 +149,23 @@ async def test_summary_service_deduplicates_stream_tasks(
         SimpleNamespace(
             stream_id="stream-1",
             history_summary="",
-            compress_round_count=0,
+            sealed_segments=[[{"role": "user", "content": [{"type": "text", "text": "old"}]}]],
+            compression_paused=False,
         ),
     )
     config = KFCConfig()
-    chat_stream = cast(Any, SimpleNamespace())
+    chat_stream = cast(
+        Any, SimpleNamespace(bot_id="bot", context=SimpleNamespace(history_messages=[]))
+    )
 
-    first = SummaryService.maybe_schedule_compression(session, config, chat_stream)
-    await started.wait()
-    second = SummaryService.maybe_schedule_compression(session, config, chat_stream)
+    first = SummaryService.maybe_schedule_compression(session, config, chat_stream, object())
+    await asyncio.wait_for(started.wait(), timeout=2)
+    second = SummaryService.maybe_schedule_compression(session, config, chat_stream, object())
 
     assert first is True
     assert second is False
 
+    session.sealed_segments.clear()
     release.set()
     task_info = get_task_manager().get_task(SummaryService._task_ids["stream-1"])
     assert task_info.task is not None

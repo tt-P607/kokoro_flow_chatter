@@ -15,6 +15,7 @@ from src.app.plugin_system.types import ROLE, Text
 
 from ..context.renderer import SECTION_SEPARATOR
 from ..context.sources.history_source import build_history_summary_payload
+from ..snapshot import DYNAMIC_BACKGROUND_MARKER
 
 if TYPE_CHECKING:
     from src.app.plugin_system.types import ChatStream
@@ -59,11 +60,11 @@ class SummarySynchronizer:
         if current_summary == self._baked_summary:
             return False
 
-        self._baked_summary = current_summary
         if not current_summary:
             return False
 
         if _replace_summary_section(response, chat_stream, current_summary):
+            self._baked_summary = current_summary
             logger.info("近期记忆摘要已热更新到 LLM 上下文")
             return True
         return False
@@ -76,7 +77,7 @@ def _replace_summary_section(
 ) -> bool:
     """在动态 USER payload 中替换或插入摘要段落。
 
-    动态 payload 的结构为「通道信息 + 摘要 + 历史叙事」，各段以
+    动态 payload 的结构为「通道信息 + 日记 + 框架历史时间线」，各段以
     ``SECTION_SEPARATOR`` 分隔。通过摘要标记定位既有段落；若原先没有
     摘要（首次生成），则插入到通道信息之后。
 
@@ -95,7 +96,19 @@ def _replace_summary_section(
 
     payloads = response.payloads
     dynamic_payload = next(
-        (payload for payload in payloads if payload.role == ROLE.USER), None
+        (
+            payload for payload in payloads
+            if payload.role == ROLE.USER
+            and any(
+                isinstance(part, Text) and part.text.startswith(DYNAMIC_BACKGROUND_MARKER)
+                for part in (
+                    payload.content
+                    if isinstance(payload.content, list)
+                    else [payload.content]
+                )
+            )
+        ),
+        None,
     )
     if dynamic_payload is None:
         return False

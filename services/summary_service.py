@@ -1,17 +1,15 @@
-"""KFC 近期记忆压缩调度服务。
-
-按聊天流对压缩任务去重——同一流同时只允许一个压缩任务在跑，避免
-连续对话触发多份重复的 LLM 调用。并提供插件卸载时的集中取消入口。
-"""
+"""KFC 初始日记与封存段压缩的后台调度服务。"""
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.kernel.concurrency import get_task_manager
 
-from ..compressor import compress_history, should_compress
+from ..context.sources.history_source import build_recent_chat_history
+from ..diary_compressor import bootstrap_diary, compress_history
 
 if TYPE_CHECKING:
     from src.app.plugin_system.types import ChatStream
@@ -23,6 +21,7 @@ logger = get_logger("kfc_summary")
 
 _PLUGIN_NAME = "kokoro_flow_chatter"
 _TASK_PURPOSE = "history_compression"
+_INITIAL_DIARY_DAYS = 3
 
 
 class SummaryService:
@@ -43,9 +42,7 @@ class SummaryService:
         chat_stream: ChatStream,
         session_store: KFCSessionStore | None = None,
     ) -> bool:
-        """按会话状态决定是否调度一次压缩。
-
-        触发条件二选一：摘要为空（首次生成），或已满足周期条件。
+        """按会话状态决定是否调度初始日记或封存段压缩。
 
         Args:
             session: 当前会话。
@@ -61,26 +58,39 @@ class SummaryService:
             logger.debug(f"流 {stream_id[:8]} 已有压缩任务在跑，跳过重复调度")
             return False
 
-        trigger_empty = not session.history_summary
-        if not (trigger_empty or should_compress(session, config)):
+        if session.compression_paused:
             return False
-
-        reason = (
-            "摘要为空（首次生成）"
-            if trigger_empty
-            else f"满足周期条件（{session.compress_round_count} 轮）"
+        now = time.time()
+        initial_history = (
+            build_recent_chat_history(
+                chat_stream, now - _INITIAL_DIARY_DAYS * 86400, now
+            )
+            if not session.history_summary.strip()
+            else ""
         )
-        logger.info(f"触发近期记忆压缩：流 {stream_id[:8]}，原因：{reason}")
+        if not initial_history and not session.sealed_segments:
+            return False
+        if session_store is None:
+            raise ValueError("后台压缩需要会话存储以提交日记")
+        logger.info(f"开始处理日记：流 {stream_id[:8]}")
 
         async def run_compression() -> None:
             """执行压缩，并在任意退出路径上释放流级登记。"""
             try:
-                await compress_history(
-                    session,
-                    config,
-                    chat_stream,
-                    session_store=session_store,
-                )
+                if initial_history and not session.history_summary.strip():
+                    succeeded = await bootstrap_diary(
+                        session, config, chat_stream, initial_history,
+                        session_store=session_store,
+                    )
+                    if not succeeded:
+                        session.compression_paused = True
+                        return
+                while session.sealed_segments and not session.compression_paused:
+                    succeeded = await compress_history(
+                        session, config, chat_stream, session_store=session_store
+                    )
+                    if not succeeded:
+                        session.compression_paused = True
             finally:
                 cls._task_ids.pop(stream_id, None)
 

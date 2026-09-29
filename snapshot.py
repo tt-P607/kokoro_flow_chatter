@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from typing import Any
 
@@ -35,9 +34,6 @@ logger = get_logger("kfc_snapshot")
 #: 反序列化时跳过、由框架重新构建的固定角色。
 _SKIP_ROLES = {ROLE.SYSTEM, ROLE.TOOL}
 
-#: 快照单条 content 文本的最大长度，防止异常巨型内容撑爆会话文件。
-_MAX_ENTRY_CHARS = 4000
-
 #: 匹配 user 文本中框架动态注入的 system_reminder 块（含标签本身）。
 _SYSTEM_REMINDER_RE = re.compile(
     r"<system_reminder>.*?</system_reminder>",
@@ -49,12 +45,6 @@ _MEDIA_TYPES = {"Image", "Audio", "Video", "File"}
 
 DYNAMIC_BACKGROUND_MARKER = "【动态背景】"
 """当前请求动态背景的可见标记；序列化时用它排除伪 USER 历史。"""
-
-_TRIM_TRIGGER_RATIO = 0.8
-"""快照达到上限的 80% 时触发一次批量裁剪。"""
-
-_TRIM_KEEP_RATIO = 0.2
-"""批量裁剪后保留末尾约 20% 的近期条目。"""
 
 
 def serialize_payloads(payloads: list[Any]) -> list[dict[str, Any]]:
@@ -98,56 +88,6 @@ def serialize_payloads(payloads: list[Any]) -> list[dict[str, Any]]:
     return entries
 
 
-def trim_snapshot(
-    entries: list[dict[str, Any]],
-    max_payloads: int,
-) -> list[dict[str, Any]]:
-    """在阈值点批量裁剪快照，保证链头为 USER、尾部工具段闭合。
-
-    平时不逐轮滑动删除；当条目数接近上限时一次性截掉旧前缀，只保留
-    近期尾巴，减少多次请求间持久上下文前缀的变化。
-
-    Args:
-        entries: 待裁剪的快照条目。
-        max_payloads: 快照容量；触发与保留数量均按该配置计算。
-
-    Returns:
-        list[dict]: 裁剪后的快照条目。
-    """
-    if max_payloads <= 0:
-        max_payloads = 30
-
-    trigger_count = math.ceil(max_payloads * _TRIM_TRIGGER_RATIO)
-    keep_count = max(1, math.ceil(max_payloads * _TRIM_KEEP_RATIO))
-    if len(entries) >= trigger_count:
-        entries = _batch_trim_to_recent_boundary(entries, keep_count)
-    elif len(entries) > max_payloads:
-        entries = entries[-max_payloads:]
-
-    # 丢弃头部非 USER 条目，保证恢复后对话以 USER 起始
-    while entries and entries[0].get("role") != ROLE.USER.value:
-        entries.pop(0)
-
-    # 从尾部丢弃未配对的 assistant(tool_calls) 悬挂段
-    entries = _drop_unpaired_tail(entries)
-    return entries
-
-
-def _batch_trim_to_recent_boundary(
-    entries: list[dict[str, Any]],
-    keep_count: int,
-) -> list[dict[str, Any]]:
-    """按目标数量截尾，并向前调整到最近的真实对话边界。
-
-    从候选起点向后弹出会拆断正在进行的工具段或把 ASSISTANT 变成链头；
-    因此这里向左扩展到最近的 USER 条目，允许实际保留数略多于目标值。
-    """
-    start = len(entries) - keep_count
-    while start > 0 and entries[start].get("role") != ROLE.USER.value:
-        start -= 1
-    return entries[start:]
-
-
 def deserialize_snapshot(
     entries: list[dict[str, Any]] | None,
 ) -> list[LLMPayload] | None:
@@ -188,12 +128,11 @@ def deserialize_snapshot(
     return payloads
 
 
-def capture_snapshot(payloads: list[Any], max_payloads: int) -> list[dict[str, Any]] | None:
-    """从主链捕获并裁剪快照；无有效对话内容时返回 ``None``。
+def capture_snapshot(payloads: list[Any]) -> list[dict[str, Any]] | None:
+    """从主链无损捕获快照；无有效对话内容时返回 ``None``。
 
     Args:
         payloads: 主链 ``response.payloads``。
-        max_payloads: 快照条目上限（来自 ``config.prompt.max_context_payloads``）。
 
     Returns:
         list[dict] | None: 快照条目；无可捕获内容返回 ``None``。
@@ -201,7 +140,7 @@ def capture_snapshot(payloads: list[Any], max_payloads: int) -> list[dict[str, A
     entries = serialize_payloads(payloads)
     if not entries:
         return None
-    return trim_snapshot(entries, max_payloads)
+    return entries
 
 
 # ── 内部实现 ──────────────────────────────────────────────
@@ -211,9 +150,9 @@ def _serialize_part(part: Any) -> dict[str, Any] | None:
     """把单个 content part 序列化为字典；不可识别时返回 ``None``。"""
     type_name = type(part).__name__
     if isinstance(part, Text):
-        return {"type": "text", "text": _truncate(_strip_system_reminders(part.text))}
+        return {"type": "text", "text": _strip_system_reminders(part.text)}
     if isinstance(part, ReasoningText):
-        item: dict[str, Any] = {"type": "reasoning", "text": _truncate(part.text)}
+        item: dict[str, Any] = {"type": "reasoning", "text": part.text}
         if part.signature:
             item["signature"] = part.signature
         if part.redacted_data:
@@ -244,7 +183,7 @@ def _serialize_part(part: Any) -> dict[str, Any] | None:
         return item
     rendered = _render_unknown_part(part)
     if rendered:
-        return {"type": "text", "text": _truncate(rendered)}
+        return {"type": "text", "text": rendered}
     return None
 
 
@@ -291,7 +230,9 @@ def _deserialize_entry(entry: dict[str, Any]) -> LLMPayload | None:
                 ToolCall(
                     id=str(part.get("id", "") or ""),
                     name=str(part.get("name", "") or ""),
-                    args=part.get("args", {}) if isinstance(part.get("args"), dict) else str(part.get("args", "") or ""),
+                    args=part.get("args", {})
+                    if isinstance(part.get("args"), dict)
+                    else str(part.get("args", "") or ""),
                 )
             )
         elif part_type == "tool_result":
@@ -418,10 +359,3 @@ def _safe_text(value: Any) -> str:
         return str(value)
     except Exception:  # noqa: BLE001
         return ""
-
-
-def _truncate(text: str) -> str:
-    """裁剪过长文本。"""
-    if len(text) <= _MAX_ENTRY_CHARS:
-        return text
-    return text[:_MAX_ENTRY_CHARS].rstrip() + "..."

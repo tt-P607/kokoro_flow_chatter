@@ -31,8 +31,10 @@ from ..debug.log_formatter import log_kfc_result
 from ..execution import run_decision
 from ..protocol.response_normalizer import normalize_response
 from ..services import ProactiveService, TimeoutService
+from ..services.summary_service import SummaryService
 from ..snapshot import capture_snapshot
 from .context_builder import REQUEST_NAME, build_initial_request
+from .context_rotation import rotate_if_needed
 from .guard_hook import check_response_guard
 from .input_status import InputStatusReporter
 from .model_setup import resolve_model_set
@@ -133,6 +135,9 @@ async def execute_orchestrator(
             chatter, chat_stream, config, session, model_set
         )
         state = _LoopState(summary=SummarySynchronizer(session.history_summary))
+        SummaryService.maybe_schedule_compression(
+            session, config, chat_stream, session_store=chatter.session_store
+        )
 
         while True:
             state.summary.sync_if_changed(response, chat_stream, session.history_summary)
@@ -160,14 +165,10 @@ async def execute_orchestrator(
                 continue
 
             if turn_input.persistent_user_payload is not None:
-                state.turn_has_new_input = True
                 # 新一轮真实输入开启新的守卫重试预算
                 state.guard_retry_count = 0
                 state.guard_retry_payload = None
-                changed = session.append_context_entries(
-                    [turn_input.persistent_user_payload],
-                    config.prompt.max_context_payloads,
-                )
+                changed = session.append_context_entries([turn_input.persistent_user_payload])
                 if changed:
                     await chatter.save_session(session)
 
@@ -182,15 +183,34 @@ async def execute_orchestrator(
             transient_payloads.extend(
                 _build_guard_retry_reminders(state.guard_retry_count)
             )
+            try:
+                response, rebuilt_usables, rotated = await rotate_if_needed(
+                    chatter,
+                    response,
+                    chat_stream,
+                    config,
+                    session,
+                    model_set,
+                    transient_payloads,
+                )
+            except (ValueError, RuntimeError, OSError) as error:
+                logger.error(f"KFC 上下文轮换失败: {error}", exc_info=True)
+                yield Failure("KFC 上下文轮换失败", error)
+                return
+            if rotated:
+                usable_map = rebuilt_usables
+                state.summary = SummarySynchronizer(session.history_summary)
+                SummaryService.maybe_schedule_compression(
+                    session, config, chat_stream, session_store=chatter.session_store
+                )
             _set_external_resume_metadata(
                 response,
                 request_marker=turn_input.external_resume_request_marker,
                 source=turn_input.external_resume_source,
             )
-            # 纯文本重试的提醒随本轮请求临时注入，成功取得工具调用后自动
-            # 消失；失败的纯文本 ASSISTANT 输出同样不落主链——发送前记录
-            # 基线长度，模型仍只返回正文时直接回滚。
-            payload_baseline = len(response.payloads)
+            # 发送期间可能裁剪旧回合；失败时按发送前的主链快照恢复，
+            # 不能用发送前长度索引裁剪后的响应链。
+            payloads_before_send = list(response.payloads)
             send_target = build_request_view(response, transient_payloads)
             if config.debug.show_prompt:
                 chatter.log_prompt(send_target)
@@ -250,7 +270,7 @@ async def execute_orchestrator(
             if guard_blocked:
                 if _handle_guard_refusal(
                     response,
-                    payload_baseline,
+                    payloads_before_send,
                     state,
                     guard_evidence,
                     from_tool_call=bool(response.call_list),
@@ -265,7 +285,7 @@ async def execute_orchestrator(
                 return
             elif not response.call_list:
                 if _handle_plain_text_violation(
-                    response, payload_baseline, state, config, model_set
+                    response, payloads_before_send, state, config, model_set
                 ):
                     continue
             else:
@@ -298,12 +318,9 @@ async def execute_orchestrator(
                 session,
                 config,
                 chat_stream,
-                has_new_user_input=state.turn_has_new_input,
                 is_final_timeout=state.is_final_timeout,
             )
             state.is_final_timeout = turn_control.is_final_timeout
-            # 一批真实新消息只推进一次记忆压缩计数；工具续轮不再重复计入。
-            state.turn_has_new_input = False
 
             if turn_control.has_pending_tool_results:
                 if decision.has_failed_tool and _exceeded_retry_limit(config, state):
@@ -314,9 +331,7 @@ async def execute_orchestrator(
             # 回合闭合点：无待消化工具结果时，主链已含本轮完整 bot 输出
             # （推理 + 正文 + 工具调用 + 回执）且工具段必然闭合，捕获无损快照。
             if not turn_control.has_pending_tool_results:
-                snapshot = capture_snapshot(
-                    response.payloads, config.prompt.max_context_payloads
-                )
+                snapshot = capture_snapshot(response.payloads)
                 if snapshot is not None:
                     session.context_snapshot = snapshot
                     await chatter.save_session(session)
@@ -347,7 +362,6 @@ class _LoopState:
         "plain_text_reminders",
         "plain_text_retry_count",
         "summary",
-        "turn_has_new_input",
     )
 
     def __init__(self, summary: SummarySynchronizer) -> None:
@@ -355,7 +369,6 @@ class _LoopState:
         self.summary = summary
         self.has_pending_tool_results = False
         self.is_final_timeout = False
-        self.turn_has_new_input = False
         self.plain_text_retry_count = 0
         self.guard_retry_count = 0
         self.plain_text_reminders: list[LLMPayload] = []
@@ -492,27 +505,20 @@ def _log_missing_tool_call(response: Any, state: _LoopState) -> None:
         logger.warning(f"LLM 返回空响应（第 {attempt} 次），注入提醒后重试")
 
 
-def _rollback_failed_assistant(response: Any, payload_baseline: int) -> None:
-    """丢弃发送基线之后追加的失败 ASSISTANT 输出。
+def _rollback_failed_assistant(
+    response: Any, payloads_before_send: list[LLMPayload]
+) -> None:
+    """恢复发送前主链并清空无效响应字段。
 
     模型未返回工具调用时，本次正文不会被执行也不会真正发出，持久化
-    会让后续轮次读到"说过却无下文"的残缺历史。仅在末尾确实是本轮
-    新增的 ASSISTANT 时回滚；同时清空 ``message`` 等输出字段，防止
-    提交阶段把这段正文写进持久对话链。
+    会让后续轮次读到"说过却无下文"的残缺历史。发送时允许裁剪上下文，
+    因此必须恢复发送前快照，而非按发送前长度删掉响应链的尾部。
     """
-    payloads = response.payloads
-    if not isinstance(payloads, list):
-        return
-    if len(payloads) > payload_baseline:
-        trailing = payloads[payload_baseline:]
-        if all(payload.role == ROLE.ASSISTANT for payload in trailing):
-            del payloads[payload_baseline:]
-            response.message = ""
-            response.reasoning_content = ""
-            # 推理分段与推理正文是同一份内容的两个视图，回滚必须同时
-            # 清空，否则被拦响应仍会以分段形式留在响应对象上。
-            response.reasoning_parts = []
-            response.call_list = []
+    response.payloads = list(payloads_before_send)
+    response.message = ""
+    response.reasoning_content = ""
+    response.reasoning_parts = []
+    response.call_list = []
 
 
 def _guard_retry_payloads(state: _LoopState) -> list[LLMPayload]:
@@ -560,7 +566,7 @@ def _build_guard_retry_reminders(retry_count: int) -> list[LLMPayload]:
 
 def _handle_guard_refusal(
     response: Any,
-    payload_baseline: int,
+    payloads_before_send: list[LLMPayload],
     state: _LoopState,
     evidence: tuple[str, ...],
     *,
@@ -576,7 +582,7 @@ def _handle_guard_refusal(
 
     Args:
         response: 本轮 LLM 响应链。
-        payload_baseline: 发送前记录的主链长度基线。
+        payloads_before_send: 发送前主链的快照。
         state: 主循环可变状态。
         evidence: 守卫给出的证据标签。
         from_tool_call: 拒答是否包装在合法工具调用中，仅用于日志区分形态。
@@ -586,7 +592,7 @@ def _handle_guard_refusal(
     Returns:
         bool: True 表示主循环应重试一次，False 表示预算已耗尽、本轮收口。
     """
-    _rollback_failed_assistant(response, payload_baseline)
+    _rollback_failed_assistant(response, payloads_before_send)
     # 本次失败原因已明确为模型层拒答，格式纠正提示必须一并清掉：两种提示
     # 同时注入会把模型推向"改用工具调用复述同一份拒答"。
     state.plain_text_reminders.clear()
@@ -618,7 +624,7 @@ def _handle_guard_refusal(
 
 def _handle_plain_text_violation(
     response: Any,
-    payload_baseline: int,
+    payloads_before_send: list[LLMPayload],
     state: _LoopState,
     config: Any,
     model_set: Any,
@@ -632,7 +638,7 @@ def _handle_plain_text_violation(
 
     Args:
         response: 本轮 LLM 响应链。
-        payload_baseline: 发送前记录的主链长度基线。
+        payloads_before_send: 发送前主链的快照。
         state: 主循环可变状态。
         config: KFC 配置。
         model_set: 已解析的模型集，用于放大重试上限。
@@ -650,7 +656,7 @@ def _handle_plain_text_violation(
     if state.plain_text_retry_count < max_retries:
         _log_missing_tool_call(response, state)
         state.plain_text_retry_count += 1
-        _rollback_failed_assistant(response, payload_baseline)
+        _rollback_failed_assistant(response, payloads_before_send)
         # 纠正提醒逐条累积为多重强调信号，随每次请求临时注入；
         # 取得有效工具调用或本轮收口时一并清除。
         state.plain_text_reminders.append(
@@ -666,7 +672,7 @@ def _handle_plain_text_violation(
     # 强制收口时同样丢弃本次失败的纯文本输出：没有工具调用的
     # 正文不可能被执行成功，持久化只会让下一轮读到自相矛盾的
     # "我说过 xxx 却毫无反应"的残缺历史。
-    _rollback_failed_assistant(response, payload_baseline)
+    _rollback_failed_assistant(response, payloads_before_send)
     state.plain_text_reminders.clear()
     return False
 

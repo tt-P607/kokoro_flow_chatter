@@ -127,10 +127,7 @@ class VoiceCallHistoryHandler(BaseEventHandler):
         store = self.plugin.session_store
         async with store.lock(stream_id):
             session = await store.get_or_create(stream_id)
-            session.append_context_entries(
-                entries,
-                config.prompt.max_context_payloads,
-            )
+            session.append_context_entries(entries)
             await store.save(session)
 
         raw_count = sum(

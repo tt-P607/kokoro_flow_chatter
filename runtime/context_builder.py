@@ -12,14 +12,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from src.app.plugin_system.api.llm_api import (
-    LLMContextManager,
-    ReminderSourceSpec,
-    create_llm_request,
-)
+from src.app.plugin_system.api.llm_api import ReminderSourceSpec, create_llm_request
 from src.app.plugin_system.api.log_api import get_logger
 
 from ..context import plan_initial_context, render_initial_context
+from ..context_budget import KFCContextManager
 
 logger = get_logger("kfc_context_builder")
 
@@ -78,7 +75,7 @@ async def build_initial_request(
         model_set,
         REQUEST_NAME,
         stream_id=chatter.stream_id,
-        context_manager=LLMContextManager(
+        context_manager=KFCContextManager(
             reminder_sources=_build_reminder_sources(chatter.stream_id),
         ),
     )
@@ -88,14 +85,17 @@ async def build_initial_request(
         config=config,
         session=session,
     )
-    system_payloads, history_payloads, _has_history = await render_initial_context(
+    system_payloads, history_payloads, has_history = await render_initial_context(
         chat_stream=chat_stream,
         plan=plan,
         mental_log=session.mental_log,
         serialized_context_snapshot=session.context_snapshot,
     )
 
-    if session.context_snapshot:
+    if session.context_snapshot and not has_history:
+        session.context_snapshot = None
+        await chatter.save_session(session)
+    elif session.context_snapshot:
         logger.info(
             f"已从上下文快照恢复 {len(session.context_snapshot)} 条 transcript "
             f"(stream={chatter.stream_id[:8]})"

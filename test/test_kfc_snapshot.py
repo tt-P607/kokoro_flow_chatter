@@ -13,7 +13,6 @@ from plugins.kokoro_flow_chatter.snapshot import (  # noqa: E402
     capture_snapshot,
     deserialize_snapshot,
     serialize_payloads,
-    trim_snapshot,
 )
 from src.app.plugin_system.types import (  # noqa: E402
     Audio,
@@ -121,30 +120,29 @@ def test_serialize_strips_system_reminder_from_user() -> None:
 
 def test_capture_snapshot_none_on_empty() -> None:
     """无可捕获内容时返回 None。"""
-    assert capture_snapshot([], 30) is None
+    assert capture_snapshot([]) is None
 
 
-def test_trim_snapshot_keeps_user_head() -> None:
-    """裁剪后链头必须是 USER，且条数不超过上限。"""
-    entries = []
+def test_capture_snapshot_keeps_user_head() -> None:
+    """长原话链的快照不丢弃前缀。"""
+    payloads = []
     for index in range(10):
-        entries.append({"role": "user", "content": [{"type": "text", "text": f"u{index}"}]})
-        entries.append({"role": "assistant", "content": [{"type": "text", "text": f"a{index}"}]})
-    trimmed = trim_snapshot(entries, 5)
-    assert len(trimmed) <= 5
-    assert trimmed[0]["role"] == "user"
+        payloads.append(LLMPayload(ROLE.USER, Text(f"u{index}")))
+        payloads.append(LLMPayload(ROLE.ASSISTANT, Text(f"a{index}")))
+    snapshot = capture_snapshot(payloads)
+    assert snapshot is not None
+    assert len(snapshot) == len(payloads)
+    assert snapshot[0]["role"] == "user"
 
 
-def test_trim_snapshot_drops_leading_non_user() -> None:
-    """头部孤立 assistant 应被丢弃。"""
-    trimmed = trim_snapshot(
-        [
-            {"role": "assistant", "content": [{"type": "text", "text": "孤立"}]},
-            {"role": "user", "content": [{"type": "text", "text": "u"}]},
-        ],
-        30,
-    )
-    assert trimmed[0]["role"] == "user"
+def test_capture_snapshot_retains_leading_non_user() -> None:
+    """快照层不自行修补或裁剪原始链。"""
+    snapshot = capture_snapshot([
+        LLMPayload(ROLE.ASSISTANT, Text("孤立")),
+        LLMPayload(ROLE.USER, Text("u")),
+    ])
+    assert snapshot is not None
+    assert snapshot[0]["role"] == "assistant"
 
 
 def test_deserialize_drops_unpaired_tail_tool_calls() -> None:
@@ -211,7 +209,7 @@ def test_capture_snapshot_and_deserialize_round_trip() -> None:
         ),
         LLMPayload(ROLE.ASSISTANT, Text("好的")),
     ]
-    snapshot = capture_snapshot(payloads, 30)
+    snapshot = capture_snapshot(payloads)
     assert snapshot is not None
     restored = deserialize_snapshot(snapshot)
     assert restored is not None
@@ -233,7 +231,6 @@ def test_restore_chain_keeps_dynamic_user_and_snapshot_history() -> None:
             LLMPayload(ROLE.USER, Text("[新消息]\n你好")),
             LLMPayload(ROLE.ASSISTANT, Text("回复")),
         ],
-        30,
     )
     restored = deserialize_snapshot(snapshot)
     assert restored is not None

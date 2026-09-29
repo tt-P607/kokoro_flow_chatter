@@ -68,6 +68,8 @@ def _collect_payload_text(payload: LLMPayload) -> str:
 async def build_system_prompt(
     chat_stream: ChatStream,
     extra_vars: dict[str, str] | None = None,
+    *,
+    template_name: str = _SYSTEM_TEMPLATE_NAME,
 ) -> str:
     """构建稳定的系统提示词。
 
@@ -77,13 +79,14 @@ async def build_system_prompt(
     Args:
         chat_stream: 当前聊天流。
         extra_vars: 额外模板变量，如工具说明、预约状态。
+        template_name: 注册的系统提示词模板名，缺省为主对话模板。
 
     Returns:
         str: 渲染后的系统提示词；模板缺失时返回空串。
     """
     from ..prompts.modules import build_mental_log_hint
 
-    template_base = get_template(_SYSTEM_TEMPLATE_NAME)
+    template_base = get_template(template_name)
     if not template_base:
         return ""
 
@@ -105,6 +108,18 @@ async def build_system_prompt(
     )
 
 
+async def build_diary_system_prompt(chat_stream: ChatStream) -> str:
+    """使用同一套人格配置渲染不包含对话工具协议的日记系统提示词。"""
+    from ..prompts.modules import DIARY_SYSTEM_PROMPT_NAME
+
+    prompt = await build_system_prompt(
+        chat_stream, template_name=DIARY_SYSTEM_PROMPT_NAME
+    )
+    if not prompt.strip():
+        raise ValueError("日记系统提示词未注册或为空")
+    return prompt
+
+
 async def render_initial_context(
     *,
     chat_stream: ChatStream,
@@ -115,30 +130,24 @@ async def render_initial_context(
         [ChatStream, dict[str, str] | None], Awaitable[str]
     ]
     | None = None,
-    build_fused_narrative_fn: Callable[[ChatStream, Any, float | None], str]
-    | None = None,
 ) -> tuple[list[LLMPayload], list[LLMPayload], bool]:
     """渲染 ``execute()`` 启动所需的初始 payload。
 
     产出分为两组：``system_payloads`` 只含稳定系统提示词；
-    ``history_payloads`` 首项是「当前通道 + 记忆摘要 + 融合叙事」合并的动态
-    背景，其余是从唯一持久快照还原的真实对话。先说明当前背景、再展开
-    过去对话，语义顺序更自然。
+    ``history_payloads`` 首项包含通道、日记和框架限定的历史时间线，
+    其余是从持久快照还原的活动原话链。
 
     Args:
         chat_stream: 当前聊天流。
         plan: 初始上下文规划结果。
-        mental_log: 心理活动流，供融合叙事使用。
+        mental_log: 会话心理活动流，和框架历史消息共同构建时间线。
         serialized_context_snapshot: 唯一持久 transcript 快照。
         build_system_prompt_fn: 系统提示词构建器，默认用本模块实现。
-        build_fused_narrative_fn: 融合叙事构建器，默认用本模块实现。
 
     Returns:
         tuple: ``(system_payloads, history_payloads, has_history)``。
     """
     system_prompt_builder = build_system_prompt_fn or build_system_prompt
-    narrative_builder = build_fused_narrative_fn or build_fused_narrative
-
     system_prompt = await system_prompt_builder(chat_stream, plan.system_extra_vars)
     system_payloads = [LLMPayload(ROLE.SYSTEM, Text(system_prompt))]
 
@@ -150,10 +159,10 @@ async def render_initial_context(
     if summary_payload is not None:
         dynamic_parts.append(_collect_payload_text(summary_payload))
 
-    history_text = narrative_builder(chat_stream, mental_log)
-    if not history_text:
-        history_text = _collect_payload_text(build_current_time_payload())
-    dynamic_parts.append(history_text)
+    history_text = build_fused_narrative(chat_stream, mental_log)
+    dynamic_parts.append(
+        history_text or _collect_payload_text(build_current_time_payload())
+    )
 
     dynamic_background = LLMPayload(
         ROLE.USER,
@@ -162,10 +171,10 @@ async def render_initial_context(
             f"{SECTION_SEPARATOR.join(dynamic_parts)}"
         ),
     )
-    restored_payloads = deserialize_snapshot(serialized_context_snapshot) or []
-    history_payloads = [dynamic_background, *restored_payloads]
+    restored_payloads = deserialize_snapshot(serialized_context_snapshot)
+    history_payloads = [dynamic_background, *(restored_payloads or [])]
 
-    return system_payloads, history_payloads, True
+    return system_payloads, history_payloads, restored_payloads is not None
 
 
 def render_user_payload(

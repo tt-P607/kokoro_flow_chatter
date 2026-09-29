@@ -14,6 +14,7 @@ from src.core.config import get_core_config  # 公开 API 尚未提供人格配�
 from src.core.prompt import min_len, optional, wrap  # 无状态的模板策略工具
 
 from .templates import (
+    KFC_DIARY_SYSTEM_PROMPT,
     KFC_PROACTIVE_DECISION_TOOL_CALLING,
     KFC_PROACTIVE_PROMPT,
     KFC_REPLY_MODE_TOOL_CALLING,
@@ -22,6 +23,7 @@ from .templates import (
 )
 
 SYSTEM_PROMPT_NAME = "kfc_system_prompt"
+DIARY_SYSTEM_PROMPT_NAME = "kfc_diary_system_prompt"
 PROACTIVE_PROMPT_NAME = "kfc_proactive_prompt"
 
 _BACKGROUND_STORY_MIN_LEN = 10
@@ -40,27 +42,36 @@ def register_kfc_prompts() -> None:
     """
     personality = get_core_config().personality
 
+    personality_policies = {
+        "nickname": optional(personality.nickname),
+        "alias_names": optional("、".join(personality.alias_names)),
+        "personality_core": optional(personality.personality_core),
+        "personality_side": optional(personality.personality_side),
+        "identity": optional(personality.identity),
+        "background_story": optional(personality.background_story)
+        .then(min_len(_BACKGROUND_STORY_MIN_LEN))
+        .then(wrap("# 背景故事\n", _BACKGROUND_STORY_SUFFIX)),
+        "reply_style": optional(personality.reply_style),
+        "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
+        "negative_behaviors": optional("\n".join(personality.negative_behaviors)),
+    }
     get_or_create(
         name=SYSTEM_PROMPT_NAME,
         template=KFC_SYSTEM_PROMPT,
         policies={
-            "nickname": optional(personality.nickname),
-            "alias_names": optional("、".join(personality.alias_names)),
-            "personality_core": optional(personality.personality_core),
-            "personality_side": optional(personality.personality_side),
-            "identity": optional(personality.identity),
-            "background_story": optional(personality.background_story)
-            .then(min_len(_BACKGROUND_STORY_MIN_LEN))
-            .then(wrap("# 背景故事\n", _BACKGROUND_STORY_SUFFIX)),
-            "reply_style": optional(personality.reply_style),
-            "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
-            "negative_behaviors": optional("\n".join(personality.negative_behaviors)),
+            **personality_policies,
             "custom_decision_prompt": optional(""),
             "scene_state_info": optional(""),
             "scheduled_proactive_info": optional(""),
             # 实际值由初始上下文规划注入，此处提供 tool calling 兜底
             "reply_mode_instruction": optional(KFC_REPLY_MODE_TOOL_CALLING),
         },
+    )
+
+    get_or_create(
+        name=DIARY_SYSTEM_PROMPT_NAME,
+        template=KFC_DIARY_SYSTEM_PROMPT,
+        policies=personality_policies,
     )
 
     get_or_create(

@@ -27,7 +27,6 @@ from ..context import (
 from ..domain.decision import build_experience_snapshot
 from ..domain.turn_trigger import TurnTrigger, classify_turn_trigger
 from ..models import KFCEventType, WaitingConfig
-from ..services import SummaryService
 from .unread_policy import format_unread_messages, prefer_real_unreads
 
 if TYPE_CHECKING:
@@ -357,7 +356,6 @@ async def commit_turn_decision(
     config: KFCConfig,
     chat_stream: ChatStream,
     *,
-    has_new_user_input: bool,
     is_final_timeout: bool,
 ) -> TurnControlResult:
     """把本轮决策提交到会话，并给出主循环的下一步指令。
@@ -369,7 +367,6 @@ async def commit_turn_decision(
         session: 当前会话。
         config: KFC 配置。
         chat_stream: 当前聊天流。
-        has_new_user_input: 本轮是否由真实新用户消息触发。
         is_final_timeout: 本轮是否为最后一次超时。
 
     Returns:
@@ -384,15 +381,6 @@ async def commit_turn_decision(
     )
 
     await chatter.save_session(session)
-    _schedule_turn_compression(
-        chatter,
-        decision,
-        response,
-        session,
-        config,
-        chat_stream,
-        has_new_user_input=has_new_user_input,
-    )
 
     if not decision.has_meaningful_action:
         raw_message = (response.message or "").strip()
@@ -491,39 +479,3 @@ def _final_signal(
     if snapshot is not None:
         signal.step_data = {"experience_snapshot": snapshot}
     return signal
-
-
-def _schedule_turn_compression(
-    chatter: KokoroFlowChatter,
-    decision: Decision,
-    response: Any,
-    session: KFCSession,
-    config: KFCConfig,
-    chat_stream: ChatStream,
-    *,
-    has_new_user_input: bool,
-) -> bool:
-    """按已完成的真实对话轮次调度记忆压缩。
-
-    Returns:
-        bool: 是否推进了轮次计数或调度了压缩。
-    """
-    if not has_new_user_input:
-        return False
-
-    assistant_text = (response.message or "").strip() or decision.reply_text
-    serialized_tool_calls = [
-        {"name": call.name, "args": call.args, "id": call.id}
-        for call in response.call_list or []
-    ]
-    if not assistant_text and not serialized_tool_calls:
-        return False
-
-    session.compress_round_count += 1
-    SummaryService.maybe_schedule_compression(
-        session,
-        config,
-        chat_stream,
-        session_store=chatter.session_store,
-    )
-    return True

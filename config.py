@@ -257,47 +257,11 @@ class KFCConfig(BaseConfig):
             ge=1,
             le=10000,
         )
-        max_context_payloads: int = Field(
-            default=100,
-            description="LLM 快照容量；达到 80% 时批量裁剪并保留约末尾 20%",
-            ge=2,
-            le=1000,
-        )
-        compress_every_n_rounds: int = Field(
-            default=50,
-            description="每完成 N 轮对话触发一次近期记忆压缩（1 轮 = 1 次 USER→ASSISTANT 交换）",
-            ge=0,
-            le=10000,
-        )
-        compress_days_window: float = Field(
-            default=3.0,
-            description="压缩时覆盖的历史时间窗口（天），只对该窗口内的消息做摘要",
-            gt=0.0,
-            le=365.0,
-        )
-        min_compress_interval_minutes: float = Field(
-            default=120.0,
-            description="两次压缩之间的最短间隔（分钟），防止频繁触发",
-            ge=0.0,
-            le=525600.0,
-        )
-        compress_min_chars: int = Field(
-            default=800,
-            description="近期记忆摘要的最小字数（写入压缩指令，引导 LLM 控制摘要长度下限）",
-            ge=0,
-            le=100000,
-        )
-        compress_max_chars: int = Field(
-            default=1200,
-            description="近期记忆摘要的最大字数（写入压缩指令，引导 LLM 控制摘要长度上限）",
-            ge=0,
-            le=100000,
-        )
         compress_model_task: str = Field(
             default="actor",
             description=(
-                "近期记忆压缩使用的 LLM 模型任务（对应 model.toml 中的 task）。"
-                "独立于主对话模型配置，可选择更高性价比的模型用于摘要生成。"
+                "封存段日记压缩使用的 LLM 模型任务（对应 model.toml 中的 task）。"
+                "独立于主对话模型配置。"
             ),
         )
 
