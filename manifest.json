@@ -9,10 +9,10 @@
     "prompt_api": "1.0.0",
     "send_api": "1.0.0",
     "storage_api": "1.0.0",
-    "stream_api": "1.0.0"
+    "stream_api": "2.0.0"
   },
   "display_name": "KokoroFlow 对话引擎",
-  "version": "2.6.6",
+  "version": "2.6.7",
   "description": "KokoroFlow 对话引擎 — 基于心理活动流的私聊特化聊天器",
   "author": "言柒",
   "license": "AGPL-v3.0",
