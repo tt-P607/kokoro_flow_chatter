@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 from src.app.plugin_system.api.llm_api import LLMContextManager
-from src.app.plugin_system.types import LLMPayload
+from src.app.plugin_system.types import LLMPayload, ROLE
 from src.kernel.llm.context_budget import compute_effective_context_budget
 from src.kernel.llm.token_counter import count_payload_tokens
 
@@ -34,8 +35,23 @@ def should_rotate(payloads: list[LLMPayload], model_set: Any) -> bool:
     return payload_tokens(payloads, model_set) >= context_budget(model_set) * _ROTATION_RATIO
 
 
+@dataclass(slots=True)
 class KFCContextManager(LLMContextManager):
     """保留框架 reminder 与结构校验，但禁止请求层静默裁剪。"""
+
+    background_payloads: list[LLMPayload] = field(default_factory=list)
+    """仅发送视图使用的动态背景，不属于持久对话链。"""
+
+    def add_payload(
+        self,
+        payloads: list[LLMPayload],
+        payload: LLMPayload,
+        position: int | None = None,
+    ) -> list[LLMPayload]:
+        """保留 USER 条目边界；reminder 注入与结构校验仍由框架负责。"""
+        if position is None and payload.role == ROLE.USER:
+            position = len(payloads)
+        return LLMContextManager.add_payload(self, payloads, payload, position=position)
 
     async def prepare_payloads_for_model(
         self,

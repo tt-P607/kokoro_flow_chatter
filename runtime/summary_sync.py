@@ -15,7 +15,7 @@ from src.app.plugin_system.types import ROLE, Text
 
 from ..context.renderer import SECTION_SEPARATOR
 from ..context.sources.history_source import build_history_summary_payload
-from ..snapshot import DYNAMIC_BACKGROUND_MARKER
+from ..context_budget import KFCContextManager
 
 if TYPE_CHECKING:
     from src.app.plugin_system.types import ChatStream
@@ -94,19 +94,14 @@ def _replace_summary_section(
     if not new_summary_text:
         return False
 
-    payloads = response.payloads
+    context_manager = getattr(response, "context_manager", None)
+    if not isinstance(context_manager, KFCContextManager):
+        return False
+    payloads = context_manager.background_payloads
     dynamic_payload = next(
         (
             payload for payload in payloads
             if payload.role == ROLE.USER
-            and any(
-                isinstance(part, Text) and part.text.startswith(DYNAMIC_BACKGROUND_MARKER)
-                for part in (
-                    payload.content
-                    if isinstance(payload.content, list)
-                    else [payload.content]
-                )
-            )
         ),
         None,
     )

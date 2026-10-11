@@ -3,7 +3,7 @@
 ``KFCSession`` 保存单个聊天流的全部跨轮状态：等待配置、心理活动流、
 唯一持久 transcript 快照、近期记忆摘要、备忘录与主动发起预约。
 ``KFCSessionStore`` 负责按 ``stream_id`` 索引这些会话，并通过
-``JSONStore`` 落盘到 ``data/kokoro_flow_chatter/sessions/``。
+``JSONStore`` 按平台分目录、以真实用户 ID 命名状态和上下文文件。
 
 所有跨协程的读写都应通过 ``async with store.lock(stream_id)`` 串行化，
 避免 Scheduler 回调与 ``execute()`` 主循环竞态。
@@ -19,10 +19,12 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.storage_api import JSONStore
+from src.app.plugin_system.api.stream_api import get_stream
 
 from src.app.plugin_system.types import LLMPayload
 
@@ -33,12 +35,9 @@ from .snapshot import serialize_payloads
 logger = get_logger("kfc_session")
 
 _STORAGE_DIR = "data/kokoro_flow_chatter/sessions"
-"""会话文件所在目录，按 ``stream_id`` 分文件存放。"""
+"""状态与上下文目录，按平台和真实用户 ID 分文件存放。"""
 
 _FORMAT_VERSION = 2
-
-_INDEX_FILENAME = "_index.json"
-"""可读索引文件名，维护 ``stream_id`` → 平台/用户 的映射便于人工排查。"""
 
 _LOCK_CLEANUP_THRESHOLD = 100
 """锁字典超过此规模时触发一次不活跃锁清理。"""
@@ -73,6 +72,9 @@ class KFCSession:
     context_snapshot: list[dict[str, Any]] | None = None
     """唯一持久对话状态（来自闭合回合的主链快照）。动态背景、备忘录和
     其他当前请求注入不进入这里。"""
+
+    completed_context_length: int = 0
+    """已完成回合覆盖的快照前缀长度；未标记的旧缓存不推断边界。"""
 
     sealed_segments: list[list[dict[str, Any]]] = field(default_factory=list)
     """已封存待写入日记的完整对话段，与活动链同文件保存。"""
@@ -210,6 +212,8 @@ class KFCSession:
     def append_context_entries(
         self,
         payloads: list[LLMPayload],
+        *,
+        complete: bool = False,
     ) -> bool:
         """把合法的持久 payload 追加进唯一 transcript 快照。
 
@@ -217,10 +221,13 @@ class KFCSession:
         当前请求内容走 RequestView，不能进入本方法。
         """
         entries = list(self.context_snapshot or [])
+        previous_length = len(entries)
         entries.extend(serialize_payloads(payloads))
         if not entries or entries == self.context_snapshot:
             return False
         self.context_snapshot = entries
+        if complete and self.completed_context_length == previous_length:
+            self.completed_context_length = len(entries)
         return True
 
     # ── 备忘录管理 ────────────────────────────────────────
@@ -340,7 +347,11 @@ class KFCSession:
         """序列化独立的对话缓存。"""
         return {
             "version": _FORMAT_VERSION,
+            "user_id": self.user_id,
+            "stream_id": self.stream_id,
+            "platform": self.platform,
             "context_snapshot": self.context_snapshot,
+            "completed_context_length": self.completed_context_length,
             "sealed_segments": self.sealed_segments,
             "history_summary": self.history_summary,
         }
@@ -408,6 +419,8 @@ class KFCSessionStore:
         self._context_store: Any = None
         self._legacy_store: Any = None
         self._store_initialized = False
+        self._store_init_lock = asyncio.Lock()
+        self._file_locations: dict[str, tuple[str, str]] = {}
 
     # ── 并发控制 ──────────────────────────────────────────
 
@@ -493,10 +506,16 @@ class KFCSessionStore:
         if self._json_store is None or self._context_store is None:
             raise RuntimeError("KFC 会话存储不可用")
 
-        await self.save_context(session)
-        await _atomic_save(self._json_store, session.stream_id, session.to_dict())
+        location = await self._session_location(session)
+        previous = self._file_locations.get(session.stream_id)
+        state_store, context_store = self._stores_for(location)
+        await self._check_file_owner(state_store, location[1], session.stream_id)
+        await self._check_file_owner(context_store, location[1], session.stream_id)
+        await _atomic_save(context_store, location[1], session.context_to_dict())
+        await _atomic_save(state_store, location[1], session.to_dict())
+        await self._remove_previous_files(previous, location)
+        self._file_locations[session.stream_id] = location
         self._sessions[session.stream_id] = session
-        await self._update_index(session)
 
         if len(self._locks) > _LOCK_CLEANUP_THRESHOLD:
             cleaned = self.cleanup_inactive_locks()
@@ -504,11 +523,19 @@ class KFCSessionStore:
                 logger.debug(f"清理了 {cleaned} 个不活跃的会话锁")
 
     async def save_context(self, session: KFCSession) -> None:
-        """原子提交日记、封存队列与活动链，不改动其他状态文件。"""
+        """原子提交上下文；文件身份变化时同时保存并改名状态文件。"""
         await self._ensure_store()
         if self._context_store is None:
             raise RuntimeError("KFC 上下文存储不可用")
-        await _atomic_save(self._context_store, session.stream_id, session.context_to_dict())
+        location = await self._session_location(session)
+        previous = self._file_locations.get(session.stream_id)
+        if previous is not None and previous != location:
+            await self.save(session)
+            return
+        _, context_store = self._stores_for(location)
+        await self._check_file_owner(context_store, location[1], session.stream_id)
+        await _atomic_save(context_store, location[1], session.context_to_dict())
+        self._file_locations.setdefault(session.stream_id, location)
         self._sessions[session.stream_id] = session
 
     def get_all_cached(self) -> dict[str, KFCSession]:
@@ -516,16 +543,12 @@ class KFCSessionStore:
         return dict(self._sessions)
 
     async def list_all_stream_ids(self) -> list[str]:
-        """列出所有已持久化的 ``stream_id``（跳过 ``_`` 开头的辅助文件）。"""
+        """从会话文件的身份字段列出内部流 ID，不把账号文件名当作流 ID。"""
         await self._ensure_store()
         if self._json_store is None:
             return []
-        try:
-            all_ids = await self._json_store.list_all()
-        except Exception as error:
-            logger.warning(f"会话列举失败: {error}")
-            return []
-        return [sid for sid in all_ids if not sid.startswith("_")]
+        await self._discover_files()
+        return list(self._file_locations)
 
     # ── 内部实现 ──────────────────────────────────────────
 
@@ -533,18 +556,102 @@ class KFCSessionStore:
         """延迟初始化 ``JSONStore``。"""
         if self._store_initialized:
             return
-        self._store_initialized = True
-        try:
-            from src.app.plugin_system.api.storage_api import JSONStore
-
+        async with self._store_init_lock:
+            if self._store_initialized:
+                return
             self._legacy_store = JSONStore(storage_dir=_STORAGE_DIR)
             self._json_store = JSONStore(storage_dir=Path(_STORAGE_DIR) / "state")
             self._context_store = JSONStore(storage_dir=Path(_STORAGE_DIR) / "context")
-        except ImportError:
-            self._json_store = None
+            await self._discover_files()
+            for store in (self._legacy_store, self._json_store):
+                index = store.get_storage_dir() / "_index.json"
+                await asyncio.to_thread(index.unlink, missing_ok=True)
+            self._store_initialized = True
+
+    async def _discover_files(self) -> None:
+        """从状态或独立快照发现文件位置，兼容已落盘的哈希文件名。"""
+        locations: dict[str, tuple[str, str]] = {}
+        known_locations: set[tuple[str, str]] = set()
+        for root in (self._json_store, self._context_store):
+            directory = root.get_storage_dir()
+            paths = await asyncio.to_thread(lambda: list(directory.rglob("*.json")))
+            for path in paths:
+                if path.name == "_index.json":
+                    continue
+                parts = path.relative_to(directory).parts
+                if len(parts) > 2:
+                    continue
+                platform = parts[0] if len(parts) == 2 else ""
+                location = (platform, path.stem)
+                if location in known_locations:
+                    continue
+                try:
+                    data = await JSONStore(path.parent).load(path.stem)
+                except json.JSONDecodeError:
+                    data = None
+                stream_id = data.get("stream_id") if isinstance(data, dict) else None
+                if not isinstance(stream_id, str) or not stream_id:
+                    if platform:
+                        continue
+                    stream_id = path.stem
+                locations.setdefault(stream_id, location)
+                known_locations.add(location)
+        self._file_locations = locations
+
+    def _stores_for(self, location: tuple[str, str]) -> tuple[JSONStore, JSONStore]:
+        """返回平台目录下相互独立的状态和上下文存储。"""
+        platform, _ = location
+        return (
+            JSONStore(self._json_store.get_storage_dir() / platform),
+            JSONStore(self._context_store.get_storage_dir() / platform),
+        )
+
+    async def _session_location(self, session: KFCSession) -> tuple[str, str]:
+        """从会话或公开聊天流 API 获取真实用户身份并校验路径。"""
+        if not session.user_id:
+            stream = await get_stream(session.stream_id)
+            message = stream.context.current_message if stream is not None else None
+            if (
+                stream is None or message is None
+                or not message.sender_id or message.sender_id == stream.bot_id
+            ):
+                raise ValueError("KFC 会话缺少真实用户 ID，无法命名缓存文件")
+            session.user_id = message.sender_id
+            session.platform = stream.platform
+        for value in (session.user_id, session.platform):
+            if not value:
+                continue
+            if (
+                any(character in '<>:"/\\|?*' or ord(character) < 32 for character in value)
+                or ".." in value
+                or value.endswith((".", " "))
+                or PureWindowsPath(value).is_reserved()
+                or value == "_index"
+            ):
+                raise ValueError("KFC 平台或用户 ID 不能作为安全的文件名")
+        return session.platform, session.user_id
+
+    async def _check_file_owner(
+        self, store: JSONStore, name: str, stream_id: str
+    ) -> None:
+        """拒绝覆盖属于其他聊天流的同名账号文件。"""
+        data = await store.load(name)
+        if data is not None and (
+            not isinstance(data, dict) or data.get("stream_id") != stream_id
+        ):
+            raise ValueError("KFC 账号缓存已属于其他聊天流，拒绝覆盖")
+
+    async def _remove_previous_files(
+        self, previous: tuple[str, str] | None, location: tuple[str, str]
+    ) -> None:
+        """新文件成功落盘后才删除同一会话的旧文件。"""
+        if previous is None or previous == location:
+            return
+        for store in self._stores_for(previous):
+            await store.delete(previous[1])
 
     async def _load_from_disk(self, stream_id: str) -> KFCSession | None:
-        """分别加载状态与上下文；无效快照不影响独立的日记和封存段。"""
+        """分别加载状态与上下文，清空损坏字段并落盘保留有效内容。"""
         await self._ensure_store()
         if self._json_store is None:
             return None
@@ -553,7 +660,9 @@ class KFCSessionStore:
             logger.error(f"旧版 KFC 会话缓存格式不兼容，删除 (stream={stream_id[:8]})")
             await self._legacy_store.delete(stream_id)
 
-        data = await self._load_part(self._json_store, stream_id, "状态")
+        previous = self._file_locations.get(stream_id, ("", stream_id))
+        state_store, context_store = self._stores_for(previous)
+        data = await self._load_part(state_store, previous[1], "状态")
         session = KFCSession(user_id="", stream_id=stream_id)
         session.mental_log = MentalLog(max_entries=self._max_log_entries)
         if data is not None:
@@ -561,28 +670,53 @@ class KFCSessionStore:
                 session = KFCSession.from_dict(data, max_log_entries=self._max_log_entries)
             except (ValueError, TypeError, KeyError) as error:
                 logger.error(f"KFC 状态格式错误，删除 (stream={stream_id[:8]}): {error}")
-                await self._json_store.delete(stream_id)
+                await state_store.delete(previous[1])
                 data = None
 
         has_context = False
+        context_changed = False
+        context: dict[str, Any] | None = None
         if self._context_store is not None:
-            context = await self._load_part(self._context_store, stream_id, "上下文")
+            context = await self._load_part(context_store, previous[1], "上下文")
             if context is not None:
+                if data is None:
+                    session.user_id = context.get("user_id", "")
+                    session.platform = context.get("platform", "")
                 summary = context.get("history_summary")
                 if isinstance(summary, str):
                     session.history_summary = summary
                     has_context = True
                 else:
-                    logger.error(f"KFC 日记格式错误，跳过 (stream={stream_id[:8]})")
+                    context["history_summary"] = ""
+                    context_changed = True
+                    logger.warning(f"KFC 日记格式错误，清空 (stream={stream_id[:8]})")
 
                 try:
                     entries = context["context_snapshot"]
                     if entries is not None and not _is_complete_snapshot(entries):
                         raise ValueError("无效对话快照")
                     session.context_snapshot = entries
+                    completed_length = context.get("completed_context_length", 0)
+                    if (
+                        type(completed_length) is int
+                        and 0 <= completed_length <= len(entries or [])
+                        and (
+                            completed_length == 0
+                            or entries is not None
+                            and _is_complete_snapshot(entries[:completed_length])
+                            and entries[completed_length - 1]["role"] != "user"
+                        )
+                    ):
+                        session.completed_context_length = completed_length
+                    else:
+                        context["completed_context_length"] = 0
+                        context_changed = True
                     has_context = True
                 except (ValueError, TypeError, KeyError) as error:
-                    logger.error(f"KFC 对话快照格式错误，跳过 (stream={stream_id[:8]}): {error}")
+                    context["context_snapshot"] = None
+                    context["completed_context_length"] = 0
+                    context_changed = True
+                    logger.warning(f"KFC 对话快照格式错误，清空 (stream={stream_id[:8]}): {error}")
 
                 try:
                     sealed = context["sealed_segments"]
@@ -594,8 +728,32 @@ class KFCSessionStore:
                     session.sealed_segments = sealed
                     has_context = True
                 except (ValueError, TypeError, KeyError) as error:
-                    logger.error(f"KFC 封存段格式错误，跳过 (stream={stream_id[:8]}): {error}")
-        return session if data is not None or has_context else None
+                    context["sealed_segments"] = []
+                    context_changed = True
+                    logger.warning(f"KFC 封存段格式错误，清空 (stream={stream_id[:8]}): {error}")
+                if context_changed:
+                    await _atomic_save(context_store, previous[1], context)
+                    has_context = True
+        if data is None and not has_context:
+            return None
+        if session.user_id:
+            location = await self._session_location(session)
+            if location != previous:
+                new_state, new_context = self._stores_for(location)
+                await self._check_file_owner(new_state, location[1], stream_id)
+                await self._check_file_owner(new_context, location[1], stream_id)
+                if context is not None:
+                    context.update({
+                        "user_id": session.user_id,
+                        "stream_id": stream_id,
+                        "platform": session.platform,
+                    })
+                    await _atomic_save(new_context, location[1], context)
+                if data is not None:
+                    await _atomic_save(new_state, location[1], data)
+                await self._remove_previous_files(previous, location)
+                self._file_locations[stream_id] = location
+        return session
 
     async def _load_part(
         self, store: Any, stream_id: str, label: str
@@ -613,32 +771,8 @@ class KFCSessionStore:
             await store.delete(stream_id)
             return None
 
-    async def _update_index(self, session: KFCSession) -> None:
-        """刷新可读索引文件，便于人工对照文件名与账号。"""
-        if self._json_store is None:
-            return
-
-        index_path = self._json_store.get_storage_dir() / _INDEX_FILENAME
-        try:
-            raw = await asyncio.to_thread(index_path.read_bytes)
-            index: dict[str, dict[str, str]] = json.loads(raw)
-        except (FileNotFoundError, json.JSONDecodeError):
-            index = {}
-
-        index[session.stream_id] = {
-            "platform": session.platform,
-            "user_id": session.user_id,
-        }
-
-        try:
-            payload = json.dumps(index, ensure_ascii=False, indent=2).encode("utf-8")
-            await asyncio.to_thread(index_path.write_bytes, payload)
-        except Exception as error:
-            logger.debug(f"会话索引写入失败: {error}")
-
-
 async def _atomic_save(store: Any, stream_id: str, data: dict[str, Any]) -> None:
-    """在同目录写入临时文件后原子替换单份会话文件。"""
+    """原子替换会话文件；取消时等写盘线程结束再传播取消。"""
     def write() -> None:
         directory = store.get_storage_dir()
         directory.mkdir(parents=True, exist_ok=True)
@@ -657,7 +791,16 @@ async def _atomic_save(store: Any, stream_id: str, data: dict[str, Any]) -> None
             if temporary is not None and os.path.exists(temporary):
                 os.unlink(temporary)
 
-    await asyncio.to_thread(write)
+    future = asyncio.get_running_loop().run_in_executor(None, write)
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(future)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def _is_complete_snapshot(entries: Any) -> bool:

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -27,6 +29,7 @@ from plugins.kokoro_flow_chatter.context.sources.plugin_source import (  # noqa:
 )
 from plugins.kokoro_flow_chatter.context.types import InitialContextPlan  # noqa: E402
 from plugins.kokoro_flow_chatter.config import KFCConfig  # noqa: E402
+from plugins.kokoro_flow_chatter.context_budget import KFCContextManager
 from plugins.kokoro_flow_chatter.handlers.voice_call_history_handler import (  # noqa: E402
     VoiceCallHistoryHandler,
 )
@@ -47,6 +50,7 @@ from plugins.kokoro_flow_chatter.snapshot import (  # noqa: E402
 )
 from plugins.kokoro_flow_chatter.runtime.request_view import (  # noqa: E402
     _without_transient_payloads,
+    build_request_view,
 )
 from plugins.kokoro_flow_chatter.runtime import context_builder  # noqa: E402
 from plugins.kokoro_flow_chatter.runtime.summary_sync import SummarySynchronizer  # noqa: E402
@@ -62,21 +66,258 @@ from src.app.plugin_system.types import (  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_session_files_use_platform_user_ids(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """状态与快照以平台用户 ID 命名，不生成账号索引。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    session = KFCSession(user_id="10001", stream_id="stream-1", platform="qq")
+    session.history_summary = "已有日记"
+    session.scheduled_proactive_at = 123.0
+    session.context_snapshot = [
+        {"role": "user", "content": [{"type": "text", "text": "原话"}]}
+    ]
+    await KFCSessionStore().save(session)
+
+    assert (directory / "state" / "qq" / "10001.json").is_file()
+    assert (directory / "context" / "qq" / "10001.json").is_file()
+    assert not list(directory.rglob("_index.json"))
+    assert not list(directory.rglob("stream-1.json"))
+
+    restarted = KFCSessionStore()
+    assert await restarted.list_all_stream_ids() == [session.stream_id]
+    loaded = await restarted.peek(session.stream_id)
+    assert loaded is not None
+    assert restarted.get_all_cached() == {}
+    assert loaded.user_id == session.user_id
+    assert loaded.platform == session.platform
+    assert loaded.history_summary == session.history_summary
+    assert loaded.context_snapshot == session.context_snapshot
+    assert loaded.scheduled_proactive_at == session.scheduled_proactive_at
+
+
+@pytest.mark.asyncio
+async def test_same_user_id_is_isolated_by_platform(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """不同平台的同名账号不会覆盖彼此的日记与快照。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    store = KFCSessionStore()
+    for platform in ("qq", "telegram"):
+        await store.save(KFCSession(
+            user_id="10001", stream_id=f"stream-{platform}",
+            platform=platform, history_summary=platform,
+        ))
+
+    restarted = KFCSessionStore()
+    assert set(await restarted.list_all_stream_ids()) == {"stream-qq", "stream-telegram"}
+    for platform in ("qq", "telegram"):
+        loaded = await restarted.get(f"stream-{platform}")
+        assert loaded is not None
+        assert loaded.history_summary == platform
+        assert (directory / "state" / platform / "10001.json").is_file()
+        assert (directory / "context" / platform / "10001.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_hash_named_cache_is_renamed_without_losing_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """已有双文件缓存改名后，原话、封存段、日记和预约均可重启恢复。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    session = KFCSession(user_id="10001", stream_id="stream-legacy", platform="qq")
+    session.history_summary = "已有日记"
+    session.scheduled_proactive_at = 123.0
+    session.context_snapshot = [
+        {"role": "user", "content": [{"type": "text", "text": "原话"}]}
+    ]
+    session.sealed_segments = [session.context_snapshot]
+    old_context = session.context_to_dict()
+    for field in ("user_id", "stream_id", "platform"):
+        old_context.pop(field)
+    for part, data in (("state", session.to_dict()), ("context", old_context)):
+        parent = directory / part
+        parent.mkdir(parents=True)
+        (parent / f"{session.stream_id}.json").write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+    (directory / "state" / "_index.json").write_text("{}", encoding="utf-8")
+
+    loaded = await KFCSessionStore().get(session.stream_id)
+    assert loaded is not None
+    assert loaded.history_summary == session.history_summary
+    assert loaded.context_snapshot == session.context_snapshot
+    assert loaded.sealed_segments == session.sealed_segments
+    assert loaded.scheduled_proactive_at == session.scheduled_proactive_at
+    assert not list(directory.rglob(f"{session.stream_id}.json"))
+    assert not list(directory.rglob("_index.json"))
+
+    restarted = await KFCSessionStore().get(session.stream_id)
+    assert restarted is not None
+    assert restarted.history_summary == session.history_summary
+    assert restarted.sealed_segments == session.sealed_segments
+    assert (directory / "state" / "qq" / "10001.json").is_file()
+    assert (directory / "context" / "qq" / "10001.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_context_only_save_resolves_user_from_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """首次通话回填或后台日记可从公开流 API 获取缓存命名所需身份。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    monkeypatch.setattr(session_module, "get_stream", AsyncMock(return_value=SimpleNamespace(
+        platform="qq", bot_id="bot",
+        context=SimpleNamespace(current_message=SimpleNamespace(sender_id="10001")),
+    )))
+    session = KFCSession(user_id="", stream_id="stream-1", history_summary="已有日记")
+    await KFCSessionStore().save_context(session)
+
+    assert (directory / "context" / "qq" / "10001.json").is_file()
+    assert not list((directory / "state").rglob("*.json"))
+    loaded = await KFCSessionStore().get(session.stream_id)
+    assert loaded is not None
+    assert loaded.user_id == "10001"
+    assert loaded.history_summary == session.history_summary
+
+
+@pytest.mark.asyncio
+async def test_old_session_identity_is_resolved_before_context_only_rename(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """旧状态缺身份时，首次上下文写入必须同时改名两份缓存。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    monkeypatch.setattr(session_module, "get_stream", AsyncMock(return_value=SimpleNamespace(
+        platform="qq", bot_id="bot",
+        context=SimpleNamespace(current_message=SimpleNamespace(sender_id="10001")),
+    )))
+    session = KFCSession(user_id="", stream_id="stream-1", history_summary="旧日记")
+    for part, data in (("state", session.to_dict()), ("context", session.context_to_dict())):
+        parent = directory / part
+        parent.mkdir(parents=True)
+        (parent / "stream-1.json").write_text(json.dumps(data), encoding="utf-8")
+
+    store = KFCSessionStore()
+    loaded = await store.get_or_create(session.stream_id)
+    loaded.history_summary = "新的日记"
+    await store.save_context(loaded)
+
+    assert not list(directory.rglob("stream-1.json"))
+    assert (directory / "state" / "qq" / "10001.json").is_file()
+    assert (directory / "context" / "qq" / "10001.json").is_file()
+    restarted = await KFCSessionStore().get(session.stream_id)
+    assert restarted is not None
+    assert restarted.history_summary == "新的日记"
+
+
+@pytest.mark.asyncio
+async def test_cache_rename_write_failure_keeps_original_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """新状态写入失败时不删除旧状态或旧快照，重试仍可完整恢复。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    session = KFCSession(
+        user_id="10001", stream_id="stream-1", platform="qq", history_summary="已有日记"
+    )
+    original_files: dict[Path, bytes] = {}
+    for part, data in (("state", session.to_dict()), ("context", session.context_to_dict())):
+        parent = directory / part
+        parent.mkdir(parents=True)
+        path = parent / "stream-1.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        original_files[path] = path.read_bytes()
+
+    original_replace = session_module.os.replace
+
+    def fail_state_replace(source: str, destination: Path) -> None:
+        """允许上下文写入，但让新状态提交报告磁盘错误。"""
+        if destination.parent.parent.name == "state":
+            raise OSError("disk full")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(session_module.os, "replace", fail_state_replace)
+    with pytest.raises(OSError, match="disk full"):
+        await KFCSessionStore().get(session.stream_id)
+    for path, original in original_files.items():
+        assert path.read_bytes() == original
+
+    monkeypatch.setattr(session_module.os, "replace", original_replace)
+    loaded = await KFCSessionStore().get(session.stream_id)
+    assert loaded is not None
+    assert loaded.history_summary == session.history_summary
+    assert not list(directory.rglob("stream-1.json"))
+
+
+@pytest.mark.asyncio
+async def test_missing_user_id_does_not_write_hash_named_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """没有真实账号身份时不得回退到内部流 ID 文件名。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    monkeypatch.setattr(session_module, "get_stream", AsyncMock(return_value=None))
+    with pytest.raises(ValueError, match="缺少真实用户 ID"):
+        await KFCSessionStore().save_context(KFCSession(user_id="", stream_id="stream-1"))
+    assert not list(directory.rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_same_account_cannot_overwrite_another_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """同平台同账号的内部流冲突必须显式报错，不覆盖已有缓存。"""
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(tmp_path / "sessions"))
+    store = KFCSessionStore()
+    session = KFCSession(
+        user_id="10001", stream_id="stream-1", platform="qq", history_summary="已有日记"
+    )
+    await store.save(session)
+    with pytest.raises(ValueError, match="拒绝覆盖"):
+        await store.save(KFCSession(
+            user_id="10001", stream_id="stream-2", platform="qq", history_summary="其他日记"
+        ))
+    loaded = await KFCSessionStore().get(session.stream_id)
+    assert loaded is not None
+    assert loaded.history_summary == session.history_summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id", ["../10001", "10001/part", "10001\\part", "CON", "10001:part"])
+async def test_cache_user_id_cannot_escape_storage_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, user_id: str
+) -> None:
+    """账号 ID 含路径或 Windows 保留名称时不得落盘。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    with pytest.raises(ValueError, match="安全的文件名"):
+        await KFCSessionStore().save(KFCSession(
+            user_id=user_id, stream_id="stream-1", platform="qq"
+        ))
+    assert not list(directory.rglob("*.json"))
+
+
+@pytest.mark.asyncio
 async def test_corrupt_context_clears_only_context_cache(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """上下文损坏后，独立保存的会话状态仍可恢复。"""
     monkeypatch.setattr(session_module, "_STORAGE_DIR", str(tmp_path / "sessions"))
     store = KFCSessionStore()
-    session = KFCSession(user_id="u1", stream_id="stream-1")
+    session = KFCSession(user_id="u1", stream_id="stream-1", platform="qq")
     session.scheduled_proactive_at = 123.0
     session.context_snapshot = [
         {"role": "user", "content": [{"type": "text", "text": "原话"}]}
     ]
     await store.save(session)
 
-    state_path = tmp_path / "sessions" / "state" / "stream-1.json"
-    context_path = tmp_path / "sessions" / "context" / "stream-1.json"
+    state_path = tmp_path / "sessions" / "state" / "qq" / "u1.json"
+    context_path = tmp_path / "sessions" / "context" / "qq" / "u1.json"
     assert state_path.exists()
     assert context_path.exists()
     context_path.write_text("{broken", encoding="utf-8")
@@ -92,10 +333,10 @@ async def test_corrupt_context_clears_only_context_cache(
 async def test_incomplete_context_cannot_silently_drop_tool_tail(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """无效活动链不能靠修剪恢复，也不能连同已有日记一并删除。"""
+    """无效活动链落盘清空，不影响日记和完整封存段的恢复。"""
     monkeypatch.setattr(session_module, "_STORAGE_DIR", str(tmp_path / "sessions"))
     session = KFCSession(
-        user_id="user", stream_id="stream-1", history_summary="我已有日记"
+        user_id="user", stream_id="stream-1", platform="qq", history_summary="我已有日记"
     )
     session.context_snapshot = [
         {"role": "user", "content": [{"type": "text", "text": "原话"}]},
@@ -103,16 +344,36 @@ async def test_incomplete_context_cannot_silently_drop_tool_tail(
             {"type": "tool_call", "id": "c1", "name": "lookup", "args": {}}
         ]},
     ]
+    session.sealed_segments = [[
+        {"role": "user", "content": [{"type": "text", "text": "已封存原话"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "已封存回复"}]},
+    ]]
     await KFCSessionStore().save(session)
 
     loaded = await KFCSessionStore().get_or_create("stream-1")
     assert loaded.user_id == "user"
     assert loaded.context_snapshot is None
     assert loaded.history_summary == "我已有日记"
-    assert (tmp_path / "sessions" / "context" / "stream-1.json").exists()
-    assert (tmp_path / "sessions" / "state" / "stream-1.json").exists()
+    assert loaded.sealed_segments == session.sealed_segments
+    context_path = tmp_path / "sessions" / "context" / "qq" / "user.json"
+    persisted = json.loads(context_path.read_text(encoding="utf-8"))
+    assert persisted["context_snapshot"] is None
+    assert persisted["history_summary"] == session.history_summary
+    assert persisted["sealed_segments"] == session.sealed_segments
+    assert (tmp_path / "sessions" / "state" / "qq" / "user.json").exists()
     restarted = await KFCSessionStore().get_or_create("stream-1")
     assert restarted.history_summary == "我已有日记"
+    assert restarted.context_snapshot is None
+    assert restarted.sealed_segments == session.sealed_segments
+    restarted.append_context_entries([
+        LLMPayload(ROLE.USER, Text("新的输入")),
+        LLMPayload(ROLE.ASSISTANT, Text("新的回复")),
+    ])
+    await KFCSessionStore().save(restarted)
+    resumed = await KFCSessionStore().get_or_create("stream-1")
+    assert resumed.context_snapshot == restarted.context_snapshot
+    assert resumed.history_summary == session.history_summary
+    assert deserialize_snapshot(resumed.context_snapshot) is not None
     recent_history = SimpleNamespace(
         bot_id="bot",
         context=SimpleNamespace(history_messages=[SimpleNamespace(
@@ -123,9 +384,94 @@ async def test_incomplete_context_cannot_silently_drop_tool_tail(
             message_id="m1",
         )]),
     )
+    restarted.sealed_segments = []
     assert not SummaryService.maybe_schedule_compression(
         restarted, KFCConfig(), recent_history
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "cleared_value"),
+    [
+        ("context_snapshot", [], None),
+        ("context_snapshot", "invalid", None),
+        ("context_snapshot", [{"role": "user", "content": []}], None),
+        ("history_summary", 123, ""),
+        ("sealed_segments", "invalid", []),
+        ("sealed_segments", [[{"role": "user", "content": []}]], []),
+    ],
+)
+async def test_invalid_context_field_is_cleared_on_disk_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    field: str, invalid_value: object, cleared_value: object,
+) -> None:
+    """损坏字段单独清空落盘，重复磁盘读取无需再次修复。"""
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(tmp_path / "sessions"))
+    session = KFCSession(
+        user_id="10001", stream_id="stream-1", platform="qq", history_summary="已有日记"
+    )
+    session.context_snapshot = [
+        {"role": "user", "content": [{"type": "text", "text": "有效原话"}]}
+    ]
+    session.sealed_segments = [session.context_snapshot]
+    session.scheduled_proactive_at = 123.0
+    await KFCSessionStore().save(session)
+    path = tmp_path / "sessions" / "context" / "qq" / "10001.json"
+    original = session.context_to_dict()
+    corrupted = dict(original)
+    corrupted[field] = invalid_value
+    path.write_text(json.dumps(corrupted), encoding="utf-8")
+    repair = AsyncMock(wraps=session_module._atomic_save)
+    monkeypatch.setattr(session_module, "_atomic_save", repair)
+
+    loaded = await KFCSessionStore().get_or_create(session.stream_id)
+    expected = dict(original)
+    expected[field] = cleared_value
+    assert loaded.context_to_dict() == expected
+    assert loaded.scheduled_proactive_at == session.scheduled_proactive_at
+    assert json.loads(path.read_text(encoding="utf-8")) == expected
+    assert repair.await_count == 1
+
+    restarted = KFCSessionStore()
+    for _attempt in range(2):
+        peeked = await restarted.peek(session.stream_id)
+        assert peeked is not None
+        assert peeked.context_to_dict() == expected
+    assert repair.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_context_repair_failure_keeps_original_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """修复提交失败不得删掉原文件，恢复磁盘后仍可清空损坏字段。"""
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(tmp_path / "sessions"))
+    session = KFCSession(
+        user_id="10001", stream_id="stream-1", platform="qq", history_summary="已有日记"
+    )
+    session.context_snapshot = []
+    await KFCSessionStore().save(session)
+    path = tmp_path / "sessions" / "context" / "qq" / "10001.json"
+    original = path.read_bytes()
+    original_replace = session_module.os.replace
+
+    def fail_replace(source: str, destination: Path) -> None:
+        """模拟缓存原子提交时的磁盘错误。"""
+        raise OSError("disk full")
+
+    monkeypatch.setattr(session_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk full"):
+        await KFCSessionStore().get(session.stream_id)
+    assert path.read_bytes() == original
+    assert {entry.name for entry in path.parent.iterdir()} == {path.name}
+
+    monkeypatch.setattr(session_module.os, "replace", original_replace)
+    loaded = await KFCSessionStore().get(session.stream_id)
+    assert loaded is not None
+    assert loaded.context_snapshot is None
+    assert loaded.history_summary == session.history_summary
+    assert json.loads(path.read_text(encoding="utf-8"))["context_snapshot"] is None
 
 
 @pytest.mark.asyncio
@@ -135,17 +481,19 @@ async def test_corrupt_state_preserves_independent_context(
     """状态文件损坏不应删除或阻止恢复独立的活动原话与日记。"""
     monkeypatch.setattr(session_module, "_STORAGE_DIR", str(tmp_path / "sessions"))
     store = KFCSessionStore()
-    session = KFCSession(user_id="old", stream_id="stream-1", history_summary="我记得原话")
+    session = KFCSession(
+        user_id="old", stream_id="stream-1", platform="qq", history_summary="我记得原话"
+    )
     session.context_snapshot = [
         {"role": "user", "content": [{"type": "text", "text": "原话"}]}
     ]
     await store.save(session)
-    state_path = tmp_path / "sessions" / "state" / "stream-1.json"
-    context_path = tmp_path / "sessions" / "context" / "stream-1.json"
+    state_path = tmp_path / "sessions" / "state" / "qq" / "old.json"
+    context_path = tmp_path / "sessions" / "context" / "qq" / "old.json"
     state_path.write_text("{broken", encoding="utf-8")
 
     loaded = await KFCSessionStore().get_or_create("stream-1")
-    assert loaded.user_id == ""
+    assert loaded.user_id == "old"
     assert loaded.context_snapshot == session.context_snapshot
     assert loaded.history_summary == "我记得原话"
     assert not state_path.exists()
@@ -155,7 +503,8 @@ async def test_corrupt_state_preserves_independent_context(
 def test_diary_hot_update_targets_dynamic_background_only() -> None:
     """后台日记只能写进动态背景，不能污染真实用户消息。"""
     real_user = LLMPayload(ROLE.USER, Text("真实原话"))
-    response = SimpleNamespace(payloads=[real_user])
+    manager = KFCContextManager()
+    response = SimpleNamespace(payloads=[real_user], context_manager=manager)
     stream = SimpleNamespace(stream_name="对方")
     sync = SummarySynchronizer("")
     assert not sync.sync_if_changed(response, stream, "我记得这件事")
@@ -164,7 +513,7 @@ def test_diary_hot_update_targets_dynamic_background_only() -> None:
     background = LLMPayload(ROLE.USER, Text(
         f"{DYNAMIC_BACKGROUND_MARKER}\n\n[当前通道参数]\n\n---\n\n当前时间：现在"
     ))
-    response.payloads.insert(0, background)
+    manager.background_payloads.append(background)
     assert sync.sync_if_changed(response, stream, "我记得这件事")
     assert "我记得这件事" in _text(background)
     assert _text(real_user) == "真实原话"
@@ -265,7 +614,7 @@ async def test_build_initial_request_clears_invalid_snapshot_and_saves(
     plan = InitialContextPlan(system_extra_vars={}, history_summary="")
     monkeypatch.setattr(context_builder, "create_llm_request", lambda *args, **kwargs: _Request())
     monkeypatch.setattr(context_builder, "plan_initial_context", lambda **kwargs: plan)
-    async def render(**kwargs: object) -> tuple[list[LLMPayload], list[LLMPayload], bool]:
+    async def render(**kwargs: object) -> tuple[list[LLMPayload], list[LLMPayload], list[LLMPayload], bool]:
         return _render_snapshot_for_test(kwargs["serialized_context_snapshot"])
 
     monkeypatch.setattr(context_builder, "render_initial_context", render)
@@ -295,11 +644,11 @@ async def test_build_initial_request_clears_invalid_snapshot_and_saves(
 
 def _render_snapshot_for_test(
     snapshot: list[dict[str, object]] | None,
-) -> tuple[list[LLMPayload], list[LLMPayload], bool]:
+) -> tuple[list[LLMPayload], list[LLMPayload], list[LLMPayload], bool]:
     """构造初始请求测试所需的最小渲染结果。"""
     has_history = bool(snapshot and "role" in snapshot[0])
     restored = [LLMPayload(ROLE.USER, Text("历史"))] if has_history else []
-    return [], restored, has_history
+    return [], [], restored, has_history
 
 
 def test_dynamic_background_and_transients_do_not_enter_snapshot() -> None:
@@ -310,12 +659,19 @@ def test_dynamic_background_and_transients_do_not_enter_snapshot() -> None:
     )
     payloads = [
         LLMPayload(ROLE.SYSTEM, Text("稳定系统规则")),
-        LLMPayload(ROLE.USER, Text(background_text)),
         LLMPayload(ROLE.USER, Text("真实用户输入")),
         LLMPayload(ROLE.ASSISTANT, Text("真实回复")),
     ]
     snapshot = capture_snapshot(payloads)
     assert snapshot is not None
+    response = SimpleNamespace(
+        payloads=payloads,
+        context_manager=KFCContextManager(background_payloads=[
+            LLMPayload(ROLE.USER, Text(background_text))
+        ]),
+    )
+    view = build_request_view(response)
+    assert "当前通道参数" in str(view.payloads)
     text = str(snapshot)
     assert "稳定系统规则" not in text
     for forbidden in ("当前通道参数", "长期摘要", "融合叙事"):
@@ -507,7 +863,7 @@ async def test_voice_call_backfills_then_reloads_from_snapshot() -> None:
     async def system_prompt(_stream: object, _extra: dict[str, str] | None) -> str:
         return "SYSTEM"
 
-    _, history, _ = await render_initial_context(
+    _, _, history, _ = await render_initial_context(
         chat_stream=chat_stream,
         plan=InitialContextPlan(history_summary="动态摘要"),
         mental_log=None,

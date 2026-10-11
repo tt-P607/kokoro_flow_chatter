@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,16 +22,137 @@ if str(_ROOT) not in sys.path:
 from plugins.kokoro_flow_chatter.config import KFCConfig  # noqa: E402
 from plugins.kokoro_flow_chatter import context_budget  # noqa: E402
 from plugins.kokoro_flow_chatter import diary_compressor  # noqa: E402
+from plugins.kokoro_flow_chatter import session as session_module
 from plugins.kokoro_flow_chatter.context import renderer  # noqa: E402
 from plugins.kokoro_flow_chatter.context.sources.history_source import build_recent_chat_history  # noqa: E402
 from plugins.kokoro_flow_chatter.prompts import modules as prompt_modules  # noqa: E402
+from plugins.kokoro_flow_chatter.runtime import context_builder
 from plugins.kokoro_flow_chatter.runtime import context_rotation  # noqa: E402
+from plugins.kokoro_flow_chatter.runtime.request_view import build_request_view
+from plugins.kokoro_flow_chatter.context.types import InitialContextPlan
 from plugins.kokoro_flow_chatter.services import summary_service  # noqa: E402
-from plugins.kokoro_flow_chatter.session import KFCSession  # noqa: E402
-from plugins.kokoro_flow_chatter.snapshot import serialize_payloads  # noqa: E402
+from plugins.kokoro_flow_chatter.session import KFCSession, KFCSessionStore  # noqa: E402
+from plugins.kokoro_flow_chatter.snapshot import deserialize_snapshot, serialize_payloads  # noqa: E402
 from src.app.plugin_system.types import LLMPayload, ROLE, Text, ToolCall, ToolResult  # noqa: E402
 from src.kernel.concurrency import get_task_manager  # noqa: E402
+from src.kernel.llm.request import LLMRequest
 from src.core.prompt.template import PromptTemplate  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_request_view_sends_background_without_persisting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """实际请求追加与发送视图保留首条原话，但不保存背景和注入。"""
+    manager = context_budget.KFCContextManager(background_payloads=[
+        LLMPayload(ROLE.USER, Text("background only"))
+    ])
+    request = LLMRequest(
+        cast(Any, [{"model_identifier": "gpt-4", "max_context": 1000}]),
+        request_name="test", context_manager=manager,
+    )
+    request.add_payload(LLMPayload(ROLE.SYSTEM, Text("policy")))
+    request.add_payload(LLMPayload(ROLE.USER, Text("【动态背景】 real user text")))
+    request.add_payload(LLMPayload(ROLE.USER, Text("second user text")))
+    transient = LLMPayload(ROLE.USER, Text("request only"))
+    outgoing: list[LLMPayload] = []
+
+    async def send(actual: LLMRequest, **kwargs: Any) -> Any:
+        """只替换模型返回，保留真实请求类的追加和校验。"""
+        outgoing.extend(actual.payloads)
+        actual.add_payload(LLMPayload(ROLE.ASSISTANT, Text("answer")))
+        return SimpleNamespace(payloads=actual.payloads, _consumed=True)
+
+    monkeypatch.setattr(LLMRequest, "send", send)
+    result = await build_request_view(request, [transient]).send()
+    assert [payload.role for payload in request.payloads] == [ROLE.SYSTEM, ROLE.USER, ROLE.USER]
+    assert "background only" in str(outgoing)
+    assert "request only" in str(outgoing)
+    snapshot = serialize_payloads(result.payloads)
+    assert [entry["role"] for entry in snapshot] == ["user", "user", "assistant"]
+    assert "real user text" in str(snapshot)
+    assert "second user text" in str(snapshot)
+    assert "background only" not in str(snapshot)
+    assert "request only" not in str(snapshot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tokens", [79, 80, 100, 101])
+async def test_rotation_threshold_without_completed_round(
+    monkeypatch: pytest.MonkeyPatch, tokens: int,
+) -> None:
+    """80% 无旧回合时继续；预算包括独立背景，只有真超限才拒绝。"""
+    monkeypatch.setattr(
+        context_budget, "count_payload_tokens",
+        lambda payloads, **kwargs: sum(
+            len(part.text) for payload in payloads for part in payload.content
+            if isinstance(part, Text)
+        ),
+    )
+    response = LLMRequest(
+        cast(Any, [{"model_identifier": "gpt-4", "max_context": 100}]),
+        context_manager=context_budget.KFCContextManager(background_payloads=[
+            LLMPayload(ROLE.USER, Text("b" * (tokens - 35)))
+        ]),
+    )
+    response.add_payload(LLMPayload(ROLE.USER, Text("u" * 10)))
+    session = KFCSession(user_id="user", stream_id="stream")
+    session.context_snapshot = serialize_payloads(response.payloads)
+    before = copy.deepcopy(session.context_to_dict())
+    store = _Store()
+    operation = context_rotation.rotate_if_needed(
+        cast(Any, SimpleNamespace(session_store=store)), response,
+        cast(Any, SimpleNamespace()), KFCConfig(), session, response.model_set,
+        [LLMPayload(ROLE.USER, Text("t" * 25))],
+    )
+    if tokens > 100:
+        with pytest.raises(ValueError, match="动态背景=.*当前对话=.*临时注入="):
+            await operation
+    else:
+        actual, tools, rotated = await operation
+        assert actual is response and tools is None and not rotated
+    assert session.context_to_dict() == before
+    assert store.saved == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["rebuild", "cancel", "budget"])
+async def test_rotation_rebuild_failure_preserves_all_authority(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    """重建失败、取消或仍超预算时不提交任何新的权威状态。"""
+    monkeypatch.setattr(context_rotation, "should_rotate", lambda *args: True)
+    payloads = [
+        LLMPayload(ROLE.USER, Text("old")),
+        LLMPayload(ROLE.ASSISTANT, Text("answer")),
+        LLMPayload(ROLE.USER, Text("current")),
+    ]
+    session = KFCSession(user_id="user", stream_id="stream")
+    session.context_snapshot = serialize_payloads(payloads)
+    session.completed_context_length = 2
+    session.sealed_segments = [serialize_payloads(payloads[:2])]
+    before = copy.deepcopy(session.context_to_dict())
+    store = _Store()
+
+    async def rebuild(*args: Any) -> Any:
+        """分别模拟重建异常、取消与过大的重建背景。"""
+        if failure == "rebuild":
+            raise RuntimeError("rebuild failed")
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        monkeypatch.setattr(context_budget, "count_payload_tokens", lambda *a, **k: 1001)
+        return SimpleNamespace(payloads=deserialize_snapshot(args[3].context_snapshot)), {}
+
+    monkeypatch.setattr(context_rotation, "build_initial_request", rebuild)
+    expected = {"rebuild": RuntimeError, "cancel": asyncio.CancelledError, "budget": ValueError}[failure]
+    with pytest.raises(expected):
+        await context_rotation.rotate_if_needed(
+            cast(Any, SimpleNamespace(session_store=store)),
+            SimpleNamespace(payloads=payloads), cast(Any, SimpleNamespace()),
+            KFCConfig(), session, [{"model_identifier": "gpt-4", "max_context": 1000}], [],
+        )
+    assert session.context_to_dict() == before
+    assert store.saved == []
 
 
 class _Store:
@@ -45,6 +168,172 @@ class _Store:
         if self.fail:
             raise OSError("disk full")
         self.saved.append(copy.deepcopy(session.context_to_dict()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed_length", [None, 0, 2, -1, 3, 5, True, "2"])
+async def test_completed_prefix_restart_preserves_transcript(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, completed_length: Any,
+) -> None:
+    """重启恢复可信完成前缀；缺失或损坏的边界不得删除合法原话。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    session = KFCSession(user_id="user", stream_id="stream", platform="test")
+    session.context_snapshot = serialize_payloads([
+        LLMPayload(ROLE.USER, Text("first")),
+        LLMPayload(ROLE.ASSISTANT, Text("answer")),
+        LLMPayload(ROLE.USER, Text("current")),
+        LLMPayload(ROLE.ASSISTANT, Text("current answer")),
+    ])
+    session.sealed_segments = [copy.deepcopy(session.context_snapshot[:2])]
+    await KFCSessionStore().save(session)
+    path = directory / "context" / "test" / "user.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if completed_length is None:
+        data.pop("completed_context_length")
+    else:
+        data["completed_context_length"] = completed_length
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = await KFCSessionStore().get("stream")
+    assert loaded is not None
+    assert loaded.context_snapshot == session.context_snapshot
+    assert loaded.sealed_segments == session.sealed_segments
+    assert loaded.completed_context_length == (
+        completed_length if type(completed_length) is int and completed_length in (0, 2)
+        else 0
+    )
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["context_snapshot"] == session.context_snapshot
+    assert persisted["sealed_segments"] == session.sealed_segments
+
+
+@pytest.mark.asyncio
+async def test_rotation_cancellation_during_atomic_write_restores_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """写盘过程中重复取消后，原对话、封存段及边界均恢复到磁盘。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    monkeypatch.setattr(context_rotation, "should_rotate", lambda *args: True)
+    payloads = [
+        LLMPayload(ROLE.USER, Text("old")),
+        LLMPayload(ROLE.ASSISTANT, Text("answer")),
+        LLMPayload(ROLE.USER, Text("current")),
+    ]
+    session = KFCSession(user_id="user", stream_id="stream", platform="test")
+    session.context_snapshot = serialize_payloads(payloads)
+    session.completed_context_length = 2
+    store = KFCSessionStore()
+    await store.save(session)
+    path = directory / "context" / "test" / "user.json"
+    before = json.loads(path.read_text(encoding="utf-8"))
+    started = threading.Event()
+    release = threading.Event()
+    replacements: list[str] = []
+    original_replace = session_module.os.replace
+
+    def blocking_replace(source: Any, destination: Any) -> None:
+        """只在目标上下文的第一轮原子替换前等待测试释放。"""
+        if Path(destination) == path:
+            replacements.append(str(destination))
+            if len(replacements) == 1:
+                started.set()
+                assert release.wait(5)
+        original_replace(source, destination)
+
+    async def rebuild(*args: Any) -> Any:
+        """从候选快照恢复实际 payload，不改权威会话。"""
+        return SimpleNamespace(payloads=deserialize_snapshot(args[3].context_snapshot)), {}
+
+    monkeypatch.setattr(session_module.os, "replace", blocking_replace)
+    monkeypatch.setattr(context_rotation, "build_initial_request", rebuild)
+    task = get_task_manager().create_task(context_rotation.rotate_if_needed(
+        cast(Any, SimpleNamespace(session_store=store)), SimpleNamespace(payloads=payloads),
+        cast(Any, SimpleNamespace()), KFCConfig(), session,
+        [{"model_identifier": "gpt-4", "max_context": 1000}], [],
+    )).task
+    assert task is not None
+    try:
+        assert await asyncio.to_thread(started.wait, 3)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    assert session.context_to_dict() == before
+    assert json.loads(path.read_text(encoding="utf-8")) == before
+    assert len(replacements) == 2
+    assert await store.get("stream") is session
+
+
+def test_voice_entries_do_not_close_an_unfinished_round() -> None:
+    """通话补写仅在现有前缀已完成时扩展完成边界。"""
+    session = KFCSession(user_id="user", stream_id="stream")
+    pair = [
+        LLMPayload(ROLE.USER, Text("call")),
+        LLMPayload(ROLE.ASSISTANT, Text("answer")),
+    ]
+    session.append_context_entries(pair, complete=True)
+    assert session.completed_context_length == 2
+    session.append_context_entries([LLMPayload(ROLE.USER, Text("pending"))])
+    session.append_context_entries(pair, complete=True)
+    assert session.completed_context_length == 2
+    assert len(session.context_snapshot or []) == 5
+
+
+@pytest.mark.asyncio
+async def test_initial_request_preserves_first_real_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实请求组装后，动态背景不能吞掉活动链的首个 USER。"""
+    session = KFCSession(user_id="user", stream_id="stream")
+    snapshot = serialize_payloads([
+        LLMPayload(ROLE.USER, Text("original question")),
+        LLMPayload(ROLE.ASSISTANT, Text("original answer")),
+    ])
+    session.context_snapshot = copy.deepcopy(snapshot)
+    stream = SimpleNamespace(
+        platform="test", chat_type="private", bot_id="bot", bot_nickname="bot",
+        stream_id="stream", stream_name="partner",
+        context=SimpleNamespace(history_messages=[]),
+    )
+
+    async def system_prompt(*args: Any) -> str:
+        """提供不依赖运行时配置的系统提示词。"""
+        return "stable policy"
+
+    async def inject_usables(request: LLMRequest) -> dict[str, object]:
+        """保留真实请求组装，不注册外部组件。"""
+        return {}
+
+    monkeypatch.setattr(renderer, "build_system_prompt", system_prompt)
+    monkeypatch.setattr(
+        context_builder, "plan_initial_context",
+        lambda **kwargs: InitialContextPlan(history_summary="background diary"),
+    )
+    monkeypatch.setattr(
+        context_builder, "create_llm_request",
+        lambda models, name, **kwargs: LLMRequest(
+            models, request_name=name, context_manager=kwargs["context_manager"],
+        ),
+    )
+    request, _ = await context_builder.build_initial_request(
+        cast(Any, SimpleNamespace(stream_id="stream", inject_usables=inject_usables)),
+        cast(Any, stream), KFCConfig(), session,
+        [{"model_identifier": "gpt-4", "max_context": 1000}],
+    )
+    assert serialize_payloads(request.payloads) == snapshot
+    assert session.context_snapshot == snapshot
 
 
 def test_initial_diary_history_uses_three_day_window() -> None:
@@ -417,18 +706,20 @@ async def test_rotation_commits_old_turn_and_rebuilds_from_latest(
     ]
     session = KFCSession(user_id="u", stream_id="s")
     session.context_snapshot = serialize_payloads(payloads)
+    session.completed_context_length = 2
     original = session.context_snapshot
     store = _Store(fail=fail)
     chatter = SimpleNamespace(session_store=store)
 
     async def rebuild(*args):
-        assert session.context_snapshot is not original
-        return SimpleNamespace(payloads=session.context_snapshot), {"tool": object()}
+        candidate = args[3]
+        assert candidate.context_snapshot is not original
+        return SimpleNamespace(payloads=deserialize_snapshot(candidate.context_snapshot)), {"tool": object()}
 
     monkeypatch.setattr(context_rotation, "build_initial_request", rebuild)
     operation = context_rotation.rotate_if_needed(
-        chatter, SimpleNamespace(payloads=payloads), SimpleNamespace(),
-        KFCConfig(), session, [{}], []
+        cast(Any, chatter), SimpleNamespace(payloads=payloads), cast(Any, SimpleNamespace()),
+        KFCConfig(), session, [{"model_identifier": "gpt-4", "max_context": 1000}], []
     )
     if fail:
         with pytest.raises(OSError, match="disk full"):
@@ -440,11 +731,11 @@ async def test_rotation_commits_old_turn_and_rebuilds_from_latest(
     rebuilt, tools, rotated = await operation
     assert rotated and "tool" in tools
     assert len(store.saved) == 1
-    assert [entry["role"] for entry in store.saved[0]["sealed_segments"][0]] == [
+    assert [entry["role"] for entry in cast(Any, store.saved[0]["sealed_segments"])[0]] == [
         "user", "assistant"
     ]
     assert len(rebuilt.payloads) == 1
-    assert "current question" in str(rebuilt.payloads)
+    assert rebuilt.payloads[0].content == [Text("current question")]
 
 
 @pytest.mark.asyncio
@@ -454,6 +745,7 @@ async def test_rotation_keeps_closed_tool_segment_in_current_turn(
     """工具调用和回执留在活动回合；旧完整回合仍能先封存。"""
     monkeypatch.setattr(context_rotation, "should_rotate", lambda *args: True)
     session = KFCSession(user_id="u", stream_id="s")
+    session.completed_context_length = 2
     store = _Store()
     payloads = [
         LLMPayload(ROLE.USER, Text("old question")),
@@ -464,15 +756,17 @@ async def test_rotation_keeps_closed_tool_segment_in_current_turn(
     ]
 
     async def rebuild(*args):
-        return SimpleNamespace(payloads=session.context_snapshot), {}
+        return SimpleNamespace(payloads=deserialize_snapshot(args[3].context_snapshot)), {}
 
     monkeypatch.setattr(context_rotation, "build_initial_request", rebuild)
     _, _, rotated = await context_rotation.rotate_if_needed(
-        SimpleNamespace(session_store=store), SimpleNamespace(payloads=payloads),
-        SimpleNamespace(), KFCConfig(), session, [{}], []
+        cast(Any, SimpleNamespace(session_store=store)), SimpleNamespace(payloads=payloads),
+        cast(Any, SimpleNamespace()), KFCConfig(), session,
+        [{"model_identifier": "gpt-4", "max_context": 1000}], []
     )
     assert rotated
     assert len(session.sealed_segments) == 1
+    assert session.context_snapshot is not None
     assert [entry["role"] for entry in session.context_snapshot] == [
         "user", "assistant", "tool_result"
     ]
@@ -485,6 +779,7 @@ async def test_rotation_refuses_unpaired_tool_segment(
     """活动回合的工具调用未配对时，不得持久化一个会被恢复逻辑裁掉的尾部。"""
     monkeypatch.setattr(context_rotation, "should_rotate", lambda *args: True)
     session = KFCSession(user_id="u", stream_id="s")
+    session.completed_context_length = 2
     store = _Store()
     payloads = [
         LLMPayload(ROLE.USER, Text("old question")),
@@ -494,8 +789,9 @@ async def test_rotation_refuses_unpaired_tool_segment(
     ]
     with pytest.raises(ValueError, match="未闭合工具段"):
         await context_rotation.rotate_if_needed(
-            SimpleNamespace(session_store=store), SimpleNamespace(payloads=payloads),
-            SimpleNamespace(), KFCConfig(), session, [{}], []
+            cast(Any, SimpleNamespace(session_store=store)), SimpleNamespace(payloads=payloads),
+            cast(Any, SimpleNamespace()), KFCConfig(), session,
+            [{"model_identifier": "gpt-4", "max_context": 1000}], []
         )
     assert store.saved == []
     assert session.sealed_segments == []

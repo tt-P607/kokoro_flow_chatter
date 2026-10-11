@@ -671,6 +671,7 @@ class _HarnessSession:
         """初始化记录容器。"""
         self.history_summary = ""
         self.context_snapshot: Any = None
+        self.completed_context_length = 0
         self.sealed_segments: list[Any] = []
         self.bot_planning: list[dict[str, Any]] = []
         self.user_id = "user-1"

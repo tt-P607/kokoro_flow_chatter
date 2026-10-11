@@ -130,12 +130,11 @@ async def render_initial_context(
         [ChatStream, dict[str, str] | None], Awaitable[str]
     ]
     | None = None,
-) -> tuple[list[LLMPayload], list[LLMPayload], bool]:
+) -> tuple[list[LLMPayload], list[LLMPayload], list[LLMPayload], bool]:
     """渲染 ``execute()`` 启动所需的初始 payload。
 
-    产出分为两组：``system_payloads`` 只含稳定系统提示词；
-    ``history_payloads`` 首项包含通道、日记和框架限定的历史时间线，
-    其余是从持久快照还原的活动原话链。
+    分别返回稳定系统提示词、动态背景与从持久快照恢复的原话链。
+    动态背景仅供发送视图使用，不进入持久主链。
 
     Args:
         chat_stream: 当前聊天流。
@@ -145,7 +144,7 @@ async def render_initial_context(
         build_system_prompt_fn: 系统提示词构建器，默认用本模块实现。
 
     Returns:
-        tuple: ``(system_payloads, history_payloads, has_history)``。
+        tuple: ``(system_payloads, background_payloads, history_payloads, has_history)``。
     """
     system_prompt_builder = build_system_prompt_fn or build_system_prompt
     system_prompt = await system_prompt_builder(chat_stream, plan.system_extra_vars)
@@ -172,9 +171,10 @@ async def render_initial_context(
         ),
     )
     restored_payloads = deserialize_snapshot(serialized_context_snapshot)
-    history_payloads = [dynamic_background, *(restored_payloads or [])]
-
-    return system_payloads, history_payloads, restored_payloads is not None
+    return (
+        system_payloads, [dynamic_background], restored_payloads or [],
+        restored_payloads is not None,
+    )
 
 
 def render_user_payload(

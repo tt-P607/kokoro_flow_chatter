@@ -3,9 +3,8 @@
 组装 ``execute()`` 启动时的第一份 LLM 请求：稳定 SYSTEM、动态背景、
 唯一持久 transcript 快照与工具注册。
 
-所有 payload 统一经 ``add_payload()`` 注入，由 context manager 的
-reminder 管线统一管理注入与剥离——若绕过管线直接构造 payload，
-system_reminder 会在多轮循环中重复堆积。
+持久 payload 经 ``add_payload()`` 注入；动态背景由发送视图独立组装，
+不会与真实 USER 合并或进入快照。
 """
 
 from __future__ import annotations
@@ -71,13 +70,14 @@ async def build_initial_request(
     Returns:
         tuple: ``(request, usable_map)``。
     """
+    context_manager = KFCContextManager(
+        reminder_sources=_build_reminder_sources(chatter.stream_id),
+    )
     request = create_llm_request(
         model_set,
         REQUEST_NAME,
         stream_id=chatter.stream_id,
-        context_manager=KFCContextManager(
-            reminder_sources=_build_reminder_sources(chatter.stream_id),
-        ),
+        context_manager=context_manager,
     )
 
     plan = plan_initial_context(
@@ -85,7 +85,7 @@ async def build_initial_request(
         config=config,
         session=session,
     )
-    system_payloads, history_payloads, has_history = await render_initial_context(
+    system_payloads, background_payloads, history_payloads, has_history = await render_initial_context(
         chat_stream=chat_stream,
         plan=plan,
         mental_log=session.mental_log,
@@ -94,6 +94,7 @@ async def build_initial_request(
 
     if session.context_snapshot and not has_history:
         session.context_snapshot = None
+        session.completed_context_length = 0
         await chatter.save_session(session)
     elif session.context_snapshot:
         logger.info(
@@ -101,6 +102,7 @@ async def build_initial_request(
             f"(stream={chatter.stream_id[:8]})"
         )
 
+    context_manager.background_payloads = background_payloads
     for payload in (*system_payloads, *history_payloads):
         request.add_payload(payload)
 

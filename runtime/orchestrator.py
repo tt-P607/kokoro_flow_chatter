@@ -333,8 +333,16 @@ async def execute_orchestrator(
             if not turn_control.has_pending_tool_results:
                 snapshot = capture_snapshot(response.payloads)
                 if snapshot is not None:
+                    previous_snapshot = session.context_snapshot
+                    previous_completed_length = session.completed_context_length
                     session.context_snapshot = snapshot
-                    await chatter.save_session(session)
+                    session.completed_context_length = len(snapshot)
+                    try:
+                        await chatter.save_session(session)
+                    except BaseException:
+                        session.context_snapshot = previous_snapshot
+                        session.completed_context_length = previous_completed_length
+                        raise
 
             if turn_control.next_signal is not None:
                 yield turn_control.next_signal

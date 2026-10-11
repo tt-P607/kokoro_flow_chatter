@@ -44,7 +44,7 @@ _SYSTEM_REMINDER_RE = re.compile(
 _MEDIA_TYPES = {"Image", "Audio", "Video", "File"}
 
 DYNAMIC_BACKGROUND_MARKER = "【动态背景】"
-"""当前请求动态背景的可见标记；序列化时用它排除伪 USER 历史。"""
+"""当前请求动态背景的展示标题，不用于判断持久内容。"""
 
 
 def serialize_payloads(payloads: list[Any]) -> list[dict[str, Any]]:
@@ -65,8 +65,6 @@ def serialize_payloads(payloads: list[Any]) -> list[dict[str, Any]]:
     for payload in payloads or []:
         role = getattr(payload, "role", None)
         if role in _SKIP_ROLES:
-            continue
-        if role == ROLE.USER and _is_dynamic_background(payload):
             continue
         content = getattr(payload, "content", None)
         if not isinstance(content, list):
@@ -185,15 +183,6 @@ def _serialize_part(part: Any) -> dict[str, Any] | None:
     if rendered:
         return {"type": "text", "text": rendered}
     return None
-
-
-def _is_dynamic_background(payload: Any) -> bool:
-    """判断是否为每轮重建的动态背景 USER payload。"""
-    content = payload.content
-    if not isinstance(content, list):
-        content = [content]
-    text = "".join(part.text for part in content if isinstance(part, Text))
-    return text.startswith(DYNAMIC_BACKGROUND_MARKER)
 
 
 def _deserialize_entry(entry: dict[str, Any]) -> LLMPayload | None:

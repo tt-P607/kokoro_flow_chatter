@@ -56,7 +56,7 @@ class TurnInputResult:
     """本轮临时注入的上下文贡献，发送后不入对话链。"""
 
     persistent_user_payload: LLMPayload | None = None
-    """本轮真实用户输入；非用户消息路径为空，发送前先进入快照。"""
+    """本轮真实用户输入或唤醒事件；发送前进入快照形成回合锚点。"""
 
     external_resume_request_marker: str = ""
     """通用 external resume 的请求级标记；普通回合为空。"""
@@ -255,10 +255,15 @@ async def _prepare_external_resume(
             next_signal=Wait(0),
             continue_loop=True,
         )
+    event_payload = LLMPayload(
+        ROLE.USER, Text(f"[外部唤醒事件]\n来源：{external_resume.source}"),
+    )
+    response.add_payload(event_payload)
     return TurnInputResult(
         response=response,
         request_only_payload=request_only_payload,
         extra_payload=extra_payload,
+        persistent_user_payload=event_payload,
         external_resume_request_marker=request_marker,
         external_resume_source=str(external_resume.source or ""),
     )
@@ -287,12 +292,17 @@ async def _prepare_timeout(
     session: KFCSession,
     timeout_service: TimeoutService,
 ) -> TurnInputResult:
-    """处理超时路径：注入仅当前请求可见的超时决策提示。"""
+    """保存超时事件锚点；超时决策提示仅本次请求可见。"""
     timeout_result = timeout_service.build_timeout_result(session)
+    event_payload = LLMPayload(
+        ROLE.USER, Text("[等待超时事件]\n等待对方回复超时，开始新的决策回合。"),
+    )
+    response.add_payload(event_payload)
     return TurnInputResult(
         response=response,
         request_only_payload=timeout_result.payload,
         extra_payload=await _collect_followup_payload(chatter.stream_id),
+        persistent_user_payload=event_payload,
         is_final_timeout=timeout_result.is_final_timeout,
     )
 

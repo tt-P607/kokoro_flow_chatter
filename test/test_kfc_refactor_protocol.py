@@ -780,7 +780,7 @@ async def test_initial_context_includes_framework_history_with_or_without_snapsh
     async def _system_prompt(_stream: Any, _vars: dict[str, str] | None) -> str:
         return "系统提示词"
 
-    system_payloads, history_payloads, has_history = await render_initial_context(
+    system_payloads, background_payloads, history_payloads, has_history = await render_initial_context(
         chat_stream=chat_stream,
         plan=InitialContextPlan(history_summary="已有日记"),
         mental_log=None,
@@ -788,14 +788,14 @@ async def test_initial_context_includes_framework_history_with_or_without_snapsh
         build_system_prompt_fn=_system_prompt,
     )
 
-    assert "框架保留的历史原话" in _text_of(history_payloads[0])
-    assert "框架保留的历史回复" in _text_of(history_payloads[0])
-    assert "已有日记" in _text_of(history_payloads[0])
+    assert "框架保留的历史原话" in _text_of(background_payloads[0])
+    assert "框架保留的历史回复" in _text_of(background_payloads[0])
+    assert "已有日记" in _text_of(background_payloads[0])
     assert "框架保留的历史原话" not in _text_of(system_payloads[0])
     assert has_history is with_snapshot
-    assert len(history_payloads) == (2 if with_snapshot else 1)
+    assert len(history_payloads) == (1 if with_snapshot else 0)
     if with_snapshot:
-        assert _text_of(history_payloads[1]) == "快照中的活动原话"
+        assert _text_of(history_payloads[0]) == "快照中的活动原话"
 
     from plugins.kokoro_flow_chatter.snapshot import capture_snapshot
 
@@ -834,7 +834,7 @@ async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
         {"role": "user", "content": [{"type": "text", "text": "旧用户输入"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "旧回复"}]},
     ]
-    system_payloads, history_payloads, has_history = await render_initial_context(
+    system_payloads, background_payloads, history_payloads, has_history = await render_initial_context(
         chat_stream=chat_stream,
         plan=plan,
         mental_log=None,
@@ -846,14 +846,13 @@ async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
     assert _text_of(system_payloads[0]) == "稳定系统提示词"
     assert [payload.role for payload in history_payloads] == [
         ROLE.USER,
-        ROLE.USER,
         ROLE.ASSISTANT,
     ]
-    dynamic_text = _text_of(history_payloads[0])
+    dynamic_text = _text_of(background_payloads[0])
     assert "近期摘要" in dynamic_text
     assert "当前时间：" in dynamic_text
     assert "融合叙事" not in dynamic_text
-    assert _text_of(history_payloads[1]) == "旧用户输入"
+    assert _text_of(history_payloads[0]) == "旧用户输入"
     assert has_history is True
 
     from plugins.kokoro_flow_chatter.snapshot import capture_snapshot
@@ -863,14 +862,14 @@ async def test_initial_context_keeps_dynamic_content_out_of_system() -> None:
     assert [entry["role"] for entry in captured] == ["user", "assistant"]
     assert all("近期摘要" not in str(entry) for entry in captured)
 
-    _, invalid_history, invalid_has_history = await render_initial_context(
+    _, _, invalid_history, invalid_has_history = await render_initial_context(
         chat_stream=chat_stream,
         plan=plan,
         mental_log=None,
         serialized_context_snapshot=[{"role": "assistant", "content": []}],
         build_system_prompt_fn=_build_system_prompt,
     )
-    assert len(invalid_history) == 1
+    assert invalid_history == []
     assert invalid_has_history is False
 
 

@@ -19,6 +19,8 @@ from src.kernel.llm.context_structure import validate_payload_sequence
 from src.kernel.llm.exceptions import LLMContextError
 from src.kernel.llm.request import LLMRequest
 
+from ..context_budget import KFCContextManager
+
 CONTINUATION_BOUNDARY_TEXT = "（会话继续）"
 
 
@@ -31,6 +33,9 @@ class RequestView:
 
     payloads: list[LLMPayload] = field(default_factory=list)
     """本次实际发送的完整 payload 列表（主链 + 临时项）。"""
+
+    transient_payloads: list[LLMPayload] = field(default_factory=list)
+    """背景与本轮注入的对象身份，发送后不回写主链。"""
 
     async def send(
         self,
@@ -48,7 +53,7 @@ class RequestView:
             Any: source 支持回写时返回 source 本身，否则返回新结果对象。
         """
         source_payloads = list(self.source.payloads)
-        transient_payloads = self.payloads[len(source_payloads) :]
+        transient_payloads = self.transient_payloads
 
         # LLMResponse 把请求元信息挂在 _upper 上；source 若本身就是
         # LLMRequest，则元信息直接位于自身。
@@ -103,9 +108,22 @@ def build_request_view(
         RequestView: 发送视图。
     """
     payloads = list(response.payloads)
-    if transient_payloads:
-        payloads.extend(transient_payloads)
-    return RequestView(source=response, payloads=payloads)
+    context_manager = getattr(response, "context_manager", None)
+    background = (
+        context_manager.background_payloads
+        if isinstance(context_manager, KFCContextManager) else []
+    )
+    first_user = next(
+        (index for index, payload in enumerate(payloads) if payload.role == ROLE.USER),
+        len(payloads),
+    )
+    payloads[first_user:first_user] = background
+    extras = transient_payloads or []
+    payloads.extend(extras)
+    return RequestView(
+        source=response, payloads=payloads,
+        transient_payloads=[*background, *extras],
+    )
 
 
 def _without_transient_payloads(

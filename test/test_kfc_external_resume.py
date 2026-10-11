@@ -271,7 +271,7 @@ async def test_timer_wake_keeps_timeout_path_available(
 async def test_cold_zero_unread_resume_uses_only_transient_contribution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """0 unread resume 可形成回合，且不写 USER 活动与持久链。"""
+    """无未读唤醒只保存事件锚点，不伪造用户发言或保存插件注入。"""
 
     async def fake_plan(*_args: Any, **kwargs: Any) -> ContextPlan:
         assert kwargs["external_resume"].source == "external"
@@ -309,11 +309,11 @@ async def test_cold_zero_unread_resume_uses_only_transient_contribution(
     )
 
     assert result.continue_loop is False
-    assert result.persistent_user_payload is None
+    assert "外部唤醒事件" in _text(result.persistent_user_payload)
     assert result.request_only_payload is None
     assert "内部行动" in _text(result.extra_payload)
     assert result.external_resume_request_marker
-    assert response.payloads == []
+    assert response.payloads == [result.persistent_user_payload]
     assert session.context_snapshot is None
     assert session.last_user_message_at is None
     assert session.last_activity_at == initial_activity
@@ -371,7 +371,7 @@ async def test_external_resume_takes_precedence_over_real_unread(
 
     # 独立行动轮：resume 生效，真实未读不被写入/消费。
     assert "跨流行动指令" in _text(result.extra_payload)
-    assert result.persistent_user_payload is None
+    assert "外部唤醒事件" in _text(result.persistent_user_payload)
     assert result.unread_msgs == []
     assert result.external_resume_request_marker
     assert captured["external_resume"] == event
@@ -516,8 +516,9 @@ async def test_explicit_resume_prompt_is_request_only(
     )
 
     assert _text(result.request_only_payload) == "请处理内部事件"
-    assert result.persistent_user_payload is None
-    assert response.payloads == []
+    assert "外部唤醒事件" in _text(result.persistent_user_payload)
+    assert "请处理内部事件" not in str(response.payloads)
+    assert response.payloads == [result.persistent_user_payload]
 
 
 def test_external_resume_metadata_is_transient() -> None:
