@@ -257,6 +257,18 @@ class KFCConfig(BaseConfig):
             ge=1,
             le=10000,
         )
+        compress_every_n_rounds: int = Field(
+            default=50,
+            description="日记更新至少需要的已完成对话轮数；0 禁用周期更新",
+            ge=0,
+            le=10000,
+        )
+        min_compress_interval_minutes: float = Field(
+            default=120.0,
+            description="两次日记更新之间的最短间隔（分钟），须同时满足轮数条件",
+            ge=0.0,
+            le=525600.0,
+        )
         compress_model_task: str = Field(
             default="actor",
             description=(

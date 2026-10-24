@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import tempfile
 import time
@@ -83,6 +84,10 @@ class KFCSession:
 
     history_summary: str = ""
     """封存原话和旧日记合并生成的第一人称日记。"""
+
+    compress_round_count: int = 0
+    last_compress_at: float = 0.0
+    """上次日记提交后的完整回合数与提交时间，随日记原子保存。"""
 
     memos: list[Memo] = field(default_factory=list)
     """私人备忘录。仅作为 turn 级 transient 注入，不进入持久 transcript。"""
@@ -354,6 +359,8 @@ class KFCSession:
             "completed_context_length": self.completed_context_length,
             "sealed_segments": self.sealed_segments,
             "history_summary": self.history_summary,
+            "compress_round_count": self.compress_round_count,
+            "last_compress_at": self.last_compress_at,
         }
 
     @classmethod
@@ -690,6 +697,28 @@ class KFCSessionStore:
                     context["history_summary"] = ""
                     context_changed = True
                     logger.warning(f"KFC 日记格式错误，清空 (stream={stream_id[:8]})")
+
+                rounds = context.get("compress_round_count", 0)
+                if type(rounds) is not int or rounds < 0:
+                    rounds = 0
+                last_compress_at = context.get("last_compress_at")
+                if (
+                    not isinstance(last_compress_at, (int, float))
+                    or isinstance(last_compress_at, bool)
+                    or not math.isfinite(last_compress_at)
+                    or last_compress_at < 0
+                ):
+                    last_compress_at = time.time() if session.history_summary.strip() else 0.0
+                session.compress_round_count = rounds
+                session.last_compress_at = float(last_compress_at)
+                if (
+                    "compress_round_count" not in context
+                    or context["compress_round_count"] != rounds
+                    or context.get("last_compress_at") != last_compress_at
+                ):
+                    context["compress_round_count"] = rounds
+                    context["last_compress_at"] = last_compress_at
+                    context_changed = True
 
                 try:
                     entries = context["context_snapshot"]

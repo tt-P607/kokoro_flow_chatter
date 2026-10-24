@@ -170,6 +170,193 @@ class _Store:
         self.saved.append(copy.deepcopy(session.context_to_dict()))
 
 
+@pytest.mark.parametrize(
+    ("rounds", "elapsed", "expected"),
+    [(49, 7200, False), (50, 7199, False), (49, 7199, False), (50, 7200, True)],
+)
+def test_diary_respects_round_and_time_gates(
+    monkeypatch: pytest.MonkeyPatch, rounds: int, elapsed: int, expected: bool,
+) -> None:
+    """已有日记必须同时达到轮数和时间门槛，积压原话不能绕过周期。"""
+    scheduled: list[str] = []
+
+    class _TaskManager:
+        def create_task(self, coroutine: Any, **kwargs: Any) -> Any:
+            """记录调度而不执行后台模型请求。"""
+            coroutine.close()
+            scheduled.append(kwargs["name"])
+            return SimpleNamespace(task_id="diary-task")
+
+    monkeypatch.setattr(summary_service, "get_task_manager", lambda: _TaskManager())
+    monkeypatch.setattr(summary_service.time, "time", lambda: 10000.0)
+    monkeypatch.setattr(summary_service.SummaryService, "_task_ids", {})
+    session = cast(Any, SimpleNamespace(
+        stream_id="periodic-diary", history_summary="existing diary",
+        sealed_segments=[[{"role": "user", "content": [{"type": "text", "text": "old"}]}]],
+        compression_paused=False, compress_round_count=rounds,
+        last_compress_at=10000.0 - elapsed,
+    ))
+    assert summary_service.SummaryService.maybe_schedule_compression(
+        session, KFCConfig(), cast(Any, SimpleNamespace()), session_store=cast(Any, _Store()),
+    ) is expected
+    assert len(scheduled) == int(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_size", [1, 3])
+async def test_diary_batches_once_and_keeps_concurrent_sources(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int,
+) -> None:
+    """一周期只合批提交一次；超预算与生成期间追加的原话留在队列。"""
+    session = KFCSession(
+        user_id="example", stream_id="batch-diary", history_summary="existing diary",
+        compress_round_count=50,
+    )
+    segments = [serialize_payloads([
+        LLMPayload(ROLE.USER, Text(f"question {index} " * 100)),
+        LLMPayload(ROLE.ASSISTANT, Text(f"answer {index} " * 100)),
+    ]) for index in range(3)]
+    session.sealed_segments = copy.deepcopy(segments)
+    added = serialize_payloads([LLMPayload(ROLE.USER, Text("newly sealed conversation"))])
+    models = [{"model_identifier": "gpt-4", "max_context": 10000}]
+    if batch_size == 1:
+        source = diary_compressor._render_segment(segments[0])
+        models[0]["max_context"] = context_budget.payload_tokens([
+            LLMPayload(ROLE.SYSTEM, Text("diary policy")),
+            LLMPayload(ROLE.USER, Text(diary_compressor._build_diary_instruction(
+                session.history_summary, source,
+            ))),
+        ], models) + 5
+    requests: list[list[LLMPayload]] = []
+
+    class _Request:
+        def __init__(self) -> None:
+            """记录实际交给压缩请求的 payload。"""
+            self.payloads: list[LLMPayload] = []
+
+        def add_payload(self, payload: LLMPayload) -> None:
+            """收集系统与待整理原话。"""
+            self.payloads.append(payload)
+
+        async def send(self, *, stream: bool) -> Any:
+            """只替换远端模型，在生成阶段插入新的会话状态。"""
+            requests.append(self.payloads)
+            session.sealed_segments.append(added)
+            session.compress_round_count += 2
+            session.append_context_entries([LLMPayload(ROLE.USER, Text("active conversation"))])
+
+            async def content() -> str:
+                """返回比原话短的日记。"""
+                return "updated diary"
+
+            return content()
+
+    async def system_prompt(stream: object) -> str:
+        """提供离线预算检查所用的稳定提示。"""
+        return "diary policy"
+
+    monkeypatch.setattr(diary_compressor, "build_diary_system_prompt", system_prompt)
+    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: models)
+    monkeypatch.setattr(diary_compressor, "create_llm_request", lambda *args, **kwargs: _Request())
+    store = _Store()
+    assert summary_service.SummaryService.maybe_schedule_compression(
+        session, KFCConfig(), cast(Any, SimpleNamespace()), session_store=cast(Any, store),
+    )
+    task_id = summary_service.SummaryService._task_ids[session.stream_id]
+    task = get_task_manager().get_task(task_id).task
+    assert task is not None
+    await task
+
+    assert len(requests) == 1
+    assert len(store.saved) == 1
+    assert session.history_summary == "updated diary"
+    assert session.sealed_segments == [*segments[batch_size:], added]
+    assert session.compress_round_count == 2
+    assert session.last_compress_at > 0
+    assert "active conversation" in str(session.context_snapshot)
+    sent_text = str(requests[0])
+    for index in range(3):
+        assert (f"question {index}" in sent_text) is (index < batch_size)
+    assert "newly sealed conversation" not in sent_text
+    assert not summary_service.SummaryService.maybe_schedule_compression(
+        session, KFCConfig(), cast(Any, SimpleNamespace()), session_store=cast(Any, store),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_diary_period_survives_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, legacy: bool,
+) -> None:
+    """日记周期随上下文恢复；旧缓存补齐时间但不猜测历史轮数。"""
+    directory = tmp_path / "sessions"
+    monkeypatch.setattr(session_module, "_STORAGE_DIR", str(directory))
+    session = KFCSession(
+        user_id="example", stream_id="period-restart", platform="test",
+        history_summary="existing diary", compress_round_count=51,
+        last_compress_at=time.time(),
+    )
+    session.sealed_segments = [serialize_payloads([LLMPayload(ROLE.USER, Text("pending"))])]
+    await KFCSessionStore().save(session)
+    path = directory / "context" / "test" / "example.json"
+    if legacy:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("compress_round_count")
+        data.pop("last_compress_at")
+        path.write_text(json.dumps(data), encoding="utf-8")
+    before = time.time()
+    restarted = await KFCSessionStore().get(session.stream_id)
+    assert restarted is not None
+    assert restarted.compress_round_count == (0 if legacy else 51)
+    if legacy:
+        assert restarted.last_compress_at >= before
+    else:
+        assert restarted.last_compress_at == session.last_compress_at
+    assert restarted.sealed_segments == session.sealed_segments
+    assert restarted.history_summary == session.history_summary
+    assert not summary_service.SummaryService.maybe_schedule_compression(
+        restarted, KFCConfig(), cast(Any, SimpleNamespace()), session_store=KFCSessionStore(),
+    )
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["compress_round_count"] == restarted.compress_round_count
+    assert persisted["last_compress_at"] == restarted.last_compress_at
+
+
+@pytest.mark.asyncio
+async def test_diary_oversized_source_is_not_sent_or_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队首单段也超预算时，不发模型请求且保留日记、原话与周期。"""
+    session = KFCSession(
+        user_id="example", stream_id="oversized-diary", history_summary="existing diary",
+        compress_round_count=50, last_compress_at=123.0,
+    )
+    session.sealed_segments = [serialize_payloads([
+        LLMPayload(ROLE.USER, Text("long conversation " * 100))
+    ])]
+    before = copy.deepcopy(session.context_to_dict())
+
+    async def system_prompt(stream: object) -> str:
+        """提供无法装入极小窗口的日记提示。"""
+        return "diary policy"
+
+    def forbidden_request(*args: Any, **kwargs: Any) -> Any:
+        """超预算原话不得交给请求层或触发重试。"""
+        pytest.fail("oversized diary must not create a request")
+
+    monkeypatch.setattr(diary_compressor, "build_diary_system_prompt", system_prompt)
+    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [
+        {"model_identifier": "gpt-4", "max_context": 1}
+    ])
+    monkeypatch.setattr(diary_compressor, "create_llm_request", forbidden_request)
+    store = _Store()
+    assert not await diary_compressor.compress_history(
+        session, KFCConfig(), cast(Any, SimpleNamespace()), session_store=cast(Any, store),
+    )
+    assert session.context_to_dict() == before
+    assert store.saved == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completed_length", [None, 0, 2, -1, 3, 5, True, "2"])
 async def test_completed_prefix_restart_preserves_transcript(
@@ -493,7 +680,9 @@ async def test_diary_requests_use_dedicated_system_prompt(
         return "我是测试角色。只写第一人称日记正文，不使用工具调用。"
 
     monkeypatch.setattr(diary_compressor, "build_diary_system_prompt", diary_prompt)
-    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [{}])
+    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [
+        {"model_identifier": "gpt-4", "max_context": 10000}
+    ])
     monkeypatch.setattr(diary_compressor, "create_llm_request", lambda *args, **kwargs: _Request())
 
     session = KFCSession(user_id="u", stream_id="diary-prompt")
@@ -642,10 +831,10 @@ async def test_initial_diary_keeps_new_turns_while_model_runs(
 
 
 @pytest.mark.asyncio
-async def test_initial_diary_precedes_pending_segment_compression(
+async def test_initial_diary_does_not_immediately_rewrite_pending_segments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """同一后台任务先提交历史日记，再基于它压缩封存原话。"""
+    """首次日记只提交一次，积压原话留到满足周期后再合并。"""
     session = KFCSession(user_id="u", stream_id="bootstrap-queued")
     segment = serialize_payloads([
         LLMPayload(ROLE.USER, Text("后来我们再次讨论了很长时间，约定一起去看展览。"))
@@ -685,11 +874,13 @@ async def test_initial_diary_precedes_pending_segment_compression(
     assert task is not None
     await task
 
-    assert len(store.saved) == 2
+    assert len(store.saved) == 1
     assert store.saved[0]["history_summary"] == "我记得初次谈到旅行。"
     assert store.saved[0]["sealed_segments"] == [segment]
-    assert store.saved[1]["history_summary"] == "我记得旅行，也约定去看展览。"
-    assert store.saved[1]["sealed_segments"] == []
+    assert session.last_compress_at > 0
+    assert not summary_service.SummaryService.maybe_schedule_compression(
+        session, KFCConfig(), stream, session_store=store
+    )
 
 
 @pytest.mark.asyncio
@@ -829,7 +1020,9 @@ async def test_diary_commit_does_not_overwrite_new_active_turns(
         return "actor"
 
     monkeypatch.setattr(diary_compressor, "build_diary_system_prompt", system_prompt)
-    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [{}])
+    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [
+        {"model_identifier": "gpt-4", "max_context": 10000}
+    ])
     monkeypatch.setattr(diary_compressor, "create_llm_request", lambda *args, **kwargs: _Request())
     task = asyncio.create_task(diary_compressor.compress_history(
         session, KFCConfig(), SimpleNamespace(), session_store=store
@@ -865,7 +1058,9 @@ async def test_diary_failed_three_times_keeps_sealed_source(
         return "actor"
 
     monkeypatch.setattr(diary_compressor, "build_diary_system_prompt", system_prompt)
-    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [{}])
+    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [
+        {"model_identifier": "gpt-4", "max_context": 10000}
+    ])
     monkeypatch.setattr(diary_compressor, "create_llm_request", lambda *args, **kwargs: _Request())
     assert not await diary_compressor.compress_history(
         session, KFCConfig(), SimpleNamespace(), session_store=store
@@ -882,7 +1077,10 @@ async def test_diary_write_failure_keeps_source_for_retry(
 ) -> None:
     """模型成功但落盘失败，日记和封存段也不能在内存中提前提交。"""
     store = _Store(fail=True)
-    session = KFCSession(user_id="u", stream_id="s", history_summary="旧日记")
+    session = KFCSession(
+        user_id="u", stream_id="s", history_summary="旧日记",
+        compress_round_count=53, last_compress_at=123.0,
+    )
     segment = serialize_payloads([
         LLMPayload(ROLE.USER, Text("那天我讲了一个很长的经历，其中有明确的重要约定和日期。"))
     ])
@@ -902,13 +1100,17 @@ async def test_diary_write_failure_keeps_source_for_retry(
         return "actor"
 
     monkeypatch.setattr(diary_compressor, "build_diary_system_prompt", system_prompt)
-    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [{}])
+    monkeypatch.setattr(diary_compressor, "get_model_set_by_task", lambda name: [
+        {"model_identifier": "gpt-4", "max_context": 10000}
+    ])
     monkeypatch.setattr(diary_compressor, "create_llm_request", lambda *args, **kwargs: _Request())
     assert not await diary_compressor.compress_history(
         session, KFCConfig(), SimpleNamespace(), session_store=store
     )
     assert session.history_summary == "旧日记"
     assert session.sealed_segments == [segment]
+    assert session.compress_round_count == 53
+    assert session.last_compress_at == 123.0
     assert store.saved == []
 
     store.fail = False
@@ -917,6 +1119,8 @@ async def test_diary_write_failure_keeps_source_for_retry(
     )
     assert session.history_summary == "我记得约定。"
     assert session.sealed_segments == []
+    assert session.compress_round_count == 0
+    assert session.last_compress_at > 123.0
 
 
 @pytest.mark.asyncio

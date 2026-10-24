@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
+import time
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
-from .context_budget import KFCContextManager
+from .context_budget import KFCContextManager, context_budget, payload_tokens
 from .context.renderer import build_diary_system_prompt
 
 if TYPE_CHECKING:
@@ -33,6 +35,7 @@ async def bootstrap_diary(
     session_store: KFCSessionStore,
 ) -> bool:
     """从近期框架聊天记录生成初始日记，不修改活动链与封存队列。"""
+    rounds_at_start = session.compress_round_count
     instruction = (
         f"当前时间：{datetime.datetime.now():%Y-%m-%d %H:%M}\n\n"
         f"最近的聊天记录：\n{history_text}\n\n"
@@ -65,11 +68,19 @@ async def bootstrap_diary(
             async with session_store.lock(session.stream_id):
                 if session.history_summary.strip():
                     return True
+                previous_rounds = session.compress_round_count
+                previous_compress_at = session.last_compress_at
                 session.history_summary = diary
+                session.compress_round_count = max(0, previous_rounds - rounds_at_start)
+                session.last_compress_at = time.time()
                 try:
                     await session_store.save_context(session)
-                except BaseException:
+                except BaseException as error:
                     session.history_summary = ""
+                    session.compress_round_count = previous_rounds
+                    session.last_compress_at = previous_compress_at
+                    if isinstance(error, asyncio.CancelledError):
+                        await session_store.save_context(session)
                     raise
             logger.info(f"初始日记生成完成：流 {session.stream_id[:8]}")
             return True
@@ -104,26 +115,34 @@ async def compress_history(
     *,
     session_store: KFCSessionStore,
 ) -> bool:
-    """三次以内生成新日记；成功后只替换日记和队首封存段。"""
+    """在模型预算内合并队首封存段，每个周期最多提交一次新日记。"""
     if not session.sealed_segments:
         return True
 
-    segment = session.sealed_segments[0]
+    pending_segments = list(session.sealed_segments)
     previous_diary = session.history_summary
-    source_text = _render_segment(segment)
-    instruction = (
-        f"当前时间：{datetime.datetime.now():%Y-%m-%d %H:%M}\n\n"
-        f"已有的第一人称日记：\n{previous_diary or '（暂无）'}\n\n"
-        f"接下来发生的对话与当时的思考：\n{source_text}\n\n"
-        "请以第一人称'我'续写并整合成一份完整的日记，直接输出日记正文。"
-        "忠实保留重要事件、约定、关系变化和关键原话；优先保留明确的日期和时间，"
-        "不要用会随时间失效的'昨天'、'前天'替代明确日期，也不要编造时间。"
-        "区分对方明确说过的话和我自己的推测。不按天机械分组，不规定篇幅，"
-        "但须把旧日记和这段原话压缩为比输入更短的记忆。"
-    )
+    rounds_at_start = session.compress_round_count
     try:
         system_prompt = await build_diary_system_prompt(chat_stream)
         model_set = get_model_set_by_task(config.prompt.compress_model_task)
+        budget = context_budget(model_set)
+        selected_segments: list[list[dict[str, Any]]] = []
+        source_text = ""
+        instruction = ""
+        for segment in pending_segments:
+            candidate_text = "\n\n".join(filter(None, (source_text, _render_segment(segment))))
+            candidate_instruction = _build_diary_instruction(previous_diary, candidate_text)
+            payloads = [
+                LLMPayload(ROLE.SYSTEM, Text(system_prompt)),
+                LLMPayload(ROLE.USER, Text(candidate_instruction)),
+            ]
+            if payload_tokens(payloads, model_set) > budget:
+                break
+            selected_segments.append(segment)
+            source_text = candidate_text
+            instruction = candidate_instruction
+        if not selected_segments:
+            raise ValueError("日记与队首封存段超出压缩模型预算，原话保留")
     except Exception as error:
         logger.error(f"构建日记压缩请求失败：{error}")
         return False
@@ -141,20 +160,55 @@ async def compress_history(
             summary = (await result or "").strip()
             if not summary or len(summary) >= len(previous_diary) + len(source_text):
                 raise ValueError("新日记为空或没有压缩原文")
-
-            async with session_store.lock(session.stream_id):
-                if not session.sealed_segments or session.sealed_segments[0] != segment:
-                    raise RuntimeError("压缩期间封存段已变化")
-                session.history_summary = summary
-                session.sealed_segments.pop(0)
-                try:
-                    await session_store.save_context(session)
-                except BaseException:
-                    session.history_summary = previous_diary
-                    session.sealed_segments.insert(0, segment)
-                    raise
-            logger.info(f"日记压缩完成：流 {session.stream_id[:8]}")
-            return True
+            break
         except Exception as error:
             logger.warning(f"日记压缩失败 ({attempt}/{_MAX_ATTEMPTS})：{error}")
-    return False
+    else:
+        return False
+
+    try:
+        async with session_store.lock(session.stream_id):
+            segment_count = len(selected_segments)
+            if (
+                session.history_summary != previous_diary
+                or session.sealed_segments[:segment_count] != selected_segments
+            ):
+                raise RuntimeError("压缩期间日记或封存段已变化")
+            previous_rounds = session.compress_round_count
+            previous_compress_at = session.last_compress_at
+            session.history_summary = summary
+            del session.sealed_segments[:segment_count]
+            session.compress_round_count = max(0, previous_rounds - rounds_at_start)
+            session.last_compress_at = time.time()
+            try:
+                await session_store.save_context(session)
+            except BaseException as error:
+                session.history_summary = previous_diary
+                session.sealed_segments[:0] = selected_segments
+                session.compress_round_count = previous_rounds
+                session.last_compress_at = previous_compress_at
+                if isinstance(error, asyncio.CancelledError):
+                    await session_store.save_context(session)
+                raise
+    except (OSError, RuntimeError) as error:
+        logger.error(f"日记提交失败，保留原话：{error}")
+        return False
+    logger.info(
+        f"日记压缩完成：流 {session.stream_id[:8]}，合并 {segment_count} 个封存段，"
+        f"剩余 {len(session.sealed_segments)} 段"
+    )
+    return True
+
+
+def _build_diary_instruction(previous_diary: str, source_text: str) -> str:
+    """构建合批日记指令，供预算检查与实际请求共用。"""
+    return (
+        f"当前时间：{datetime.datetime.now():%Y-%m-%d %H:%M}\n\n"
+        f"已有的第一人称日记：\n{previous_diary or '（暂无）'}\n\n"
+        f"接下来发生的对话与当时的思考：\n{source_text}\n\n"
+        "请以第一人称'我'续写并整合成一份完整的日记，直接输出日记正文。"
+        "忠实保留重要事件、约定、关系变化和关键原话；优先保留明确的日期和时间，"
+        "不要用会随时间失效的'昨天'、'前天'替代明确日期，也不要编造时间。"
+        "区分对方明确说过的话和我自己的推测。不按天机械分组，不规定篇幅，"
+        "但须把旧日记和这段原话压缩为比输入更短的记忆。"
+    )

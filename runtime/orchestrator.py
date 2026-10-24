@@ -135,11 +135,10 @@ async def execute_orchestrator(
             chatter, chat_stream, config, session, model_set
         )
         state = _LoopState(summary=SummarySynchronizer(session.history_summary))
-        SummaryService.maybe_schedule_compression(
-            session, config, chat_stream, session_store=chatter.session_store
-        )
-
         while True:
+            SummaryService.maybe_schedule_compression(
+                session, config, chat_stream, session_store=chatter.session_store
+            )
             state.summary.sync_if_changed(response, chat_stream, session.history_summary)
             heal_orphan_tool_results(response, where="loop-top")
 
@@ -335,13 +334,17 @@ async def execute_orchestrator(
                 if snapshot is not None:
                     previous_snapshot = session.context_snapshot
                     previous_completed_length = session.completed_context_length
+                    previous_round_count = session.compress_round_count
                     session.context_snapshot = snapshot
                     session.completed_context_length = len(snapshot)
+                    if decision.has_meaningful_action:
+                        session.compress_round_count += 1
                     try:
                         await chatter.save_session(session)
                     except BaseException:
                         session.context_snapshot = previous_snapshot
                         session.completed_context_length = previous_completed_length
+                        session.compress_round_count = previous_round_count
                         raise
 
             if turn_control.next_signal is not None:

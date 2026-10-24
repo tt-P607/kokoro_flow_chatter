@@ -672,6 +672,7 @@ class _HarnessSession:
         self.history_summary = ""
         self.context_snapshot: Any = None
         self.completed_context_length = 0
+        self.compress_round_count = 0
         self.sealed_segments: list[Any] = []
         self.bot_planning: list[dict[str, Any]] = []
         self.user_id = "user-1"
@@ -809,7 +810,9 @@ class _OrchestratorHarness:
 
         async def _run_decision(*args: Any, **kwargs: Any) -> Any:
             harness.decisions.append((args, kwargs))
-            return SimpleNamespace(proactive_schedule=None, has_failed_tool=False)
+            return SimpleNamespace(
+                proactive_schedule=None, has_failed_tool=False, has_meaningful_action=True,
+            )
 
         async def _commit_turn_decision(*args: Any, **kwargs: Any) -> Any:
             harness.committed.append((args, kwargs))
@@ -1003,6 +1006,7 @@ async def test_retry_succeeds_before_budget_exhausted(
     harness.install(module)
 
     await harness.drive(module, _config())
+    assert harness.committed[0][0][3].compress_round_count == 1
 
     # 恢复成功：三次请求（初始 + 2 次重试），第 3 次不再被拦截
     assert harness.guard_retries == [0, 1, 2]

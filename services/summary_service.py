@@ -61,6 +61,13 @@ class SummaryService:
         if session.compression_paused:
             return False
         now = time.time()
+        if session.history_summary.strip() and (
+            config.prompt.compress_every_n_rounds <= 0
+            or session.compress_round_count < config.prompt.compress_every_n_rounds
+            or now - session.last_compress_at
+            < config.prompt.min_compress_interval_minutes * 60
+        ):
+            return False
         initial_history = (
             build_recent_chat_history(
                 chat_stream, now - _INITIAL_DIARY_DAYS * 86400, now
@@ -85,7 +92,7 @@ class SummaryService:
                     if not succeeded:
                         session.compression_paused = True
                         return
-                while session.sealed_segments and not session.compression_paused:
+                elif session.sealed_segments:
                     succeeded = await compress_history(
                         session, config, chat_stream, session_store=session_store
                     )
