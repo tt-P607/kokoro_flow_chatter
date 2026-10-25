@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import Stop, Wait
-from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import ROLE, LLMPayload, Text
 
 from ..context import (
     plan_followup_contributions,
@@ -205,11 +205,12 @@ async def _prepare_new_messages(
         chatter.record_reply_timing(session)
         session.clear_waiting()
 
-    media_items = None
-    if config.general.native_multimodal:
-        from ..multimodal import extract_images_from_messages
+    from ..multimodal import extract_media_from_messages
 
-        media_items = extract_images_from_messages(unread_msgs) or None
+    media_items = extract_media_from_messages(
+        unread_msgs,
+        include_images=config.general.native_multimodal,
+    ) or None
 
     plan = await plan_user_turn(
         formatted_unreads=format_unread_messages(chatter, unread_msgs),
@@ -286,6 +287,48 @@ def _build_external_resume_payload(external_resume: Any) -> LLMPayload | None:
     return LLMPayload(ROLE.USER, Text(prompt.strip()))
 
 
+async def _with_voice_call_context(
+    payload: LLMPayload | None,
+    stream_id: str,
+) -> LLMPayload | None:
+    """为当前通话请求附加临时输入/输出说明。"""
+    from src.app.plugin_system.api.service_api import get_service
+
+    service = get_service("anima_voice:service:voice_call")
+    state = service.get_state(stream_id) if service is not None else None
+    if not isinstance(state, dict) or state.get("phase") != "connected":
+        return payload
+    from src.app.plugin_system.api import prompt_api
+
+    template_name = "tts_voice_plugin-neo.speech_rules"
+    speech_template = prompt_api.get_template(template_name)
+    if speech_template is None:
+        raise RuntimeError(f"公共语音模板未注册：{template_name}")
+    speech_template.set("stream_id", stream_id)
+    speech_rules = await speech_template.build(strict=True)
+    options = service.get_speech_options()
+    styles = "、".join(str(style) for style in options["styles"])
+    mode = str(state.get("input_mode") or "unknown")
+    context = (
+        "当前正在语音通话，输入方式为"
+        f"{mode}；请继续使用当前会话，不要另建对话；"
+        "需要在通话中说话时使用 action-kfc_voice_reply 发送语音，"
+        "需要发送文字时使用 action-kfc_reply 发送文本消息。"
+        "两种动作可以在同一轮分别调用，文本不会自动转成语音。"
+        "每种回复动作每轮最多调用一次；语音 content 使用完整正文字符串，"
+        "一次提交并实时流式播音，不按句拆分或模拟打字等待。"
+        "文本消息仍可使用 content 列表分段发送。"
+        "不要使用普通语音条动作替代电话播音。"
+        f"\nvoice_style 可选：{styles}；默认：{options['default_style']}。"
+        f"\n以下朗读规则仅适用于通话语音回复：\n{speech_rules}"
+    )
+    previous = _extract_text(payload) if payload is not None else ""
+    return LLMPayload(
+        ROLE.USER,
+        Text("\n\n".join(part for part in (previous, context) if part)),
+    )
+
+
 async def _prepare_timeout(
     chatter: KokoroFlowChatter,
     response: Any,
@@ -326,10 +369,13 @@ def _append_or_merge_user_payload(
     """追加 USER payload；末尾已是纯文本 USER 时合并进去。
 
     合并可避免"打断后重来"或"超时叠加"场景在链尾堆出多条连续 USER。
-    含图片的 payload 不合并，以免破坏图文顺序。
+    含媒体的 payload 保留对象身份，由当前回合处理音频合并。
     """
     new_text = _extract_text(payload)
-    if not allow_merge or not new_text:
+    if not allow_merge:
+        response.payloads.append(payload)
+        return
+    if not new_text:
         response.add_payload(payload)
         return
 

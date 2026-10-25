@@ -17,13 +17,14 @@ from src.kernel.concurrency import get_task_manager
 from .actions.do_nothing import DoNothingAction
 from .actions.memo import KFCMemoAction, KFCMemoDeleteAction
 from .actions.pass_and_wait import PassAndWaitAction
-from .actions.reply import KFCReplyAction
+from .actions.reply import KFCReplyAction, KFCVoiceReplyAction
 from .actions.schedule_proactive import ScheduleProactiveAction
 from .chatter import KokoroFlowChatter
 from .config import KFCConfig
 from .framework_compat import set_stream_recognition_skip
 from .handlers.proactive_handler import PROACTIVE_TRIGGER_EVENT, ProactiveHandler
 from .handlers.voice_call_history_handler import VoiceCallHistoryHandler
+from .handlers.voice_call_input_handler import VoiceCallInputHandler
 from .services import ProactiveService, SummaryService
 from .session import KFCSessionStore
 
@@ -125,12 +126,14 @@ class KFCPlugin(BasePlugin):
         """
         components: list[type] = [
             KFCReplyAction,
+            KFCVoiceReplyAction,
             DoNothingAction,
             PassAndWaitAction,
             ScheduleProactiveAction,
             KFCMemoAction,
             KFCMemoDeleteAction,
             ProactiveHandler,
+            VoiceCallInputHandler,
             VoiceCallHistoryHandler,
         ]
 

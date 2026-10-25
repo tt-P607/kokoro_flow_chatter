@@ -1,19 +1,24 @@
-"""KFC 回复动作。
+"""KFC 文本与通话语音回复动作。
 
-模型的所有可见发言都经由本动作发出。执行层已完成分段拆分与打字节奏
-控制，这里只负责把单段文本交给框架发送，并做一道元数据泄漏兜底。
+文本回复交给框架发送，通话语音回复通过公开语音服务合成并播放。
 """
 
 from __future__ import annotations
 
 import re
-from typing import Annotated, Any
+import uuid
+from contextvars import ContextVar
+from typing import Annotated, Any, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.api.send_api import send_text
+from src.app.plugin_system.api.send_api import format_send_result, send_text_result
+from src.app.plugin_system.api.service_api import get_service
 from src.app.plugin_system.base import BaseAction
 
+from ..models import KFC_VOICE_REPLY
+
 logger = get_logger("kfc_reply")
+VOICE_REPLY_TRACE: ContextVar[str] = ContextVar("kfc_voice_reply_trace", default="")
 
 _METADATA_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -98,6 +103,7 @@ class KFCReplyAction(BaseAction):
     associated_types: list[str] = ["text"]
     description = (
         "发送文本消息给对方。"
+        "即使正在语音通话，本动作仍发送文字，不触发语音合成。"
         "content 为消息段落列表，每个元素是一条独立消息，系统会依次发出。"
         "可选的 reply_to 参数允许你引用消息（虽然私聊中较少用到，"
         "但引用旧消息时可能有用）。"
@@ -170,14 +176,108 @@ class KFCReplyAction(BaseAction):
             return False, "清洗后内容为空，未发送"
 
         if reply_to:
-            success = await send_text(
+            result = await send_text_result(
                 content=segment,
                 stream_id=self.chat_stream.stream_id,
                 reply_to=reply_to,
             )
+            success, receipt = format_send_result(result)
         else:
-            success = await self._send_to_stream(segment)
+            result = await self._send_to_stream_result(segment)
+            success, receipt = format_send_result(result)
 
-        if not success:
-            return False, "消息发送失败"
-        return True, f"已发送消息: {segment[:_REPLY_PREVIEW_LIMIT]}"
+        return success, f"{receipt}: {segment[:_REPLY_PREVIEW_LIMIT]}"
+
+
+async def execute_voice_reply(
+    chat_stream: Any,
+    content: str,
+    voice_style: str,
+    *,
+    trace_id: str = "",
+) -> tuple[bool, str]:
+    """在当前已接通的 QQ 私聊通话中发送一段语音。
+
+    Args:
+        chat_stream: 当前 KFC 聊天流。
+        content: 仅供朗读的正文。
+        voice_style: 传给语音服务的风格选择参数。
+        trace_id: 本次语音动作的关联标识，不包含正文。
+
+    Returns:
+        tuple[bool, str]: 发送状态和语音服务回执。
+    """
+    stream_id = str(getattr(chat_stream, "stream_id", "") or "")
+    if (
+        not stream_id
+        or getattr(chat_stream, "platform", None) != "qq"
+        or str(getattr(chat_stream, "chat_type", "")) != "private"
+    ):
+        return False, "仅支持当前 QQ 私聊通话，未发送"
+
+    service = get_service("anima_voice:service:voice_call")
+    if service is None:
+        return False, "Anima Voice 通话服务不可用，未发送"
+    state = service.get_state(stream_id)
+    if (
+        not isinstance(state, dict)
+        or state.get("stream_id") != stream_id
+        or state.get("phase") != "connected"
+    ):
+        return False, "当前 QQ 私聊没有已接通的通话，未发送"
+
+    try:
+        result = await service.speak(
+            stream_id,
+            content,
+            voice_style=voice_style,
+            **({"trace_id": trace_id} if trace_id else {}),
+        )
+    except Exception as error:  # noqa: BLE001
+        logger.warning(f"通话语音发送失败: {error}")
+        return False, f"通话语音发送失败: {error}"
+    if result.get("drained") is not True:
+        return False, "通话语音未确认完成发送"
+    return True, "通话语音已完成发送"
+
+
+class KFCVoiceReplyAction(BaseAction):
+    """通过当前 QQ 私聊通话朗读回复正文。"""
+
+    name = KFC_VOICE_REPLY
+    associated_types: ClassVar[list[str]] = ["text"]
+    description = (
+        "仅在当前同一 QQ 私聊已接通通话时，通过通话发送语音回复；"
+        "若没有可用的已接通通话会明确失败，不发送文字，也不使用本机扬声器。"
+        "与 kfc_reply 的文本回复相互独立，可在同一轮分别调用；"
+        "每轮本动作最多调用一次，content 为需要朗读的完整正文字符串。"
+        "全文一次提交并实时流式播音，不拆成多次发送。voice_style 用于选择语音风格，"
+        "只作为合成参数，绝不要将 voice_style 的值读出来。"
+        "必须提供 thought、expected_reaction、max_wait_seconds 和 mood。"
+    )
+    chatter_allow: ClassVar[list[str]] = ["kokoro_flow_chatter"]
+
+    @classmethod
+    def to_schema(cls) -> dict:  # type: ignore[override]
+        """生成带必填 KFC 元数据的动作 schema。"""
+        return force_kfc_metadata_required(super().to_schema())
+
+    async def execute(
+        self,
+        content: Annotated[str, "要朗读的完整正文字符串，不包含语音风格说明。"],
+        voice_style: Annotated[str, "语音风格选择参数，不会被朗读。"] = "",
+        thought: Annotated[str, "你此刻的内心想法和感受。"] = "",
+        expected_reaction: Annotated[str, "你预期对方听到回复后的反应。"] = "",
+        max_wait_seconds: Annotated[float, "你愿意等待对方回复的最长秒数。"] = 0.0,
+        mood: Annotated[str, "你当前的心情。"] = "",
+    ) -> tuple[bool, str]:
+        """将完整正文一次提交到当前已接通的 QQ 私聊通话。"""
+        _ = (thought, expected_reaction, max_wait_seconds, mood)
+        text = content.strip()
+        if not text:
+            return False, "内容为空，未发送"
+        trace_id = VOICE_REPLY_TRACE.get() or uuid.uuid4().hex
+        logger.info(
+            f"KFC 语音回复：trace_id={trace_id}, text_chars={len(text)}"
+        )
+        return await execute_voice_reply(self.chat_stream, text, voice_style, trace_id=trace_id)

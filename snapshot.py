@@ -178,6 +178,9 @@ def _serialize_part(part: Any) -> dict[str, Any] | None:
         mime_type = getattr(part, "mime_type", None)
         if mime_type:
             item["mime_type"] = str(mime_type)
+        audio_format = getattr(part, "format", None)
+        if type_name == "Audio" and audio_format:
+            item["format"] = str(audio_format)
         return item
     rendered = _render_unknown_part(part)
     if rendered:
@@ -313,7 +316,7 @@ def _deserialize_media(part_type: str, part: dict[str, Any]) -> Any | None:
         if part_type == "image":
             return Image(data)
         if part_type == "audio":
-            return Audio(data)
+            return Audio(data, format=str(part.get("format") or "wav"))
         if part_type == "video":
             return Video(data, mime_type=str(mime_type or "video/mp4"))
         return File(data)

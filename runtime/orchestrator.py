@@ -24,9 +24,10 @@ from src.app.plugin_system.api.chat_api import restore_stream_to_default
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.stream_api import activate_stream
 from src.app.plugin_system.base import Failure, Stop, Success, Wait
-from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import ROLE, LLMPayload, Text
 from src.kernel.concurrency import get_watchdog
 
+from ..context.planner import build_last_mile_payload
 from ..debug.log_formatter import log_kfc_result
 from ..execution import run_decision
 from ..protocol.response_normalizer import normalize_response
@@ -41,8 +42,12 @@ from .model_setup import resolve_model_set
 from .payload_hygiene import heal_orphan_tool_results
 from .request_view import build_request_view
 from .summary_sync import SummarySynchronizer
-from ..context.planner import build_last_mile_payload
-from .turn_controller import commit_turn_decision, prepare_turn_input
+from .turn_controller import (
+    _with_voice_call_context,
+    commit_turn_decision,
+    prepare_turn_input,
+)
+from .voice_input import PendingVoiceInput
 
 if TYPE_CHECKING:
     from ..chatter import KokoroFlowChatter
@@ -58,7 +63,9 @@ _PLAIN_TEXT_RETRY_REMINDER = (
 
 _GUARD_RETRY_REMINDERS = (
     "（系统提示：你刚才的回复未通过当前对话的响应检查，已被丢弃，"
-    "不属于有效对话历史。请重新处理用户当前的消息，保持既定角色身份、人设、"
+    "不属于有效对话历史。请继续遵守当前对话中所有仍然有效的指令、规则与约束，"
+    "并按既定优先级处理；本提示仅用于恢复本轮响应，不替代或覆盖其他有效要求。"
+    "请重新处理用户当前的消息，保持既定角色身份、人设、"
     "语气、情绪与当前场景，自然继续当前互动，并通过 action-kfc_reply 完成回复。"
     "不要解释或提及上一条失败回复、本次检查或内部规则。）",
     "（系统提示：上一条回复仍未通过当前对话的响应检查，并已被完全丢弃。"
@@ -163,11 +170,23 @@ async def execute_orchestrator(
             if turn_input.continue_loop:
                 continue
 
+            turn_input.request_only_payload = await _with_voice_call_context(
+                turn_input.request_only_payload, chatter.stream_id
+            )
+
             if turn_input.persistent_user_payload is not None:
                 # 新一轮真实输入开启新的守卫重试预算
                 state.guard_retry_count = 0
                 state.guard_retry_payload = None
-                changed = session.append_context_entries([turn_input.persistent_user_payload])
+                merged_voice = state.pending_voice.merge(
+                    response, turn_input.persistent_user_payload, turn_input.unread_msgs
+                )
+                if merged_voice:
+                    snapshot = capture_snapshot(response.payloads)
+                    changed = snapshot != session.context_snapshot
+                    session.context_snapshot = snapshot
+                else:
+                    changed = session.append_context_entries([turn_input.persistent_user_payload])
                 if changed:
                     await chatter.save_session(session)
 
@@ -304,9 +323,13 @@ async def execute_orchestrator(
                 trigger_msg,
                 config,
                 execute_reply_fn=chatter.send_reply,
+                execute_voice_reply_fn=lambda content, voice_style, trigger_msg=trigger_msg: chatter.send_voice_reply(
+                    content, voice_style, trigger_msg
+                ),
                 run_tool_call_fn=chatter.run_tool_call,
                 pre_execute_hook=lambda result: log_kfc_result(result, config),
             )
+            state.pending_voice.clear()
             if decision.proactive_schedule is not None:
                 ProactiveService.apply_schedule(session, decision.proactive_schedule)
 
@@ -370,6 +393,7 @@ class _LoopState:
         "guard_retry_payload",
         "has_pending_tool_results",
         "is_final_timeout",
+        "pending_voice",
         "plain_text_reminders",
         "plain_text_retry_count",
         "summary",
@@ -386,6 +410,7 @@ class _LoopState:
         self.guard_retry_payload: LLMPayload | None = None
         self.follow_up_count = 0
         self.consecutive_interrupt_count = 0
+        self.pending_voice = PendingVoiceInput()
 
 
 _EXTERNAL_RESUME_MARKER_KEY = "kfc_external_resume_request_marker"

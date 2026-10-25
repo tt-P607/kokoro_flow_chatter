@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.app.plugin_system.types import Content, Image, Text
+from src.app.plugin_system.types import Audio, Content, Image, Text
 
 _IMAGE_MEDIA_TYPE = "image"
+_AUDIO_MEDIA_TYPE = "audio"
 
 
 def _extract_dict_items(raw: Any) -> list[dict[str, Any]]:
@@ -41,7 +42,7 @@ def _read_raw_media(msg: Any) -> list[dict[str, Any]]:
         if items and any(item.get("data") for item in items):
             return items
 
-    extra = msg.extra
+    extra = getattr(msg, "extra", {})
     if isinstance(extra, dict):
         items = _extract_dict_items(extra.get("media"))
         if items:
@@ -66,6 +67,15 @@ def get_image_media_list(msg: Any) -> list[dict[str, Any]]:
     ]
 
 
+def get_audio_media_list(msg: Any) -> list[dict[str, Any]]:
+    """提取消息中的音频媒体项。"""
+    return [
+        item
+        for item in _read_raw_media(msg)
+        if item.get("type") == _AUDIO_MEDIA_TYPE and item.get("data")
+    ]
+
+
 def extract_images_from_messages(messages: list[Any]) -> list[dict[str, Any]]:
     """按消息顺序提取全部图片。
 
@@ -81,19 +91,61 @@ def extract_images_from_messages(messages: list[Any]) -> list[dict[str, Any]]:
     return items
 
 
+def extract_audio_from_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """按消息顺序提取全部音频。"""
+    items: list[dict[str, Any]] = []
+    for msg in messages:
+        items.extend(get_audio_media_list(msg))
+    return items
+
+
+def extract_media_from_messages(
+    messages: list[Any],
+    *,
+    include_images: bool,
+) -> list[dict[str, Any]]:
+    """按原消息顺序提取允许进入本轮 payload 的图片和音频。"""
+    items: list[dict[str, Any]] = []
+    for msg in messages:
+        media = _read_raw_media(msg)
+        extra = getattr(msg, "extra", {})
+        is_voice_call = isinstance(extra, dict) and isinstance(
+            extra.get("qq_voice"), dict
+        )
+        items.extend(
+            item
+            for item in media
+            if item.get("data")
+            and (
+                (include_images and item.get("type") == _IMAGE_MEDIA_TYPE)
+                or (
+                    item.get("type") == _AUDIO_MEDIA_TYPE
+                    and is_voice_call
+                )
+            )
+        )
+    return items
+
+
 def build_multimodal_content(
     text: str,
     media_items: list[dict[str, Any]],
 ) -> list[Content]:
-    """把文本与图片打包为 payload 可接受的内容列表。
+    """把文本与图片、音频按原序打包为 payload 可接受的内容列表。
 
     Args:
         text: 文本主体。
-        media_items: 按时序排列的图片媒体项。
+        media_items: 按时序排列的图片或音频媒体项。
 
     Returns:
-        list[Content]: ``[Text, Image, Image, ...]`` 形式的内容列表。
+        list[Content]: 文本及按顺序构建的 ``Image``/``Audio`` 内容。
     """
     content_list: list[Content] = [Text(text)]
-    content_list.extend(Image(str(item["data"])) for item in media_items)
+    for item in media_items:
+        if item.get("type") == _IMAGE_MEDIA_TYPE:
+            content_list.append(Image(str(item["data"])))
+        elif item.get("type") == _AUDIO_MEDIA_TYPE:
+            content_list.append(
+                Audio(str(item["data"]), format=str(item.get("format") or "wav"))
+            )
     return content_list

@@ -9,7 +9,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ..domain.decision import Decision, ProactiveSchedule, ToolCallSpec
-from ..models import DO_NOTHING, KFC_REPLY, PASS_AND_WAIT, ToolCallResult
+from ..models import (
+    DO_NOTHING,
+    KFC_REPLY,
+    KFC_VOICE_REPLY,
+    PASS_AND_WAIT,
+    ToolCallResult,
+)
 from .tool_call_adapter import extract_call_args, normalize_call_name
 
 if TYPE_CHECKING:
@@ -21,7 +27,9 @@ _SCHEDULE_PROACTIVE_NAME = "schedule_proactive"
 _DEFAULT_SCHEDULE_DELAY_MINUTES = 30.0
 """模型未给出或给出非法 ``delay_minutes`` 时的回退值。"""
 
-_CONTROL_NAMES: frozenset[str] = frozenset({KFC_REPLY, DO_NOTHING, PASS_AND_WAIT})
+_CONTROL_NAMES: frozenset[str] = frozenset(
+    {KFC_REPLY, KFC_VOICE_REPLY, DO_NOTHING, PASS_AND_WAIT}
+)
 """KFC 控制动作，不计入第三方调用列表。"""
 
 
@@ -39,7 +47,7 @@ def _extract_visible_reply_segments(result: ToolCallResult) -> list[str]:
     """
     segments: list[str] = []
     for action in result.actions:
-        if action.get("type") != KFC_REPLY:
+        if action.get("type") not in {KFC_REPLY, KFC_VOICE_REPLY}:
             continue
 
         raw_content = action.get("content")

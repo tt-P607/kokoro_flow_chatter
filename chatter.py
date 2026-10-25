@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncGenerator
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.stream_api import get_stream
@@ -29,7 +29,7 @@ from src.app.plugin_system.base import (
 )
 from src.app.plugin_system.types import ChatType, Message
 
-from .actions.reply import KFCReplyAction
+from .actions.reply import KFCReplyAction, KFCVoiceReplyAction
 from .config import KFCConfig
 from .debug.log_formatter import format_prompt_for_log
 from .framework_compat import (
@@ -37,7 +37,7 @@ from .framework_compat import (
     set_stream_recognition_skip,
 )
 from .mental_log import MentalLogEntry
-from .models import DO_NOTHING, KFC_REPLY, KFCEventType
+from .models import DO_NOTHING, KFC_REPLY, KFC_VOICE_REPLY, KFCEventType
 from .runtime import execute_orchestrator, send_interruptable_response
 
 if TYPE_CHECKING:
@@ -80,6 +80,21 @@ class KokoroFlowChatter(BaseChatter):
         """
         super().__init__(stream_id, plugin)
         self._pending_external_resume: WaitResumeEvent | None = None
+
+    @property
+    def speech_rules_template_name(self) -> str | None:
+        """通话期间声明由当前请求提供共享朗读规则。"""
+        from src.app.plugin_system.api.service_api import get_service
+
+        service = get_service("anima_voice:service:voice_call")
+        state = cast(Any, service).get_state(self.stream_id) if service is not None else None
+        if (
+            isinstance(state, dict)
+            and state.get("stream_id") == self.stream_id
+            and state.get("phase") == "connected"
+        ):
+            return "tts_voice_plugin-neo.speech_rules"
+        return None
 
     # ── 框架契约 ──────────────────────────────────────────
 
@@ -148,7 +163,7 @@ class KokoroFlowChatter(BaseChatter):
             name
             for name in self.get_config().general.blocked_tools
             # KFC 的核心控制动作不允许被配置屏蔽，否则模型将无法表达决策
-            if name not in {KFC_REPLY, DO_NOTHING}
+            if name not in {KFC_REPLY, KFC_VOICE_REPLY, DO_NOTHING}
         )
 
         available = [
@@ -165,7 +180,7 @@ class KokoroFlowChatter(BaseChatter):
     ) -> str:
         """把单条消息渲染为带标签的展示行。
 
-        格式为 ``》时间》[QQ:xxx] 昵称 [消息id:xxx]： 内容``——两种括号
+        格式为 ``》时间》[平台:账号] 昵称 [消息id:xxx]： 内容``——两种括号
         把平台账号与消息 ID 明确区分，避免模型混淆二者。
 
         Args:
@@ -187,7 +202,8 @@ class KokoroFlowChatter(BaseChatter):
         role_part = f"<{role_str}> " if role_str else ""
 
         platform_id = msg.sender_id or ""
-        id_part = f"[QQ:{platform_id}] " if platform_id else ""
+        platform = msg.platform or "unknown"
+        id_part = f"[{platform}:{platform_id}] " if platform_id else ""
 
         nickname = msg.sender_name or ""
         cardname = msg.sender_cardname
@@ -271,6 +287,29 @@ class KokoroFlowChatter(BaseChatter):
         except Exception as error:
             logger.error(f"执行 KFCReplyAction 失败: {error}", exc_info=True)
             return False
+
+    async def send_voice_reply(
+        self,
+        content: str,
+        voice_style: str,
+        trigger_msg: Message | None,
+    ) -> tuple[bool, str]:
+        """通过 KFC 专用动作发送完整通话语音并返回动作回执。"""
+        if trigger_msg is None:
+            trigger_msg = await self.build_virtual_trigger_message()
+            if trigger_msg is None:
+                return False, "无触发消息，无法发送通话语音"
+        try:
+            success, result = await self.exec_llm_usable(
+                KFCVoiceReplyAction,
+                trigger_msg,
+                content=content,
+                voice_style=voice_style,
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"执行 KFCVoiceReplyAction 失败: {error}")
+            return False, f"通话语音动作执行异常: {error}"
+        return success, str(result)
 
     async def send_interruptable(
         self,

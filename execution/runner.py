@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING, Any
 from ..models import ToolCallResult
 from ..protocol.decision_parser import build_decision
 from ..protocol.tool_call_adapter import build_decision_draft
-from .decision_executor import ExecuteReplyFn, RunToolCallFn, execute_decision_draft
+from .decision_executor import (
+    ExecuteReplyFn,
+    ExecuteVoiceReplyFn,
+    RunToolCallFn,
+    execute_decision_draft,
+)
 
 if TYPE_CHECKING:
     from src.app.plugin_system.types import ToolRegistry
@@ -29,6 +34,7 @@ async def run_decision(
     config: KFCConfig,
     *,
     execute_reply_fn: ExecuteReplyFn,
+    execute_voice_reply_fn: ExecuteVoiceReplyFn | None = None,
     run_tool_call_fn: RunToolCallFn,
     pre_execute_hook: Callable[[ToolCallResult], None] | None = None,
 ) -> Decision:
@@ -55,6 +61,7 @@ async def run_decision(
         trigger_msg,
         config,
         execute_reply_fn=execute_reply_fn,
+        execute_voice_reply_fn=execute_voice_reply_fn,
         run_tool_call_fn=run_tool_call_fn,
         pre_execute_hook=pre_execute_hook,
     )

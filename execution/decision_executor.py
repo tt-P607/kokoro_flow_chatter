@@ -1,7 +1,7 @@
 """KFC 工具调用执行层。
 
-执行层只特殊解释 KFC 自有的三个控制动作（``kfc_reply`` /
-``do_nothing`` / ``pass_and_wait``），其余 action / tool / agent 一律
+执行层只特殊解释 KFC 自有的四个控制动作（``kfc_reply`` /
+``kfc_voice_reply`` / ``do_nothing`` / ``pass_and_wait``），其余 action / tool / agent 一律
 批量交给框架 ``run_tool_call`` 调度，避免重复维护通用执行逻辑。
 
 每个被处理的调用都会往 ``response`` 写入一条 TOOL_RESULT，保证
@@ -17,14 +17,21 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import (
-    LLMPayload,
     ROLE,
+    LLMPayload,
     ToolCall,
     ToolRegistry,
     ToolResult,
 )
 
-from ..models import DO_NOTHING, KFC_REPLY, PASS_AND_WAIT, ToolCallResult
+from ..actions.reply import VOICE_REPLY_TRACE
+from ..models import (
+    DO_NOTHING,
+    KFC_REPLY,
+    KFC_VOICE_REPLY,
+    PASS_AND_WAIT,
+    ToolCallResult,
+)
 from ..protocol.tool_call_adapter import DecisionDraft, DecisionDraftCall
 
 if TYPE_CHECKING:
@@ -34,6 +41,9 @@ logger = get_logger("kfc_execution")
 
 ExecuteReplyFn = Callable[[str, "KFCConfig", Any | None, str], Awaitable[bool]]
 """发送单段回复的回调：``(文本, 配置, 触发消息, 引用消息 ID) -> 是否成功``。"""
+
+ExecuteVoiceReplyFn = Callable[[str, str], Awaitable[tuple[bool, str]]]
+"""发送完整通话语音的回调：``(正文, voice_style) -> (是否成功, 真实回执)``。"""
 
 RunToolCallFn = Callable[
     [list[Any], Any, Any, Any | None], Awaitable[list[tuple[bool, bool]]]
@@ -52,7 +62,7 @@ _RESULT_REPLY_SENT = "已发送"
 _RESULT_REPLY_EMPTY = "发送失败：content 参数为空或解析后无有效内容，请重新思考并提供有效回复。"
 _RESULT_REPLY_FAILED = "发送失败：内部发送环节异常，请重试或更换回复策略。"
 _RESULT_REPLY_DUPLICATED = (
-    "忽略重复调用：每轮响应只允许一个 kfc_reply。请将多段内容合并到一个 content 列表中。"
+    "忽略重复调用：每轮响应中同一种回复动作只允许一次。请将多段内容合并到一个 content 列表中。"
 )
 _RESULT_SILENCE = "已选择不回复"
 _RESULT_WAIT_REGISTERED = "已登记等待"
@@ -79,7 +89,7 @@ def extract_metadata(result: ToolCallResult, args: dict[str, Any]) -> None:
 
 
 def parse_content_segments(raw_content: Any) -> list[str]:
-    """把 ``kfc_reply`` 的 content 参数解析为文本分段列表。
+    """把回复动作的 content 参数解析为文本分段列表。
 
     兼容模型的三种输出形态：真实列表、JSON 数组字符串、普通文本。
 
@@ -242,8 +252,8 @@ async def _send_reply_segments(
     config: KFCConfig,
     trigger_msg: Any | None,
     execute_reply_fn: ExecuteReplyFn,
-) -> bool:
-    """按打字节奏依次发送回复分段。
+) -> tuple[bool, str]:
+    """按打字节奏依次发送文本消息分段。
 
     仅第一段携带 ``reply_to`` 引用——同一轮回复的后续分段再引用同一条
     消息会让对话界面出现重复引用块。
@@ -256,7 +266,7 @@ async def _send_reply_segments(
         execute_reply_fn: 实际发送回调。
 
     Returns:
-        bool: 是否全部发送成功；任一段失败即中断并返回 False。
+        tuple[bool, str]: 是否全部发送成功及对应发送回执。
     """
     for index, segment in enumerate(segments):
         if index > 0:
@@ -264,9 +274,11 @@ async def _send_reply_segments(
             if delay > 0:
                 await asyncio.sleep(delay)
         segment_reply_to = reply_to if index == 0 else ""
-        if not await execute_reply_fn(segment, config, trigger_msg, segment_reply_to):
-            return False
-    return True
+        if not await execute_reply_fn(
+            segment, config, trigger_msg, segment_reply_to
+        ):
+            return False, _RESULT_REPLY_FAILED
+    return True, _RESULT_REPLY_SENT
 
 
 async def execute_decision_draft(
@@ -278,6 +290,7 @@ async def execute_decision_draft(
     *,
     execute_reply_fn: ExecuteReplyFn,
     run_tool_call_fn: RunToolCallFn,
+    execute_voice_reply_fn: ExecuteVoiceReplyFn | None = None,
     pre_execute_hook: Callable[[ToolCallResult], None] | None = None,
 ) -> ToolCallResult:
     """执行一份决策草稿并产出执行结果。
@@ -291,15 +304,16 @@ async def execute_decision_draft(
         usable_map: 框架工具注册表。
         trigger_msg: 触发本轮的消息。
         config: KFC 配置。
-        execute_reply_fn: 发送单段回复的回调。
+        execute_reply_fn: 发送单段文本回复的回调。
         run_tool_call_fn: 框架批量工具执行回调。
+        execute_voice_reply_fn: 发送完整通话语音的回调。
         pre_execute_hook: 全部动作执行完毕后的汇总日志钩子。
 
     Returns:
         ToolCallResult: 本轮执行结果汇总。
     """
     result = ToolCallResult()
-    has_processed_reply = False
+    processed_reply_types: set[str] = set()
     pending_framework_calls: list[Any] = []
 
     async def flush_pending_framework_calls() -> None:
@@ -332,14 +346,16 @@ async def execute_decision_draft(
             normalized_name = draft_call.normalized_name
             logger.info(f"LLM 调用 {draft_call.raw_name}，原因: {reason}")
 
-            if normalized_name == KFC_REPLY:
-                if has_processed_reply:
-                    logger.warning(f"忽略重复的 kfc_reply 调用: {draft_call.call_id}")
+            if normalized_name in {KFC_REPLY, KFC_VOICE_REPLY}:
+                if normalized_name in processed_reply_types:
+                    logger.warning(
+                        f"忽略重复的 {normalized_name} 调用: {draft_call.call_id}"
+                    )
                     _append_tool_result(response, draft_call, _RESULT_REPLY_DUPLICATED)
                     continue
 
                 await flush_pending_framework_calls()
-                has_processed_reply = True
+                processed_reply_types.add(normalized_name)
                 result.has_reply = True
 
                 segments = parse_content_segments(args.get("content", ""))
@@ -349,18 +365,44 @@ async def execute_decision_draft(
                     _append_tool_result(response, draft_call, _RESULT_REPLY_EMPTY)
                     continue
 
+                voice_style = str(args.pop("voice_style", "") or "")
                 reply_to = str(args.pop("reply_to", "") or "")
-                send_ok = await _send_reply_segments(
-                    segments, reply_to, config, trigger_msg, execute_reply_fn
-                )
+                if normalized_name == KFC_VOICE_REPLY:
+                    content = "\n".join(segments)
+                    segments = [content]
+                    logger.info(
+                        f"KFC 语音动作：trace_id={draft_call.call_id}, text_chars={len(content)}"
+                    )
+                    if execute_voice_reply_fn is None:
+                        send_ok = False
+                        send_receipt = "通话语音执行器不可用，未发送"
+                    else:
+                        token = VOICE_REPLY_TRACE.set(draft_call.call_id)
+                        try:
+                            send_ok, send_receipt = await execute_voice_reply_fn(content, voice_style)
+                        finally:
+                            VOICE_REPLY_TRACE.reset(token)
+                        if not send_ok:
+                            logger.warning(
+                                f"通话语音发送失败：trace_id={draft_call.call_id}, receipt={send_receipt}"
+                            )
+                else:
+                    send_ok, send_receipt = await _send_reply_segments(
+                        segments, reply_to, config, trigger_msg, execute_reply_fn
+                    )
                 if not send_ok:
                     result.has_failed_tool = True
 
-                _record_action(result, normalized_name, args, content_segments=segments)
+                _record_action(
+                    result,
+                    normalized_name,
+                    {**args, **({"voice_style": voice_style} if normalized_name == KFC_VOICE_REPLY else {})},
+                    content_segments=segments,
+                )
                 _append_tool_result(
                     response,
                     draft_call,
-                    _RESULT_REPLY_SENT if send_ok else _RESULT_REPLY_FAILED,
+                    send_receipt,
                 )
                 continue
 

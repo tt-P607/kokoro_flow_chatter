@@ -57,7 +57,7 @@ def test_serialize_round_trip_preserves_all_parts() -> None:
         ),
         LLMPayload(
             ROLE.USER,
-            [Text("新消息"), Image("aGVsbG8=")],
+            [Text("新消息"), Image("aGVsbG8="), Audio("YXVkaW8=", format="mp3")],
         ),
     ]
     entries = serialize_payloads(payloads)
@@ -87,6 +87,8 @@ def test_serialize_round_trip_preserves_all_parts() -> None:
     assert '"ok": true' in str(tool_results[0].value)
     assert tool_results[0].call_id == "c1"
     assert any(isinstance(part, Image) for part in restored[3].content)
+    audio = next(part for part in restored[3].content if isinstance(part, Audio))
+    assert audio.format == "mp3"
 
 
 def test_serialize_skips_system_and_tool_roles() -> None:
@@ -182,6 +184,8 @@ def test_deserialize_restores_audio_and_reasoning_redacted() -> None:
     restored = deserialize_snapshot(entries)
     assert restored is not None
     assert any(isinstance(part, Audio) for part in restored[0].content)
+    audio = next(part for part in restored[0].content if isinstance(part, Audio))
+    assert audio.format == "wav"
     reasoning = [
         part for part in restored[1].content if isinstance(part, ReasoningText)
     ]

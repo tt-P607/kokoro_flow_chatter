@@ -7,12 +7,13 @@
     "llm_api": "1.0.0",
     "log_api": "1.0.0",
     "prompt_api": "1.0.0",
-    "send_api": "1.0.0",
+    "send_api": "1.3.0",
     "storage_api": "1.0.0",
+    "service_api": "1.0.0",
     "stream_api": "2.0.0"
   },
   "display_name": "KokoroFlow 对话引擎",
-  "version": "2.6.8",
+  "version": "2.6.9",
   "description": "KokoroFlow 对话引擎 — 基于心理活动流的私聊特化聊天器",
   "author": "言柒",
   "license": "AGPL-v3.0",
@@ -38,6 +39,11 @@
     {
       "component_type": "action",
       "component_name": "kfc_reply",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "kfc_voice_reply",
       "dependencies": []
     },
     {
@@ -73,6 +79,11 @@
     {
       "component_type": "event_handler",
       "component_name": "kfc_voice_call_history_handler",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "kfc_voice_call_input_handler",
       "dependencies": []
     },
     {

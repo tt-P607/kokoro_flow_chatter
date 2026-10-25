@@ -240,6 +240,11 @@ def test_build_reminders_by_retry_count(
     payloads = _build_guard_retry_reminders(retry_count)
     assert _layers_in(payloads) == expected
     assert all(payload.role == ROLE.USER for payload in payloads)
+    if retry_count > 0:
+        text = _payloads_text(payloads)
+        assert "继续遵守当前对话中所有仍然有效的指令、规则与约束" in text
+        assert "按既定优先级处理" in text
+        assert "本提示仅用于恢复本轮响应，不替代或覆盖其他有效要求" in text
 
 
 def test_build_reminders_ignores_negative_count() -> None:

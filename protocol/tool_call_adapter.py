@@ -14,7 +14,7 @@ from typing import Any
 
 from src.app.plugin_system.types import ToolCall
 
-from ..models import DO_NOTHING, KFC_REPLY, PASS_AND_WAIT
+from ..models import DO_NOTHING, KFC_REPLY, KFC_VOICE_REPLY, PASS_AND_WAIT
 
 _COMPONENT_PREFIXES: tuple[str, ...] = ("action-", "tool-", "agent-")
 """框架组件类型前缀，归一化时需要剥离。"""
@@ -23,7 +23,7 @@ _INFO_TOOL_PREFIXES: tuple[str, ...] = ("tool-", "agent-")
 """有返回值的调用前缀——命中时主循环需要续轮让模型消化结果。"""
 
 _KFC_CONTROL_NAMES: frozenset[str] = frozenset(
-    {KFC_REPLY, DO_NOTHING, PASS_AND_WAIT}
+    {KFC_REPLY, KFC_VOICE_REPLY, DO_NOTHING, PASS_AND_WAIT}
 )
 """由 KFC 执行层特殊解释、不交给框架调度的控制动作。"""
 

@@ -17,16 +17,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.app.plugin_system.base import Wait  # noqa: E402
-
-from src.app.plugin_system.types import (  # noqa: E402
-    LLMPayload,
-    ROLE,
-    Text,
-    ToolCall,
-    ToolResult,
-)
-
+import plugins.kokoro_flow_chatter.runtime.request_view as request_view_module  # noqa: E402
 from plugins.kokoro_flow_chatter.context.renderer import (  # noqa: E402
     render_initial_context,
     render_turn_contributions,
@@ -62,6 +53,7 @@ from plugins.kokoro_flow_chatter.execution.runner import run_decision  # noqa: E
 from plugins.kokoro_flow_chatter.models import (  # noqa: E402
     DO_NOTHING,
     KFC_REPLY,
+    KFC_VOICE_REPLY,
     Memo,
     ToolCallResult,
     WaitingConfig,
@@ -93,12 +85,6 @@ from plugins.kokoro_flow_chatter.runtime.request_view import (  # noqa: E402
     _without_transient_payloads,
     build_request_view,
 )
-import plugins.kokoro_flow_chatter.runtime.request_view as request_view_module  # noqa: E402
-from src.kernel.llm.exceptions import LLMContextError  # noqa: E402
-from src.kernel.llm.context_structure import validate_payload_sequence  # noqa: E402
-from src.kernel.llm.request_execution import (  # noqa: E402
-    normalize_tool_result_payload,
-)
 from plugins.kokoro_flow_chatter.runtime.turn_controller import (  # noqa: E402
     _final_signal,
 )
@@ -106,7 +92,19 @@ from plugins.kokoro_flow_chatter.runtime.unread_policy import (  # noqa: E402
     filter_interrupt_messages,
     prefer_real_unreads,
 )
-
+from src.app.plugin_system.base import Wait  # noqa: E402
+from src.app.plugin_system.types import (  # noqa: E402
+    ROLE,
+    LLMPayload,
+    Text,
+    ToolCall,
+    ToolResult,
+)
+from src.kernel.llm.context_structure import validate_payload_sequence  # noqa: E402
+from src.kernel.llm.exceptions import LLMContextError  # noqa: E402
+from src.kernel.llm.request_execution import (  # noqa: E402
+    normalize_tool_result_payload,
+)
 
 # ── 测试替身 ──────────────────────────────────────────────
 
@@ -579,6 +577,185 @@ async def test_executor_only_first_segment_carries_reply_to() -> None:
 
     assert sent == [("第一句", "m1"), ("第二句", "")]
     assert result.has_failed_tool is False
+
+
+@pytest.mark.asyncio
+async def test_executor_routes_voice_reply_as_kfc_control_and_preserves_failure_receipt() -> None:
+    """通话回复保留 KFC 元数据/回复语义，并配对记录服务失败原因。"""
+    draft = build_decision_draft(
+        [
+            ToolCall(
+                name="action-kfc_voice_reply",
+                args={
+                    "content": "第一句\n第二句",
+                    "voice_style": "warm",
+                    "thought": "想法",
+                    "expected_reaction": "回应",
+                    "max_wait_seconds": 4,
+                    "mood": "平静",
+                },
+                id="voice1",
+            )
+        ]
+    )
+    response = _FakeResponse()
+    spoken: list[tuple[str, str]] = []
+
+    async def _execute_voice_reply(
+        content: str,
+        voice_style: str,
+    ) -> tuple[bool, str]:
+        spoken.append((content, voice_style))
+        return False, "服务返回：通话已结束"
+
+    result = await execute_decision_draft(
+        draft,
+        response,
+        usable_map=cast(Any, {}),
+        trigger_msg=object(),
+        config=cast(Any, _FakeConfig()),
+        execute_reply_fn=cast(Any, _unused_run_tool_call),
+        execute_voice_reply_fn=_execute_voice_reply,
+        run_tool_call_fn=_unused_run_tool_call,
+    )
+
+    assert spoken == [("第一句\n第二句", "warm")]
+    assert result.thought == "想法"
+    assert result.expected_reaction == "回应"
+    assert result.max_wait_seconds == 4
+    assert result.mood == "平静"
+    assert result.has_reply is True
+    assert result.has_third_party is False
+    assert result.has_failed_tool is True
+    assert result.actions == [
+        {
+            "type": KFC_VOICE_REPLY,
+            "content": ["第一句\n第二句"],
+            "voice_style": "warm",
+            "thought": "想法",
+            "expected_reaction": "回应",
+            "max_wait_seconds": 4,
+            "mood": "平静",
+        }
+    ]
+    tool_result = response.payloads[0].content[0]
+    assert isinstance(tool_result, ToolResult)
+    assert tool_result.value == "服务返回：通话已结束"
+    assert tool_result.call_id == "voice1"
+    assert tool_result.name == "action-kfc_voice_reply"
+    decision = build_decision(result, [draft.calls[0].raw_call])
+    assert decision.should_reply is True
+    assert decision.reply_text == "第一句\n第二句"
+    assert decision.has_third_party_calls is False
+
+
+@pytest.mark.asyncio
+async def test_executor_preserves_voice_success_receipt() -> None:
+    """通话语音成功回执保持 Action 的真实描述。"""
+    draft = build_decision_draft(
+        [
+            ToolCall(
+                name="action-kfc_voice_reply",
+                args={"content": ["你好"], "voice_style": "warm"},
+                id="voice-success",
+            )
+        ]
+    )
+    response = _FakeResponse()
+
+    async def _execute_voice_reply(
+        _content: str,
+        _voice_style: str,
+    ) -> tuple[bool, str]:
+        return True, "通话语音已排空"
+
+    await execute_decision_draft(
+        draft,
+        response,
+        usable_map=cast(Any, {}),
+        trigger_msg=object(),
+        config=cast(Any, _FakeConfig()),
+        execute_reply_fn=cast(Any, _unused_run_tool_call),
+        execute_voice_reply_fn=_execute_voice_reply,
+        run_tool_call_fn=_unused_run_tool_call,
+    )
+
+    tool_result = response.payloads[0].content[0]
+    assert isinstance(tool_result, ToolResult)
+    assert tool_result.value == "通话语音已排空"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply_order", [(KFC_REPLY, KFC_VOICE_REPLY), (KFC_VOICE_REPLY, KFC_REPLY)]
+)
+@pytest.mark.parametrize("voice_success", [False, True])
+async def test_executor_keeps_text_and_voice_replies_independent(
+    reply_order: tuple[str, str],
+    voice_success: bool,
+) -> None:
+    """两种回复可同轮执行，同类去重且语音失败不阻止文本发送。"""
+    draft = build_decision_draft(
+        [
+            ToolCall(
+                name=f"action-{name}",
+                args={
+                    "content": [name],
+                    "reply_to": "message-1",
+                    "voice_style": "warm",
+                },
+                id=f"reply-{index}",
+            )
+            for index, name in enumerate((*reply_order, *reply_order))
+        ]
+    )
+    response = _FakeResponse()
+    sent: list[tuple[str, str, str]] = []
+    voice_receipt = "通话语音已排空" if voice_success else "通话已结束，未发送"
+
+    async def execute_text_reply(
+        content: str,
+        _config: Any,
+        _trigger_msg: Any | None,
+        reply_to: str,
+    ) -> bool:
+        sent.append((KFC_REPLY, content, reply_to))
+        return True
+
+    async def execute_call_reply(content: str, voice_style: str) -> tuple[bool, str]:
+        sent.append((KFC_VOICE_REPLY, content, voice_style))
+        return voice_success, voice_receipt
+
+    result = await execute_decision_draft(
+        draft,
+        response,
+        usable_map=cast(Any, {}),
+        trigger_msg=None,
+        config=cast(Any, _FakeConfig()),
+        execute_reply_fn=execute_text_reply,
+        execute_voice_reply_fn=execute_call_reply,
+        run_tool_call_fn=_unused_run_tool_call,
+    )
+
+    assert sent == [
+        (name, name, "message-1" if name == KFC_REPLY else "warm")
+        for name in reply_order
+    ]
+    assert [action["type"] for action in result.actions] == list(reply_order)
+    assert result.has_reply is True
+    assert result.has_failed_tool is (not voice_success)
+    assert len(response.payloads) == 4
+    for index, payload in enumerate(response.payloads):
+        receipt = payload.content[0]
+        assert isinstance(receipt, ToolResult)
+        assert receipt.call_id == f"reply-{index}"
+        assert receipt.name == f"action-{reply_order[index % 2]}"
+        if index < 2:
+            assert receipt.value == (
+                "已发送" if reply_order[index] == KFC_REPLY else voice_receipt
+            )
+        else:
+            assert "忽略重复调用" in receipt.value
 
 
 @pytest.mark.asyncio

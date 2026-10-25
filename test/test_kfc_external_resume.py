@@ -196,6 +196,7 @@ async def test_message_wake_processes_second_unread(
         content="second",
         message_id="m2",
         time=123.0,
+        platform="qq",
     )
     monkeypatch.setattr(
         "plugins.kokoro_flow_chatter.runtime.turn_controller.plan_user_turn",

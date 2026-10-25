@@ -2,7 +2,7 @@
 
 本模块定义跨层复用的基础数据类型，不依赖 KFC 内部任何其他模块：
 
-- 控制动作名常量（``KFC_REPLY`` / ``DO_NOTHING`` / ``PASS_AND_WAIT``）
+- 控制动作名常量（回复、通话回复、沉默与等待）
 - ``KFCEventType``：心理活动流事件类型枚举
 - ``ToolCallResult``：执行层产出的原始工具执行汇总
 - ``Memo`` 及其边界常量：LLM 自主管理的私人备忘录
@@ -17,13 +17,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-
 # ── 控制动作名常量 ────────────────────────────────────────
-# 这三个动作由 KFC 执行层特殊解释（不走框架 run_tool_call），
+# 这些动作由 KFC 执行层特殊解释（不走框架 run_tool_call），
 # 其余 action-/tool-/agent- 一律交给框架调度。
 
 KFC_REPLY: str = "kfc_reply"
 """发送文本消息给对方。"""
+
+KFC_VOICE_REPLY: str = "kfc_voice_reply"
+"""通过当前 QQ 通话发送语音回复。"""
 
 DO_NOTHING: str = "do_nothing"
 """主动选择不回复。"""

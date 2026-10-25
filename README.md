@@ -10,6 +10,8 @@
 
 KFC 是一个面向私聊场景的 Chatter 插件。KFC 将 LLM 的每次决策与内心独白记录在独立的心理活动流中；请求使用持久化的原话链，封存旧回合后以第一人称日记延续记忆。
 
+新消息中的账号标签按消息自身的 `platform` 显示，例如 `[douyin:用户ID]`、`[qq:用户ID]`；平台缺失时显示 `unknown`。账号与消息 ID 分开标注，平台标识和账号字符串均保持原值。
+
 ### 核心能力
 
 - **心理活动流**：每次回复附带内心独白（情绪、期待），形成可回顾的心理时间线
@@ -21,6 +23,8 @@ KFC 是一个面向私聊场景的 Chatter 插件。KFC 将 LLM 的每次决策�
 - **消息积累窗口**：连发消息在窗口内合并后统一处理，避免碎片化响应
 - **生成打断**：LLM 生成期间检测到新消息时取消当前请求，合并新消息重新处理
 - **原生多模态**：图片直接进入 LLM 上下文，无需额外处理
+- **语音通话**：Anima 通话输入进入当前 QQ 私聊原流，KFC 继续唯一会话；`kfc_voice_reply` 通过通话播音，`kfc_reply` 独立发送文字
+- **通话追加发言**：模型决策被追加发言打断时，同一通话代次的待处理 PCM 按来源顺序去重合并为一个 WAV；完成回合及历史音频不重合并
 - **回复节奏**：回复拆分为短句，模拟打字节奏逐条发送
 - **第三方上下文注入**：通过 `on_prompt_build` 事件接收其他插件的上下文贡献
 
@@ -51,7 +55,8 @@ KFC 通过原生 Tool Calling 驱动对话，所有行为通过工具调用完�
 
 | 动作 | 用途 |
 |------|------|
-| `kfc_reply` | 发送消息，携带内心独白、情绪、预期反应、等待时长 |
+| `kfc_reply` | 发送文本消息，通话中仍发送文字；携带内心独白、情绪、预期反应、等待时长 |
+| `kfc_voice_reply` | 在当前已接通的 QQ 私聊通话中将完整正文一次提交并流式播音，无打字延迟或 Bot 端切句；`voice_style` 只作为合成参数 |
 | `do_nothing` | 选择不回复，设置等待时长 |
 | `schedule_proactive` | 预约下一次主动思考时间 |
 | `kfc_memo` | 写入或刷新一条带过期时间的私人备忘录 |
@@ -288,6 +293,7 @@ RequestView 作当前请求 transient 注入，也不会持久化。
 - `kokoro_flow_chatter:action:kfc_memo`
 - `kokoro_flow_chatter:action:kfc_memo_delete`
 - `kokoro_flow_chatter:event_handler:kfc_proactive_handler`
+- `kokoro_flow_chatter:event_handler:kfc_voice_call_input_handler`
 - `kokoro_flow_chatter:event_handler:kfc_voice_call_history_handler`
 
 ## 生命周期与数据
@@ -348,7 +354,7 @@ uv run pytest plugins/kokoro_flow_chatter/test -q
 4. 测试 `do_nothing`、`pass_and_wait`、等待超时和最大连续超时。
 5. 创建、覆盖、取消主动预约，并验证热流和冷启动流触发。
 6. 确认核心配置限定的框架历史在首次请求和轮换重建后仍可见；后台日记成功才清除封存原话，重启后仍可恢复。
-7. 发布 `voice_call.ended` 事件，确认通话内容以一对 USER/ASSISTANT 快照条目回填。
+7. 使用 Anima 语音通话时确认输入进入当前 QQ 私聊、KFC 继续原会话；`kfc_reply` 始终发送文字，`kfc_voice_reply` 才调用 TTS 通过通话播音，两者可同轮分别使用。
 8. 禁用、重载、卸载插件，确认无残留 Scheduler 或摘要后台任务。
 
 ---
